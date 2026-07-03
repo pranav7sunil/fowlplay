@@ -1,0 +1,10 @@
+src/**
+test/**
+e2e/**
+node_modules/**
+esbuild.mjs
+tsconfig.json
+.gitignore
+**/*.map
+SPEC.md
+ARCHITECTURE.md

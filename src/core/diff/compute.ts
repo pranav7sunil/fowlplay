@@ -1,0 +1,254 @@
+/**
+ * Line-level diff engine for the FowlPlay diff viewer.
+ *
+ * Produces a list of {@link DiffHunk}s between a `base` and a `staged` string.
+ * The algorithm is a classic LCS diff (equivalent output to Myers for our
+ * purposes) with common prefix/suffix trimming for speed. Hunks are grouped
+ * from contiguous changed runs, each carrying up to 3 lines of surrounding
+ * context for display.
+ *
+ * Invariants relied on elsewhere:
+ *   applyHunksToBase(base, computeFileDiff(path, kind, base, staged).hunks, false) === staged
+ * i.e. replaying every hunk reconstructs the staged content exactly. This is
+ * what makes selective revert (drop a hunk, recompute) sound.
+ */
+
+import type { DiffHunk, FileDiff } from '../../shared/types';
+
+// ---------------------------------------------------------------------------
+// Line splitting
+//
+// We split purely on '\n'. `split`/`join` are exact inverses, which is what
+// guarantees the round-trip property above regardless of trailing newlines:
+//   'a\nb\n'.split('\n')       -> ['a', 'b', '']
+//   ['a', 'b', ''].join('\n')  -> 'a\nb\n'
+// The trailing '' element is treated as an ordinary line token by the diff.
+// ---------------------------------------------------------------------------
+
+function splitLines(text: string): string[] {
+  return text.split('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Diff core
+// ---------------------------------------------------------------------------
+
+type Tag = 'eq' | 'del' | 'ins';
+
+interface Op {
+  tag: Tag;
+}
+
+/** LCS diff of the (already prefix/suffix-trimmed) middle sections. */
+function lcsDiff(a: string[], b: string[]): Op[] {
+  const n = a.length;
+  const m = b.length;
+  if (n === 0) return b.map(() => ({ tag: 'ins' as Tag }));
+  if (m === 0) return a.map(() => ({ tag: 'del' as Tag }));
+
+  // dp[i][j] = LCS length of a[i..] and b[j..]
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  const ops: Op[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      ops.push({ tag: 'eq' });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      ops.push({ tag: 'del' });
+      i++;
+    } else {
+      ops.push({ tag: 'ins' });
+      j++;
+    }
+  }
+  while (i < n) {
+    ops.push({ tag: 'del' });
+    i++;
+  }
+  while (j < m) {
+    ops.push({ tag: 'ins' });
+    j++;
+  }
+  return ops;
+}
+
+/** Full line diff with common prefix/suffix trimming. */
+function diffLines(a: string[], b: string[]): Op[] {
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+
+  let endA = a.length;
+  let endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA--;
+    endB--;
+  }
+
+  const ops: Op[] = [];
+  for (let i = 0; i < start; i++) ops.push({ tag: 'eq' });
+  ops.push(...lcsDiff(a.slice(start, endA), b.slice(start, endB)));
+  for (let i = endA; i < a.length; i++) ops.push({ tag: 'eq' });
+  return ops;
+}
+
+// ---------------------------------------------------------------------------
+// Stable hunk ids
+//
+// The id must survive recomputation when *unrelated* hunks change, so it is
+// derived from the hunk's own content (removed + added lines) via a hash,
+// independent of the hunk's positional index. Identical-content hunks in the
+// same file are disambiguated by an occurrence counter.
+// ---------------------------------------------------------------------------
+
+/** FNV-1a 32-bit hash rendered as 8 hex chars. */
+function hashStr(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the per-file diff. For a create pass base=''; for a delete pass
+ * staged=''. `kind` is carried through onto the returned {@link FileDiff}.
+ */
+export function computeFileDiff(
+  path: string,
+  kind: FileDiff['kind'],
+  base: string,
+  staged: string,
+): FileDiff {
+  const baseLines = splitLines(base);
+  const stagedLines = splitLines(staged);
+  const ops = diffLines(baseLines, stagedLines);
+
+  const hunks: DiffHunk[] = [];
+  const hashCounts = new Map<string, number>();
+
+  let ai = 0; // index into baseLines consumed so far
+  let bi = 0; // index into stagedLines consumed so far
+  let k = 0;
+
+  while (k < ops.length) {
+    if (ops[k].tag === 'eq') {
+      ai++;
+      bi++;
+      k++;
+      continue;
+    }
+
+    // Start of a contiguous changed run.
+    const runBaseStart = ai;
+    const runStagedStart = bi;
+    const delLines: string[] = [];
+    const insLines: string[] = [];
+    while (k < ops.length && ops[k].tag !== 'eq') {
+      if (ops[k].tag === 'del') {
+        delLines.push(baseLines[ai]);
+        ai++;
+      } else {
+        insLines.push(stagedLines[bi]);
+        bi++;
+      }
+      k++;
+    }
+
+    const contextBefore = baseLines.slice(Math.max(0, runBaseStart - 3), runBaseStart);
+    const contextAfter = baseLines.slice(
+      runBaseStart + delLines.length,
+      runBaseStart + delLines.length + 3,
+    );
+
+    // Fold the surrounding context into the id hash so that byte-identical
+    // hunks in different locations get distinct, stable ids. Without this, if
+    // the first of two identical-content hunks is later dropped on recompute,
+    // the survivor would inherit the first hunk's id and reattach the user's
+    // revert/comment to the wrong hunk (see BUG C4). The occurrence counter
+    // below still disambiguates the rare case of identical content AND context.
+    const hkey = hashStr(
+      [
+        delLines.join('\n'),
+        insLines.join('\n'),
+        contextBefore.join('\n'),
+        contextAfter.join('\n'),
+      ].join('\u0000'),
+    );
+    const occ = hashCounts.get(hkey) ?? 0;
+    hashCounts.set(hkey, occ + 1);
+    const id = occ === 0 ? `${path}#${hkey}` : `${path}#${hkey}~${occ}`;
+
+    hunks.push({
+      id,
+      path,
+      baseStart: runBaseStart + 1,
+      baseLines: delLines,
+      stagedStart: runStagedStart + 1,
+      stagedLines: insLines,
+      contextBefore,
+      contextAfter,
+      reverted: false,
+    });
+  }
+
+  const additions = hunks.reduce((n, h) => n + h.stagedLines.length, 0);
+  const deletions = hunks.reduce((n, h) => n + h.baseLines.length, 0);
+  return { path, kind, hunks, additions, deletions };
+}
+
+/**
+ * Reconstruct the staged content from base + hunks. When `skipReverted` is
+ * true, hunks flagged `reverted` keep their original base lines instead of the
+ * staged lines — this materializes a selective revert. With `skipReverted`
+ * false every hunk is applied, reproducing the full staged content.
+ */
+export function applyHunksToBase(base: string, hunks: DiffHunk[], skipReverted: boolean): string {
+  const baseLines = splitLines(base);
+  const sorted = [...hunks].sort((a, b) => a.baseStart - b.baseStart);
+  const out: string[] = [];
+  let cursor = 0; // 0-based index into baseLines
+
+  for (const h of sorted) {
+    const start = h.baseStart - 1;
+    while (cursor < start && cursor < baseLines.length) {
+      out.push(baseLines[cursor]);
+      cursor++;
+    }
+    if (skipReverted && h.reverted) {
+      out.push(...h.baseLines);
+    } else {
+      out.push(...h.stagedLines);
+    }
+    cursor += h.baseLines.length;
+  }
+
+  while (cursor < baseLines.length) {
+    out.push(baseLines[cursor]);
+    cursor++;
+  }
+  return out.join('\n');
+}
+
+/** Render a hunk as a unified-diff excerpt (used by feedback prompts). */
+export function renderHunkDiff(h: DiffHunk): string {
+  const lines: string[] = [];
+  for (const l of h.contextBefore) lines.push(` ${l}`);
+  for (const l of h.baseLines) lines.push(`-${l}`);
+  for (const l of h.stagedLines) lines.push(`+${l}`);
+  for (const l of h.contextAfter) lines.push(` ${l}`);
+  return lines.join('\n');
+}

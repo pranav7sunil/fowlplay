@@ -1,0 +1,131 @@
+{
+  "name": "fowlplay",
+  "displayName": "FowlPlay",
+  "description": "AI coding partner for VS Code — Dino-style collaborative diff-first workflow with a Safe Agentic Workflow harness for local models.",
+  "version": "0.1.0",
+  "publisher": "fowlplay",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Other"
+  ],
+  "icon": "media/icon.png",
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "fowlplay.openTab",
+        "title": "FowlPlay: Open Tab",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "fowlplay.newConversation",
+        "title": "FowlPlay: New Conversation"
+      },
+      {
+        "command": "fowlplay.openSettings",
+        "title": "FowlPlay: Settings"
+      },
+      {
+        "command": "fowlplay.resetSettings",
+        "title": "FowlPlay: Reset Settings and Providers"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "fowlplay.openTab",
+        "key": "ctrl+alt+f",
+        "mac": "cmd+alt+f"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "fowlplay",
+          "title": "FowlPlay",
+          "icon": "media/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "fowlplay": [
+        {
+          "id": "fowlplay.home",
+          "name": "FowlPlay",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "editor/title": [
+        {
+          "command": "fowlplay.openTab",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "FowlPlay",
+      "properties": {
+        "fowlplay.appearance.fontFamily": {
+          "type": "string",
+          "default": "JetBrains Mono",
+          "description": "Font family for chat and code."
+        },
+        "fowlplay.appearance.fontScale": {
+          "type": "number",
+          "default": 1,
+          "description": "Chat text scale factor."
+        },
+        "fowlplay.appearance.theme": {
+          "type": "string",
+          "enum": [
+            "inherit",
+            "fowlplay-dark",
+            "fowlplay-light",
+            "fowlplay-midnight"
+          ],
+          "default": "inherit",
+          "description": "FowlPlay theme."
+        },
+        "fowlplay.harness.defaultMode": {
+          "type": "string",
+          "enum": [
+            "solo",
+            "coop"
+          ],
+          "default": "coop",
+          "description": "Default harness mode for new conversations."
+        },
+        "fowlplay.harness.qasRetryBudget": {
+          "type": "number",
+          "default": 2,
+          "description": "Maximum Inspector route-backs to the Builder per turn."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "e2e": "node e2e/run.mjs",
+    "package": "npm run build && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.24.0",
+    "preact": "^10.25.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
