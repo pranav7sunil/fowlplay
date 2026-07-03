@@ -1,0 +1,395 @@
+/**
+ * Coop harness unit tests — the pipeline state machine + verdict parsing.
+ *
+ * Uses scripted RoleRunner / ChangesetInspector fakes to drive each pipeline path.
+ */
+
+import { describe, expect, it, vi } from 'vitest';
+import type { GateCard, HarnessSettings, TokenUsage } from '../src/shared/types';
+import {
+  runCoopPipeline,
+  type ChangesetInspector,
+  type CoopResult,
+  type RoleRunner,
+} from '../src/core/harness/coop';
+import { parseVerdict } from '../src/core/harness/evidence';
+import { parseScout } from '../src/core/harness/roles';
+
+// ---------------------------------------------------------------------------
+// Fakes & helpers
+// ---------------------------------------------------------------------------
+
+const usage = (i = 1, o = 1, c = 0): TokenUsage => ({
+  inputTokens: i,
+  outputTokens: o,
+  cachedTokens: c,
+});
+
+/** A RoleRunner whose reply is chosen per role from scripted responses (FIFO per role). */
+function scriptedRunner(script: Partial<Record<string, string[]>>): {
+  runner: RoleRunner;
+  calls: Array<{ role: string; userPrompt: string }>;
+} {
+  const queues: Record<string, string[]> = {};
+  for (const [role, list] of Object.entries(script)) queues[role] = [...(list ?? [])];
+  const calls: Array<{ role: string; userPrompt: string }> = [];
+  const runner: RoleRunner = {
+    async run({ role, userPrompt }) {
+      calls.push({ role, userPrompt });
+      const q = queues[role];
+      const text = q && q.length > 1 ? q.shift()! : q?.[0] ?? '';
+      return { text, usage: usage() };
+    },
+  };
+  return { runner, calls };
+}
+
+function fakeInspector(diff = '--- a\n+++ b\n@@\n+added line'): ChangesetInspector {
+  return {
+    unifiedDiff: () => diff,
+    summary: () => ({ filesChanged: 1, additions: 1, deletions: 0 }),
+  };
+}
+
+const settings = (qasRetryBudget = 2): HarnessSettings => ({
+  defaultMode: 'coop',
+  qasRetryBudget,
+});
+
+/** Collect emitted cards; assert onGate always fires for the final card state. */
+function gateCollector() {
+  const emitted: GateCard[] = [];
+  return { onGate: (c: GateCard) => emitted.push({ ...c }), emitted };
+}
+
+const scoutOk = (criteria: string[]) =>
+  '```json\n' +
+  JSON.stringify({ criteria, plan: ['step one', 'step two'], ambiguous: false }) +
+  '\n```';
+
+const approve = '```json\n{"verdict":"approve","findings":[],"evidence":"all criteria met"}\n```';
+
+const rejectWith = (findings: string[]) =>
+  '```json\n' +
+  JSON.stringify({ verdict: 'reject', findings, evidence: 'criterion unmet' }) +
+  '\n```';
+
+// ---------------------------------------------------------------------------
+// Happy path
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — happy path', () => {
+  it('passes every gate and ends ready-for-review with correct card order', async () => {
+    const { runner } = scriptedRunner({
+      scout: [scoutOk(['C1: does X', 'C2: does Y'])],
+      inspector: [approve],
+      sentry: [approve],
+    });
+    const { onGate, emitted } = gateCollector();
+    const buildStage = vi.fn(async () => {});
+
+    const result = await runCoopPipeline({
+      userPrompt: 'add feature X',
+      runner,
+      inspector: fakeInspector(),
+      buildStage,
+      settings: settings(),
+      onGate,
+    });
+
+    expect(result.outcome).toBe('ready-for-review');
+    expect(buildStage).toHaveBeenCalledTimes(1);
+
+    // Final card state, in order.
+    const roles = result.cards.map((c) => c.role);
+    expect(roles).toEqual([
+      'scout',
+      'stop-the-line',
+      'builder',
+      'inspector',
+      'sentry',
+      'hitl',
+    ]);
+    const statusOf = (role: GateCard['role']) =>
+      result.cards.find((c) => c.role === role)?.status;
+    expect(statusOf('scout')).toBe('passed');
+    expect(statusOf('stop-the-line')).toBe('passed');
+    expect(statusOf('builder')).toBe('passed');
+    expect(statusOf('inspector')).toBe('passed');
+    expect(statusOf('sentry')).toBe('passed');
+    expect(statusOf('hitl')).toBe('running'); // awaiting the human
+
+    // Stop-the-line carries the criteria.
+    expect(result.cards.find((c) => c.role === 'stop-the-line')?.acceptanceCriteria).toEqual([
+      'C1: does X',
+      'C2: does Y',
+    ]);
+
+    // onGate saw both the running and final transitions for each card.
+    const runningThenFinal = emitted.filter((c) => c.role === 'inspector');
+    expect(runningThenFinal.map((c) => c.status)).toEqual(['running', 'passed']);
+
+    // Usage accumulated across scout + inspector + sentry (3 runner calls).
+    expect(result.usage.inputTokens).toBe(3);
+    expect(result.usage.outputTokens).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ambiguous scout → blocked
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — ambiguous scout', () => {
+  it('stops the line with the clarifying question and never builds', async () => {
+    const question = 'Which database should the cache use?';
+    const { runner } = scriptedRunner({
+      scout: [
+        '```json\n' +
+          JSON.stringify({ criteria: [], plan: [], ambiguous: true, question }) +
+          '\n```',
+      ],
+    });
+    const { emitted } = gateCollector();
+    const buildStage = vi.fn(async () => {});
+
+    const result = await runCoopPipeline({
+      userPrompt: 'add a cache',
+      runner,
+      inspector: fakeInspector(),
+      buildStage,
+      settings: settings(),
+      onGate: (c) => emitted.push(c),
+    });
+
+    expect(result.outcome).toBe('blocked');
+    expect(result.question).toBe(question);
+    expect(buildStage).not.toHaveBeenCalled();
+
+    const stl = result.cards.find((c) => c.role === 'stop-the-line');
+    expect(stl?.status).toBe('blocked');
+    expect(stl?.evidence).toContain(question);
+    expect(stl?.findings).toContain(question);
+    // No builder/inspector/sentry cards were produced.
+    expect(result.cards.some((c) => c.role === 'builder')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Inspector rejects once then approves
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — inspector route-back then approve', () => {
+  it('re-runs the builder with findings and numbers the attempts', async () => {
+    const findings = ['criterion 2: missing null check'];
+    const { runner } = scriptedRunner({
+      scout: [scoutOk(['C1', 'C2'])],
+      inspector: [rejectWith(findings), approve],
+      sentry: [approve],
+    });
+
+    const buildInstructions: string[] = [];
+    const buildStage = vi.fn(async (instructions: string) => {
+      buildInstructions.push(instructions);
+    });
+
+    const result = await runCoopPipeline({
+      userPrompt: 'implement C1 and C2',
+      runner,
+      inspector: fakeInspector(),
+      buildStage,
+      settings: settings(2),
+      onGate: () => {},
+    });
+
+    expect(result.outcome).toBe('ready-for-review');
+    expect(buildStage).toHaveBeenCalledTimes(2);
+
+    // Second build instruction carries the inspector's findings.
+    expect(buildInstructions[1]).toContain('missing null check');
+    expect(buildInstructions[1]).toMatch(/FIX THESE FINDINGS/i);
+
+    // Attempt numbering across builder + inspector cards.
+    const builders = result.cards.filter((c) => c.role === 'builder');
+    expect(builders.map((c) => c.attempt)).toEqual([1, 2]);
+    const inspectors = result.cards.filter((c) => c.role === 'inspector');
+    expect(inspectors.map((c) => c.attempt)).toEqual([1, 2]);
+    expect(inspectors.map((c) => c.status)).toEqual(['failed', 'passed']);
+    expect(inspectors[0].findings).toEqual(findings);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Retry budget exhaustion → qas-failed
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — retry budget exhaustion', () => {
+  it('gives up after budget+1 attempts and reports qas-failed', async () => {
+    const { runner } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      // Always reject — one string is reused for every inspector call.
+      inspector: [rejectWith(['still broken'])],
+      sentry: [approve],
+    });
+    const buildStage = vi.fn(async () => {});
+
+    const result = await runCoopPipeline({
+      userPrompt: 'do the thing',
+      runner,
+      inspector: fakeInspector(),
+      buildStage,
+      settings: settings(1), // 1 route-back → 2 total attempts
+      onGate: () => {},
+    });
+
+    expect(result.outcome).toBe('qas-failed');
+    expect(buildStage).toHaveBeenCalledTimes(2);
+    const inspectors = result.cards.filter((c) => c.role === 'inspector');
+    expect(inspectors).toHaveLength(2);
+    expect(inspectors.every((c) => c.status === 'failed')).toBe(true);
+    // Sentry never ran — changes stay staged for the human.
+    expect(result.cards.some((c) => c.role === 'sentry')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sentry finding → security-blocked (no retry)
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — sentry security block', () => {
+  it('blocks without any retry when the sentry finds a concern', async () => {
+    const { runner } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      inspector: [approve],
+      sentry: [
+        '```json\n' +
+          JSON.stringify({
+            verdict: 'block',
+            findings: ["config.ts: hard-coded API key at 'const KEY = \"sk-...\"'"],
+            evidence: 'secret committed',
+          }) +
+          '\n```',
+      ],
+    });
+    const buildStage = vi.fn(async () => {});
+
+    const result = await runCoopPipeline({
+      userPrompt: 'wire up the client',
+      runner,
+      inspector: fakeInspector(),
+      buildStage,
+      settings: settings(),
+      onGate: () => {},
+    });
+
+    expect(result.outcome).toBe('security-blocked');
+    expect(buildStage).toHaveBeenCalledTimes(1); // no security auto-fix retry
+    const sentry = result.cards.find((c) => c.role === 'sentry');
+    expect(sentry?.status).toBe('blocked');
+    expect(sentry?.findings?.[0]).toContain('hard-coded API key');
+    // No HITL card — the pipeline halted before human review.
+    expect(result.cards.some((c) => c.role === 'hitl')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — cancellation', () => {
+  it('returns cancelled when the signal aborts before the scout runs', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { runner } = scriptedRunner({ scout: [scoutOk(['C1'])] });
+    const buildStage = vi.fn(async () => {});
+
+    const result: CoopResult = await runCoopPipeline({
+      userPrompt: 'x',
+      runner,
+      inspector: fakeInspector(),
+      buildStage,
+      settings: settings(),
+      onGate: () => {},
+      signal: controller.signal,
+    });
+
+    expect(result.outcome).toBe('cancelled');
+    expect(buildStage).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Verdict parser fixtures
+// ---------------------------------------------------------------------------
+
+describe('parseVerdict', () => {
+  it('parses a clean fenced JSON block', () => {
+    const v = parseVerdict('```json\n{"verdict":"approve","findings":[],"evidence":"ok"}\n```');
+    expect(v.verdict).toBe('approve');
+    expect(v.evidence).toBe('ok');
+  });
+
+  it('parses JSON embedded in surrounding prose without fences', () => {
+    const v = parseVerdict(
+      'Here is my assessment. {"verdict": "reject", "findings": ["missing test"]} Thanks!',
+    );
+    expect(v.verdict).toBe('reject');
+    expect(v.findings).toEqual(['missing test']);
+  });
+
+  it('tolerates single-quoted JSON and trailing commas', () => {
+    const v = parseVerdict("{'verdict':'block','findings':['unsafe eval',],'evidence':'danger',}");
+    expect(v.verdict).toBe('block');
+    expect(v.findings).toEqual(['unsafe eval']);
+  });
+
+  it('falls back to a plain-text APPROVE first line', () => {
+    const v = parseVerdict('APPROVE\nEverything checks out, criteria all met.');
+    expect(v.verdict).toBe('approve');
+  });
+
+  it('falls back to a plain-text REJECT keyword', () => {
+    const v = parseVerdict('REJECT: the second criterion is not implemented');
+    expect(v.verdict).toBe('reject');
+  });
+
+  it('defaults to reject on unparseable garbage (fail-safe, never fail-open)', () => {
+    const v = parseVerdict('the weather today is quite pleasant and mild');
+    expect(v.verdict).toBe('reject');
+    expect(v.findings).toContain('could not parse verdict');
+  });
+
+  it('never approves an empty response', () => {
+    expect(parseVerdict('').verdict).toBe('reject');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scout parser fixtures
+// ---------------------------------------------------------------------------
+
+describe('parseScout', () => {
+  it('parses criteria + plan and marks not-ambiguous', () => {
+    const s = parseScout(scoutOk(['C1', 'C2']));
+    expect(s.ambiguous).toBe(false);
+    expect(s.criteria).toEqual(['C1', 'C2']);
+    expect(s.plan).toEqual(['step one', 'step two']);
+  });
+
+  it('honours an explicit ambiguous flag with a question', () => {
+    const s = parseScout('{"criteria":[],"plan":[],"ambiguous":true,"question":"Which API?"}');
+    expect(s.ambiguous).toBe(true);
+    expect(s.question).toBe('Which API?');
+  });
+
+  it('fails safe to ambiguous when no criteria can be recovered', () => {
+    const s = parseScout('sorry, I am not sure what you want');
+    expect(s.ambiguous).toBe(true);
+    expect(s.question).toBeTruthy();
+    expect(s.criteria).toEqual([]);
+  });
+
+  it('treats an empty-criteria non-ambiguous response as ambiguous (fail-safe)', () => {
+    const s = parseScout('{"criteria":[],"plan":["do it"],"ambiguous":false}');
+    expect(s.ambiguous).toBe(true);
+  });
+});
