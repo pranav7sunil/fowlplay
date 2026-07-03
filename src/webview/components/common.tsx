@@ -59,7 +59,14 @@ export function Collapsible({
   );
 }
 
-/** Anchored dropdown that closes on outside click / Escape. */
+/**
+ * Anchored dropdown that closes on outside click / Escape.
+ *
+ * Placement auto-flips: the menu opens downward by default, but when the
+ * trigger sits near the bottom of the viewport (e.g. the status-line model
+ * picker) it opens upward instead, and its height is capped to the space
+ * actually available on the chosen side so it never renders off-screen.
+ */
 export function Dropdown({
   trigger,
   children,
@@ -70,7 +77,24 @@ export function Dropdown({
   align?: 'left' | 'right';
 }) {
   const [open, setOpen] = useState(false);
+  const [up, setUp] = useState(false);
+  const [maxH, setMaxH] = useState<number | undefined>(undefined);
   const ref = useRef<HTMLDivElement>(null);
+
+  const toggle = () => {
+    if (!open && ref.current) {
+      const rect = ref.current.getBoundingClientRect();
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const spaceAbove = rect.top;
+      // Flip upward when the menu can't comfortably fit below and there is
+      // more room above; cap to the chosen side's space so it always fits.
+      const flip = spaceBelow < 300 && spaceAbove > spaceBelow;
+      setUp(flip);
+      setMaxH(Math.max(120, (flip ? spaceAbove : spaceBelow) - 16));
+    }
+    setOpen((o) => !o);
+  };
+
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => {
@@ -86,11 +110,19 @@ export function Dropdown({
       document.removeEventListener('keydown', onKey);
     };
   }, [open]);
+
   return (
     <div class="fp-anchor" ref={ref}>
-      {trigger(open, () => setOpen((o) => !o))}
+      {trigger(open, toggle)}
       {open && (
-        <div class="fp-menu" style={{ [align === 'right' ? 'right' : 'left']: 0, top: 'calc(100% + 4px)' }}>
+        <div
+          class="fp-menu"
+          style={{
+            [align === 'right' ? 'right' : 'left']: 0,
+            [up ? 'bottom' : 'top']: 'calc(100% + 4px)',
+            ...(maxH ? { maxHeight: `${maxH}px` } : {}),
+          }}
+        >
           {children(() => setOpen(false))}
         </div>
       )}
