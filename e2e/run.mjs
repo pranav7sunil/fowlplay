@@ -204,6 +204,21 @@ if (await search.isVisible().catch(() => false)) {
 } else ok(false, 'history search accepts input');
 await page.screenshot({ path: join(SHOTS, 'history.png'), fullPage: false });
 
+// ====================== HISTORY DIFF (read-only View Changes) ================
+console.log('\n# history diff (read-only)');
+await open('history-diff');
+await waitFor(page, () => document.body.innerText.includes('feat(auth): add AuthError'), 'commit block renders in transcript');
+const viewChanges = page.getByRole('button', { name: /view changes/i }).first();
+ok(await viewChanges.isVisible().catch(() => false), 'View Changes button visible on commit block');
+await viewChanges.click();
+ok((await sent(page, 'openDiff')).some((m) => m.changesetId === 'cs-hist-1'), 'View Changes posts openDiff with the frozen changeset id');
+await waitFor(page, () => document.body.innerText.includes('Viewing committed changes from history'), 'read-only history banner present');
+await waitFor(page, () => document.body.innerText.includes('src/auth/errors.ts'), 'frozen changeset file renders');
+ok(await page.getByRole('button', { name: 'Apply to Disk' }).isDisabled().catch(() => false), 'Apply to Disk disabled in read-only diff');
+ok(await page.getByRole('button', { name: /Apply & Commit/ }).isDisabled().catch(() => false), 'Apply & Commit disabled in read-only diff');
+ok((await page.locator('.fp-hunk-toolbar').count()) === 0, 'no revert/comment toolbar in read-only diff');
+await page.screenshot({ path: join(SHOTS, 'history-diff.png'), fullPage: false });
+
 // ============================== STREAM =======================================
 console.log('\n# stream');
 await open('stream');

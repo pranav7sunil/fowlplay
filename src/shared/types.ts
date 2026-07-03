@@ -109,6 +109,13 @@ export interface Conversation {
   usageTotals: TokenUsage;
   /** Serialized staging layer keyed by node id — snapshot at that point in the tree. */
   stagingSnapshots?: Record<string, SerializedOverlay>;
+  /**
+   * Frozen changeset views captured at apply/commit time, keyed by a stable id
+   * (`cs-<sha>` for commits, `cs-applied-<n>` for disk-only applies). Lets a
+   * historical commit block be re-opened read-only long after the live staging
+   * layer has moved on. Persists with the conversation.
+   */
+  committedChangesets?: Record<string, ChangeSetView>;
 }
 
 export interface ConversationSummary {

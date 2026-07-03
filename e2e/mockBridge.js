@@ -27,6 +27,12 @@
       if (msg && msg.type === 'ready') {
         // Defer so the UI has subscribed and rendered.
         setTimeout(runScenario, 0);
+        return;
+      }
+      // Read-only "View Changes" on a historical commit block: the host serves
+      // the frozen changeset for that id, regardless of the live overlay.
+      if (msg && msg.type === 'openDiff' && msg.changesetId === 'cs-hist-1') {
+        emit({ type: 'changeset', view: historicalView() });
       }
     },
     onMessage(handler) {
@@ -268,6 +274,70 @@
     };
   }
 
+  // A frozen changeset captured at commit time — served read-only when the user
+  // clicks "View Changes" on a historical commit block.
+  function historicalView() {
+    return {
+      id: 'cs-hist-1',
+      additions: 6,
+      deletions: 0,
+      totalChanges: 1,
+      files: [
+        {
+          path: 'src/auth/errors.ts',
+          kind: 'create',
+          additions: 6,
+          deletions: 0,
+          hunks: [
+            {
+              id: 'hh1', path: 'src/auth/errors.ts',
+              baseStart: 1, stagedStart: 1,
+              baseLines: [],
+              stagedLines: ['export class AuthError extends Error {', '  constructor(message: string) {', '    super(message);', '    this.name = "AuthError";', '  }', '}'],
+              contextBefore: [], contextAfter: [], reverted: false,
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  // A conversation whose assistant turn ended in an applied commit — carries a
+  // commit block with a frozen changeset id, plus the persisted frozen view.
+  function commitBlockConversation() {
+    const u = {
+      id: 'u1', parentId: null, role: 'user',
+      blocks: [{ type: 'text', text: 'Add a dedicated `AuthError` type and commit it.' }],
+      createdAt: now - 60000,
+    };
+    const a = {
+      id: 'a1', parentId: 'u1', role: 'assistant',
+      blocks: [
+        { type: 'text', text: 'Added `AuthError` and committed the change.' },
+        { type: 'commit', commit: { sha: 'abc1234def5678', message: 'feat(auth): add AuthError', changesetId: 'cs-hist-1', filesChanged: 1 } },
+      ],
+      createdAt: now - 30000,
+      model: { providerId: 'prov-ollama', modelId: 'qwen2.5-coder:32b' },
+      usage: { inputTokens: 320, outputTokens: 96, cachedTokens: 0 },
+    };
+    return {
+      type: 'conversation',
+      conversation: {
+        id: 'conv-hist',
+        title: 'Committed: add AuthError',
+        nodes: { u1: u, a1: a },
+        rootIds: ['u1'],
+        currentLeafId: 'a1',
+        model: { providerId: 'prov-ollama', modelId: 'qwen2.5-coder:32b' },
+        harnessMode: 'solo',
+        createdAt: now - 60000,
+        updatedAt: now,
+        usageTotals: { inputTokens: 320, outputTokens: 96, cachedTokens: 0 },
+        committedChangesets: { 'cs-hist-1': historicalView() },
+      },
+    };
+  }
+
   function conversationList() {
     return {
       type: 'conversationList',
@@ -289,6 +359,10 @@
   function runScenario() {
     const hash = (location.hash || '#chat').replace('#', '');
     switch (hash) {
+      case 'history-diff':
+        emit(settings(true));
+        emit(commitBlockConversation());
+        break;
       case 'diff':
         emit(settings(true));
         emit(conversation());

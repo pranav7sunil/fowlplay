@@ -11,6 +11,7 @@
 import { describe, expect, it } from 'vitest';
 import type {
   AppearanceSettings,
+  ContentBlock,
   Conversation,
   ConversationSummary,
   FowlPlaySettings,
@@ -316,6 +317,86 @@ describe('applyToDisk', () => {
       | Extract<HostToWebview, { type: 'changeset' }>
       | undefined;
     expect(lastCs?.view).toBeNull();
+  });
+});
+
+describe('View Changes on historical commits', () => {
+  it('freezes the committed diff, appends a commit block, and later serves the frozen (not live) diff', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    // Stage v1 on the first turn, v2 on the second — so the live changeset
+    // genuinely diverges from the frozen one captured at commit time.
+    const contents = ['v1\n', 'v2\n'];
+    let turn = 0;
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        // A turn's continuation call ends in a tool result; its opening call ends
+        // in the user prompt. (Checking the LAST message — not `.some` — matters
+        // across turns, where earlier turns' tool results linger in history.)
+        const last = request.messages[request.messages.length - 1];
+        const isContinuation = last?.role === 'tool';
+        const content = contents[Math.min(turn, contents.length - 1)];
+        const events: StreamEvent[] = isContinuation ? textEvents('done') : editEvents('foo.txt', content);
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('solo'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'create foo.txt' });
+    turn = 1;
+    await session.handle({ type: 'applyAndCommit', coAuthor: false });
+
+    // (a) A commit block was appended to the leaf assistant node.
+    const conv = lastConversation(posted)!;
+    const leaf = assistantLeaf(conv)!;
+    const commitBlock = leaf.blocks.find((b): b is Extract<ContentBlock, { type: 'commit' }> => b.type === 'commit');
+    expect(commitBlock).toBeDefined();
+    const commitId = commitBlock!.commit.changesetId;
+    expect(commitId).toBe('cs-abc1234'); // fakeGit returns sha 'abc1234'
+    expect(commitBlock!.commit.filesChanged).toBe(1);
+
+    // (b) The frozen view is stored under that id.
+    const frozenFirst = conv.committedChangesets?.[commitId];
+    expect(frozenFirst).toBeTruthy();
+    expect(frozenFirst!.id).toBe(commitId);
+    expect(frozenFirst!.files[0].path).toBe('foo.txt');
+    const frozenFingerprint = JSON.stringify(frozenFirst!.files);
+
+    // A second turn stages a DIFFERENT edit → the live changeset now diverges.
+    await session.handle({ type: 'sendPrompt', text: 'change foo.txt' });
+
+    // (c) Opening the historical diff serves the FIRST frozen view, not the live one.
+    const histFrom = posted.length;
+    await session.handle({ type: 'openDiff', changesetId: commitId });
+    const histMsg = posted.slice(histFrom).find((m) => m.type === 'changeset') as
+      | Extract<HostToWebview, { type: 'changeset' }>
+      | undefined;
+    expect(histMsg?.view).toBeTruthy();
+    expect(histMsg!.view!.id).toBe(commitId);
+    expect(JSON.stringify(histMsg!.view!.files)).toBe(frozenFingerprint);
+
+    // Sanity: the live changeset (no id) reflects the SECOND edit and differs.
+    const liveFrom = posted.length;
+    await session.handle({ type: 'openDiff' });
+    const liveMsg = posted.slice(liveFrom).find((m) => m.type === 'changeset') as
+      | Extract<HostToWebview, { type: 'changeset' }>
+      | undefined;
+    expect(liveMsg?.view).toBeTruthy();
+    expect(JSON.stringify(liveMsg!.view!.files)).not.toBe(frozenFingerprint);
   });
 });
 

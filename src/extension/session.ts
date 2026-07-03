@@ -16,6 +16,7 @@
 import type {
   AppearanceSettings,
   ChangeSetView,
+  CommitRecord,
   Conversation,
   ContentBlock,
   ConversationSummary,
@@ -147,6 +148,8 @@ export class SessionCore {
   private changeset: ChangeSet;
   private settingsCache: FowlPlaySettings | null = null;
   private abort: AbortController | null = null;
+  /** Monotonic counter for disk-only applies that have no commit sha. */
+  private appliedSeq = 0;
 
   /** Full (un-GC'd) wire history ending at each assistant node id, for follow-up turns. */
   private wireByNode = new Map<string, WireMessage[]>();
@@ -216,7 +219,7 @@ export class SessionCore {
         void this.persist();
         return;
       case 'openDiff':
-        this.sendChangeset();
+        this.sendChangeset(msg.changesetId);
         return;
       case 'toggleRevert':
         this.changeset.toggleRevert(msg.hunkId, msg.reverted);
@@ -326,7 +329,21 @@ export class SessionCore {
     this.deps.post({ type: 'conversation', conversation: this.conv });
   }
 
-  private sendChangeset(): void {
+  /**
+   * Post a changeset to the webview. With no id (or an id that is not a frozen
+   * historical changeset) this serves the live staging layer. When `changesetId`
+   * names a frozen committed changeset it serves that immutable snapshot instead,
+   * regardless of the live overlay's state — the entry point for read-only
+   * "View Changes" on a historical commit block.
+   */
+  private sendChangeset(changesetId?: string): void {
+    if (changesetId) {
+      const frozen = this.conv.committedChangesets?.[changesetId];
+      if (frozen) {
+        this.deps.post({ type: 'changeset', view: frozen });
+        return;
+      }
+    }
     this.deps.post({ type: 'changeset', view: this.overlay.isEmpty() ? null : this.changeset.view() });
   }
 
@@ -644,15 +661,31 @@ export class SessionCore {
       return;
     }
 
+    // Freeze the diff BEFORE discarding the overlay, so this applied changeset
+    // can be re-opened read-only later from its commit block in the transcript.
+    const frozen = this.changeset.view();
+    const filesChanged = frozen.files.length;
+
+    let commitInfo: { sha: string; message: string } | null = null;
     if (commit) {
       // commit() posts its own applied/error result. Even if the commit fails,
       // the files were already written to disk above, so the staged copy is now
       // stale and must be cleared — otherwise the next apply sees spurious drift
       // against the user's own just-written content.
-      await this.commit(paths, message, coAuthor, ops.length);
+      commitInfo = await this.commit(paths, message, coAuthor, ops.length);
     } else {
       this.deps.post({ type: 'applied', committed: false });
     }
+
+    // A commit gets a sha-stable id; a disk-only apply (or a failed/no-repo
+    // commit that still wrote to disk) gets a monotonic id so it stays browsable.
+    const id = commitInfo ? `cs-${commitInfo.sha}` : `cs-applied-${++this.appliedSeq}`;
+    this.recordCommit(id, { ...frozen, id }, {
+      sha: commitInfo?.sha ?? '',
+      message: commitInfo?.message ?? 'Applied to disk',
+      changesetId: id,
+      filesChanged,
+    });
 
     // Applied changes are on disk now — no longer staged.
     this.overlay.discard();
@@ -660,26 +693,59 @@ export class SessionCore {
     this.sendChangeset();
   }
 
+  /**
+   * Persist a frozen changeset and append a commit block to the transcript, then
+   * sync + save. The block lands on the current leaf when it is an assistant node
+   * (the common case: apply follows a turn); otherwise a fresh assistant node
+   * carries it so it is never dropped.
+   */
+  private recordCommit(id: string, view: ChangeSetView, record: CommitRecord): void {
+    const committedChangesets = { ...(this.conv.committedChangesets ?? {}), [id]: view };
+    const leafId = this.conv.currentLeafId;
+    const leaf = leafId ? this.conv.nodes[leafId] : undefined;
+    if (leaf && leaf.role === 'assistant') {
+      const nodes = {
+        ...this.conv.nodes,
+        [leafId!]: { ...leaf, blocks: [...leaf.blocks, { type: 'commit' as const, commit: record }] },
+      };
+      this.conv = { ...this.conv, nodes, committedChangesets, updatedAt: this.clock() };
+    } else {
+      const { conv } = appendAssistant(
+        { ...this.conv, committedChangesets },
+        [{ type: 'commit', commit: record }],
+        { parentId: leafId ?? undefined, model: this.conv.model ?? undefined },
+      );
+      this.conv = conv;
+    }
+    void this.persist();
+    this.sendConversation();
+  }
+
+  /**
+   * Commit the written paths. Returns the sha + final message on success, or
+   * null when no commit was made (no repo, or the commit failed) — the caller
+   * treats null as a disk-only apply for the purposes of the frozen changeset.
+   */
   private async commit(
     paths: string[],
     message: string | undefined,
     coAuthor: boolean,
     fileCount: number,
-  ): Promise<boolean> {
+  ): Promise<{ sha: string; message: string } | null> {
     const git = this.deps.git;
     if (!git || !(await git.isRepo())) {
       this.deps.post({ type: 'applied', committed: false });
       this.toast('warn', 'No git repository — changes were applied to disk without a commit.');
-      return true;
+      return null;
     }
     const finalMessage = (message && message.trim()) || (await this.generateCommitMessage()) || heuristicMessage(paths, fileCount);
     try {
       const { sha } = await git.commit(paths, finalMessage, coAuthor);
       this.deps.post({ type: 'applied', committed: true, sha });
-      return true;
+      return { sha, message: finalMessage };
     } catch (err) {
       this.deps.post({ type: 'applied', committed: false, error: `Commit failed: ${errMessage(err)}` });
-      return false;
+      return null;
     }
   }
 
