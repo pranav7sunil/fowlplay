@@ -29,8 +29,28 @@ export class WorkspaceIo implements DiskIo {
     return folder ? new WorkspaceIo(folder.uri) : null;
   }
 
+  /**
+   * Resolve a workspace-relative path to an absolute URI, guaranteeing the
+   * result stays inside the workspace root.
+   *
+   * `vscode.Uri.joinPath` normalizes `..` segments and will happily walk out of
+   * the root (e.g. `../../etc/passwd`), so a containment check here is the
+   * single choke point that keeps model-proposed paths — for both reads and
+   * writes — confined to the workspace. Absolute-looking inputs are already
+   * defused by dropping empty segments, but `..` must be rejected explicitly.
+   */
   private uri(path: string): vscode.Uri {
-    return vscode.Uri.joinPath(this.root, ...path.split('/').filter(Boolean));
+    const resolved = vscode.Uri.joinPath(this.root, ...path.split('/').filter(Boolean));
+    const rootPath = this.root.path.replace(/\/+$/, '');
+    const resolvedPath = resolved.path.replace(/\/+$/, '');
+    if (
+      resolved.scheme !== this.root.scheme ||
+      resolved.authority !== this.root.authority ||
+      !(resolvedPath === rootPath || resolvedPath.startsWith(rootPath + '/'))
+    ) {
+      throw new Error(`Path escapes the workspace: ${path}`);
+    }
+    return resolved;
   }
 
   async read(path: string): Promise<string | null> {
