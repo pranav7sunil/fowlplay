@@ -94,6 +94,7 @@ export type HostToWebview =
   | { type: 'settings'; settings: FowlPlaySettings }
   | { type: 'modelsFetched'; providerId: string; models: { id: string }[]; error?: string }
   // misc
+  | { type: 'showView'; view: 'chat' | 'diff' | 'settings' | 'history' }
   | { type: 'toast'; level: 'info' | 'warn' | 'error'; message: string };
 
 // ---------------------------------------------------------------------------

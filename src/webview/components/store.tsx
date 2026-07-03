@@ -160,6 +160,9 @@ class Store {
           modelsError: { ...this.state.modelsError, [msg.providerId]: msg.error },
         });
         break;
+      case 'showView':
+        this.setView(msg.view);
+        break;
       case 'toast':
         this.pushToast(msg.level, msg.message);
         break;
