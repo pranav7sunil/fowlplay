@@ -186,6 +186,31 @@ function HarnessTab({ settings }: { settings: FowlPlaySettings | null }) {
           ))}
         </div>
       </div>
+
+      <SkillsSection settings={settings} />
     </>
+  );
+}
+
+function SkillsSection({ settings }: { settings: FowlPlaySettings | null }) {
+  const skills = settings?.skills ?? [];
+  return (
+    <div class="fp-section">
+      <h2>Skills</h2>
+      <div class="fp-section-desc">
+        Reusable instruction docs the model loads on demand (Solo and Builder). Add your own as
+        {' '}<code>.fowlplay/skills/*.md</code> — they override bundled skills of the same name.
+      </div>
+      {skills.length === 0 ? (
+        <div class="fp-empty">No skills discovered.</div>
+      ) : (
+        skills.map((s) => (
+          <div class="fp-provider-row" key={s.name}>
+            <span class="fp-provider-name">{s.name}</span>
+            <span style={{ color: 'var(--fp-fg-muted)', fontSize: 12 }}>{s.description}</span>
+          </div>
+        ))
+      )}
+    </div>
   );
 }

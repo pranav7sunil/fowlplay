@@ -124,6 +124,17 @@ if (await review.isVisible().catch(() => false)) {
   ok(false, 'Review Changes button visible');
 }
 
+// ============================== EDIT SELECTION ===============================
+console.log('\n# edit selection');
+await open('selection');
+await waitFor(page, () => document.body.innerText.includes('authService.ts:12-20'), 'selection chip shows basename:range');
+const chip = page.locator('.fp-selection-chip').first();
+ok(await chip.isVisible().catch(() => false), 'selection chip visible above composer');
+await page.screenshot({ path: join(SHOTS, 'selection.png'), fullPage: false });
+await chip.getByRole('button', { name: /clear selection/i }).click();
+ok((await sent(page, 'clearSelection')).length === 1, 'clicking × posts clearSelection');
+await waitFor(page, () => !document.body.innerText.includes('authService.ts:12-20'), 'chip clears after dismiss');
+
 // ============================== DIFF =========================================
 console.log('\n# diff');
 await open('diff');
@@ -179,6 +190,8 @@ for (const tab of ['Appearance', 'Harness']) {
   } else ok(false, `${tab} tab clickable`);
 }
 await waitFor(page, () => /Scout|Inspector|Sentry/.test(document.body.innerText), 'harness tab explains Coop pipeline');
+await waitFor(page, () => document.body.innerText.includes('commit-message'), 'harness tab lists discovered skills');
+await waitFor(page, () => /\.fowlplay\/skills/.test(document.body.innerText), 'harness tab documents .fowlplay/skills location');
 await page.screenshot({ path: join(SHOTS, 'settings.png'), fullPage: false });
 
 // ============================== ONBOARDING ===================================

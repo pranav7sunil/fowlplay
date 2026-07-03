@@ -32,6 +32,10 @@
         "title": "FowlPlay: Settings"
       },
       {
+        "command": "fowlplay.editSelection",
+        "title": "FowlPlay: Edit Selection"
+      },
+      {
         "command": "fowlplay.resetSettings",
         "title": "FowlPlay: Reset Settings and Providers"
       }
@@ -41,6 +45,12 @@
         "command": "fowlplay.openTab",
         "key": "ctrl+alt+f",
         "mac": "cmd+alt+f"
+      },
+      {
+        "command": "fowlplay.editSelection",
+        "key": "ctrl+alt+e",
+        "mac": "cmd+alt+e",
+        "when": "editorHasSelection"
       }
     ],
     "viewsContainers": {
@@ -66,6 +76,13 @@
         {
           "command": "fowlplay.openTab",
           "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "fowlplay.editSelection",
+          "when": "editorHasSelection",
+          "group": "1_modification"
         }
       ]
     },

@@ -28,7 +28,10 @@ import type {
   ModelRef,
   ProviderConfig,
   SdkType,
+  SelectionContext,
   SerializedOverlay,
+  Skill,
+  SkillMeta,
   StreamEvent,
   TokenUsage,
   ToolSpec,
@@ -39,6 +42,7 @@ import { createAdapter as coreCreateAdapter, type ProviderAdapter, type WireAssi
 import { fetchModels as coreFetchModels, type FetchModelsConfig } from '../core/providers/registry';
 import { runAgentLoop } from '../core/agent/loop';
 import { buildToolSpecs, type DirEntry, type GrepMatch, type GrepOptions, type StageOp, type ToolHost } from '../core/agent/tools';
+import { BUNDLED_SKILLS, formatSkillCatalog, parseSkill } from '../core/agent/skills';
 import { gcHistory } from '../core/agent/contextGc';
 import { StagingOverlay, type DiskReader } from '../core/staging/overlay';
 import { ChangeSet } from '../core/staging/changeset';
@@ -151,6 +155,16 @@ export class SessionCore {
   /** Monotonic counter for disk-only applies that have no commit sha. */
   private appliedSeq = 0;
 
+  /** A highlighted editor region pinned as scoped context for the NEXT prompt. */
+  private pendingSelection: SelectionContext | null = null;
+
+  /**
+   * Skills available for the current turn (bundled defaults + workspace
+   * `.fowlplay/skills/*.md`), rediscovered at the start of each turn. Consumed by
+   * `toolHost()` (for `load_skill`) and the system-prompt catalog injection.
+   */
+  private turnSkills: Skill[] = [];
+
   /** Full (un-GC'd) wire history ending at each assistant node id, for follow-up turns. */
   private wireByNode = new Map<string, WireMessage[]>();
 
@@ -175,6 +189,16 @@ export class SessionCore {
     return this.conv;
   }
 
+  /**
+   * Pin a highlighted editor region as scoped context for the next prompt
+   * ("Edit Selection"). Stored host-side so it survives even if the webview
+   * misses the chip message; consumed once by the next `sendPrompt`.
+   */
+  receiveSelection(ctx: SelectionContext): void {
+    this.pendingSelection = ctx;
+    this.deps.post({ type: 'selectionContext', context: ctx });
+  }
+
   // -------------------------------------------------------------------------
   // Message dispatch
   // -------------------------------------------------------------------------
@@ -189,6 +213,10 @@ export class SessionCore {
         return;
       case 'cancelResponse':
         this.abort?.abort();
+        return;
+      case 'clearSelection':
+        this.pendingSelection = null;
+        this.deps.post({ type: 'selectionContext', context: null });
         return;
       case 'editMessage':
         await this.onEditMessage(msg.nodeId, msg.text);
@@ -316,6 +344,9 @@ export class SessionCore {
     }
     this.sendConversation();
     if (!this.overlay.isEmpty()) this.sendChangeset();
+    // A selection delivered before the webview mounted (freshly opened tab) had
+    // its chip message dropped; re-surface it now that the webview is listening.
+    if (this.pendingSelection) this.deps.post({ type: 'selectionContext', context: this.pendingSelection });
   }
 
   private async ensureSettings(): Promise<FowlPlaySettings> {
@@ -326,7 +357,10 @@ export class SessionCore {
   private async sendSettings(forceReload = false): Promise<void> {
     if (forceReload) this.settingsCache = null;
     const settings = await this.ensureSettings();
-    this.deps.post({ type: 'settings', settings });
+    // Attach discovered skills so the Settings UI can show what is available.
+    // Not part of the persisted settings — recomputed on demand, never cached.
+    const skills = toSkillMetas(await this.discoverSkills());
+    this.deps.post({ type: 'settings', settings: { ...settings, skills } });
   }
 
   private sendConversation(): void {
@@ -369,15 +403,28 @@ export class SessionCore {
     const atts = attachments ?? [];
     if (!trimmed && atts.length === 0) return;
 
+    // A pinned "Edit Selection" region applies to exactly one turn. Consume it
+    // now so a follow-up prompt without a fresh selection is unscoped.
+    const selection = this.pendingSelection;
+    this.pendingSelection = null;
+
     // Text-like files are inlined into the prompt so they persist in the tree
     // and replay on branch/resume; images are passed as image wire parts for
     // this turn (there is no image content block to persist them in).
     const images = atts.filter((a) => a.mimeType.startsWith('image/'));
     const textFiles = atts.filter((a) => !a.mimeType.startsWith('image/'));
 
+    // Prepend the highlighted region as a pinned context block (mirrors the
+    // attachment-inlining style) so it folds into the user node's text and
+    // naturally persists / replays on branch or resume.
     let displayText = trimmed;
+    if (selection) {
+      const label = selection.languageId || selection.path;
+      const header = `The user highlighted lines ${selection.startLine}–${selection.endLine} of \`${selection.path}\`. Scope the change to this selection unless related code must change too.`;
+      displayText = `${header}\n\n${fencedBlock(label, selection.text)}\n\n${displayText}`;
+    }
     for (const f of textFiles) {
-      displayText += `\n\n\`\`\`${f.name}\n${f.data}\n\`\`\``;
+      displayText += `\n\n${fencedBlock(f.name, f.data)}`;
     }
     for (const img of images) {
       displayText += `\n\n_[Attached image: ${img.name}]_`;
@@ -387,6 +434,9 @@ export class SessionCore {
       type: 'image',
       image: { mimeType: a.mimeType, data: a.data },
     }));
+
+    // The selection has been folded into this turn's prompt — clear the chip.
+    if (selection) this.deps.post({ type: 'selectionContext', context: null });
 
     const { conv, nodeId } = appendUser(this.conv, [{ type: 'text', text: displayText || '(see attachments)' }]);
     this.conv = conv;
@@ -422,6 +472,10 @@ export class SessionCore {
       this.sendConversation();
       return;
     }
+
+    // Discover skills once for this turn (bundled + workspace). Both run modes
+    // read this via `toolHost()` and the system-prompt catalog.
+    this.turnSkills = await this.discoverSkills();
 
     const userNode = this.conv.nodes[userNodeId];
     const userText = firstText(userNode?.blocks ?? []) ?? '';
@@ -493,9 +547,9 @@ export class SessionCore {
       baseUrl: resolved.baseUrl,
       apiKey: resolved.apiKey,
       modelId: resolved.modelId,
-      system: SOLO_SYSTEM,
+      system: this.systemWithSkills(SOLO_SYSTEM),
       history: sent,
-      tools: this.allTools,
+      tools: this.toolsWithSkills(),
       toolHost: this.toolHost(),
       onEvent: (e) => this.deps.post({ type: 'stream', event: e }),
       signal,
@@ -553,9 +607,9 @@ export class SessionCore {
         baseUrl: resolved.baseUrl,
         apiKey: resolved.apiKey,
         modelId: resolved.modelId,
-        system: SOLO_SYSTEM,
+        system: this.systemWithSkills(SOLO_SYSTEM),
         history: gcHistory(base),
-        tools: this.allTools,
+        tools: this.toolsWithSkills(),
         toolHost: this.toolHost(),
         onEvent: (e) => this.deps.post({ type: 'stream', event: e }),
         signal: s,
@@ -945,6 +999,7 @@ export class SessionCore {
   private toolHost(): ToolHost {
     const overlay = this.overlay;
     const io = this.deps.io;
+    const skills = this.turnSkills;
     return {
       async readFile(path: string): Promise<string> {
         const content = await overlay.read(path);
@@ -964,7 +1019,48 @@ export class SessionCore {
       async listStaged(): Promise<string[]> {
         return overlay.ops().map((o) => o.path);
       },
+      skills: toSkillMetas(skills),
+      async loadSkill(name: string): Promise<string | null> {
+        const target = name.trim();
+        const match =
+          skills.find((s) => s.name === target) ??
+          skills.find((s) => s.name.toLowerCase() === target.toLowerCase());
+        return match ? match.body : null;
+      },
     };
+  }
+
+  /**
+   * Discover skills for a turn: the bundled defaults, overlaid by any workspace
+   * skills under `.fowlplay/skills/*.md` (workspace wins on a name collision).
+   */
+  private async discoverSkills(): Promise<Skill[]> {
+    const byName = new Map<string, Skill>();
+    for (const s of BUNDLED_SKILLS) byName.set(s.name, s);
+    try {
+      const files = await this.deps.io.glob('.fowlplay/skills/*.md');
+      for (const file of files) {
+        const raw = await this.deps.io.read(file);
+        if (raw === null) continue;
+        const skill = parseSkill(file, raw);
+        byName.set(skill.name, skill);
+      }
+    } catch {
+      /* skills are best-effort; fall back to bundled defaults */
+    }
+    return [...byName.values()];
+  }
+
+  /** Prepend the skill catalog to a base system prompt (no-op when no skills). */
+  private systemWithSkills(base: string): string {
+    const catalog = formatSkillCatalog(toSkillMetas(this.turnSkills));
+    return catalog ? `${catalog}\n\n${base}` : base;
+  }
+
+  /** The base toolset, plus `load_skill` when skills are available this turn. */
+  private toolsWithSkills(): ToolSpec[] {
+    const metas = toSkillMetas(this.turnSkills);
+    return metas.length > 0 ? buildToolSpecs({ skills: metas }) : this.allTools;
   }
 
   private async resolveModel(): Promise<ResolvedModel | null> {
@@ -1081,6 +1177,11 @@ function emptyUsage(): TokenUsage {
   return { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
 }
 
+/** Strip skill bodies down to catalog metadata (name + description). */
+function toSkillMetas(skills: Skill[]): SkillMeta[] {
+  return skills.map(({ name, description }) => ({ name, description }));
+}
+
 function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
   return {
     inputTokens: a.inputTokens + b.inputTokens,
@@ -1092,6 +1193,19 @@ function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
 function firstText(blocks: ContentBlock[]): string | null {
   for (const b of blocks) if (b.type === 'text' && b.text.trim()) return b.text;
   return null;
+}
+
+/**
+ * Wrap arbitrary content in a fenced code block whose backtick run is longer
+ * than any run inside the content, so selected text or a file that itself
+ * contains ``` cannot break out of the fence (which would corrupt the pinned
+ * context / open a prompt-injection seam).
+ */
+function fencedBlock(info: string, content: string): string {
+  let longest = 0;
+  for (const m of content.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const fence = '`'.repeat(Math.max(3, longest + 1));
+  return `${fence}${info}\n${content}\n${fence}`;
 }
 
 function joinText(blocks: ContentBlock[]): string {

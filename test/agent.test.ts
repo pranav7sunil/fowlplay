@@ -127,6 +127,58 @@ describe('tools', () => {
   });
 });
 
+// --- load_skill ------------------------------------------------------------
+
+describe('load_skill tool', () => {
+  const metas = [
+    { name: 'commit-message', description: 'write a commit message' },
+    { name: 'test-writing', description: 'write tests' },
+  ];
+
+  function skillHost(bodies: Record<string, string>): ToolHost {
+    return {
+      ...makeHost({}),
+      skills: metas,
+      async loadSkill(name: string) {
+        return name in bodies ? bodies[name] : null;
+      },
+    };
+  }
+
+  it('is omitted from the toolset when no skills exist (backward-compatible)', () => {
+    expect(buildToolSpecs().map((t) => t.name)).not.toContain('load_skill');
+    expect(buildToolSpecs({}).map((t) => t.name)).not.toContain('load_skill');
+    expect(buildToolSpecs({ skills: [] }).map((t) => t.name)).not.toContain('load_skill');
+  });
+
+  it('is appended (with skill names in its description) when skills exist', () => {
+    const specs = buildToolSpecs({ skills: metas });
+    const loadSkill = specs.find((t) => t.name === 'load_skill');
+    expect(loadSkill).toBeDefined();
+    expect(loadSkill!.description).toContain('commit-message');
+    expect(loadSkill!.description).toContain('test-writing');
+    // The base toolset is otherwise untouched.
+    expect(specs.slice(0, 5).map((t) => t.name)).toEqual(['open_files', 'list_dir', 'glob', 'grep', 'edit_files']);
+  });
+
+  it('dispatch returns the skill body', async () => {
+    const host = skillHost({ 'commit-message': 'BODY: how to write a commit' });
+    const res = await dispatchToolCall(host, 'load_skill', { name: 'commit-message' });
+    expect(res.ok).toBe(true);
+    expect(res.content).toBe('BODY: how to write a commit');
+    expect(res.gcClass).toBe('other');
+  });
+
+  it('dispatch reports an unknown skill and lists available names', async () => {
+    const host = skillHost({ 'commit-message': 'x' });
+    const res = await dispatchToolCall(host, 'load_skill', { name: 'nope' });
+    expect(res.ok).toBe(false);
+    expect(res.content).toContain('unknown skill: nope');
+    expect(res.content).toContain('commit-message');
+    expect(res.content).toContain('test-writing');
+  });
+});
+
 // --- loop.ts ---------------------------------------------------------------
 
 /** Adapter that replays a scripted list of events per chat() call. */

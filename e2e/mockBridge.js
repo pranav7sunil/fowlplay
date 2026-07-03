@@ -34,6 +34,10 @@
       if (msg && msg.type === 'openDiff' && msg.changesetId === 'cs-hist-1') {
         emit({ type: 'changeset', view: historicalView() });
       }
+      // "Edit Selection" chip dismissed → the host clears the pinned selection.
+      if (msg && msg.type === 'clearSelection') {
+        emit({ type: 'selectionContext', context: null });
+      }
     },
     onMessage(handler) {
       handlers.push(handler);
@@ -85,6 +89,10 @@
         harness: { defaultMode: 'coop', qasRetryBudget: 2 },
         providers: hasProviders ? providers() : [],
         defaultModel: hasProviders ? { providerId: 'prov-ollama', modelId: 'qwen2.5-coder:32b' } : null,
+        skills: [
+          { name: 'commit-message', description: 'Write a clear, conventional commit message for a staged changeset.' },
+          { name: 'test-writing', description: 'Write focused, deterministic tests that pin the behavior a change introduces.' },
+        ],
       },
     };
   }
@@ -384,6 +392,20 @@
         emit(settings(true));
         emit(conversationList());
         setView('history');
+        break;
+      case 'selection':
+        emit(settings(true));
+        emit(conversation());
+        emit({
+          type: 'selectionContext',
+          context: {
+            path: 'src/auth/authService.ts',
+            startLine: 12,
+            endLine: 20,
+            text: 'export async function login(u, p) {\n  return api.post("/login", { u, p });\n}',
+            languageId: 'typescript',
+          },
+        });
         break;
       case 'chat':
       default:

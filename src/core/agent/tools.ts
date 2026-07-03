@@ -6,7 +6,7 @@
  * Tools accept batch inputs (open N files, apply N edits) to minimize round-trips.
  */
 
-import type { ToolResult, ToolSpec } from '../../shared/types';
+import type { SkillMeta, ToolResult, ToolSpec } from '../../shared/types';
 import { applyFindReplace } from './edits';
 
 // ---------------------------------------------------------------------------
@@ -49,14 +49,31 @@ export interface ToolHost {
   stageEdit(ops: StageOp[]): Promise<void>;
   /** Paths currently staged (for diagnostics / summaries). */
   listStaged(): Promise<string[]>;
+  /**
+   * Load a skill's full instruction body by name, or `null` if no such skill.
+   * Optional: hosts without the skills capability simply omit it (the `load_skill`
+   * tool is only ever offered when skills exist).
+   */
+  loadSkill?(name: string): Promise<string | null>;
+  /** Skills available to load, used to list valid names in error messages. */
+  skills?: SkillMeta[];
 }
 
 // ---------------------------------------------------------------------------
 // Tool schemas
 // ---------------------------------------------------------------------------
 
-export function buildToolSpecs(): ToolSpec[] {
-  return [
+export interface BuildToolSpecsOptions {
+  /**
+   * When non-empty, a `load_skill` tool is appended (with the available skill names
+   * listed in its description). With no skills the toolset is exactly today's — the
+   * skills capability is strictly opt-in.
+   */
+  skills?: SkillMeta[];
+}
+
+export function buildToolSpecs(opts?: BuildToolSpecsOptions): ToolSpec[] {
+  const specs: ToolSpec[] = [
     {
       name: 'open_files',
       description:
@@ -142,6 +159,25 @@ export function buildToolSpecs(): ToolSpec[] {
       },
     },
   ];
+
+  const skills = opts?.skills;
+  if (skills && skills.length > 0) {
+    specs.push({
+      name: 'load_skill',
+      description:
+        'Load the full instructions for a reusable skill before you rely on it. ' +
+        `Available skills: ${skills.map((s) => s.name).join(', ')}.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'The exact name of the skill to load.' },
+        },
+        required: ['name'],
+      },
+    });
+  }
+
+  return specs;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +201,8 @@ export async function dispatchToolCall(
         return await grepTool(host, args);
       case 'edit_files':
         return await editFiles(host, args);
+      case 'load_skill':
+        return await loadSkillTool(host, args);
       default:
         return { ok: false, content: `Unknown tool: ${name}` };
     }
@@ -330,6 +368,29 @@ async function editFiles(host: ToolHost, args: unknown): Promise<ToolResult> {
   }
 
   return { ok: allOk, content: results.join('\n'), gcClass: 'other' };
+}
+
+// --- load_skill -------------------------------------------------------------
+
+async function loadSkillTool(host: ToolHost, args: unknown): Promise<ToolResult> {
+  const name = asString((args as { name?: unknown })?.name)?.trim();
+  if (!name) {
+    return { ok: false, content: 'load_skill requires a "name" string' };
+  }
+  if (!host.loadSkill) {
+    return { ok: false, content: 'skills are not available in this session' };
+  }
+  const body = await host.loadSkill(name);
+  if (body === null) {
+    const available = host.skills?.map((s) => s.name).join(', ');
+    return {
+      ok: false,
+      content: available
+        ? `unknown skill: ${name}. Available skills: ${available}`
+        : `unknown skill: ${name}`,
+    };
+  }
+  return { ok: true, content: body, gcClass: 'other' };
 }
 
 function normalizeEdit(raw: unknown): EditSpec | null {

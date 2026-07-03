@@ -15,6 +15,7 @@ import type {
   ModelRef,
   ProviderConfig,
   RebaseState,
+  SelectionContext,
   StreamEvent,
   TokenUsage,
 } from './types';
@@ -29,6 +30,7 @@ export type WebviewToHost =
   // chat
   | { type: 'sendPrompt'; text: string; attachments?: Attachment[] }
   | { type: 'cancelResponse' }
+  | { type: 'clearSelection' }                                    // dismiss the pinned selection chip
   | { type: 'editMessage'; nodeId: string; text: string }        // branches
   | { type: 'rerunMessage'; nodeId: string }                      // sibling response
   | { type: 'rewindTo'; nodeId: string }
@@ -81,6 +83,7 @@ export type HostToWebview =
   | { type: 'stream'; event: StreamEvent }
   | { type: 'gateUpdate'; card: GateCard }
   | { type: 'turnStarted'; nodeId: string }                       // assistant node created
+  | { type: 'selectionContext'; context: SelectionContext | null } // scoped editor selection (null clears the chip)
   | { type: 'turnFinished'; nodeId: string; usage: TokenUsage }
   // diff review
   | { type: 'changeset'; view: ChangeSetView | null }

@@ -35,6 +35,19 @@ export interface ModelRef {
   modelId: string;
 }
 
+/**
+ * A region the user highlighted in the editor, passed to a session as scoped
+ * context for the next change ("Edit Selection"). Line numbers are 1-based and
+ * inclusive.
+ */
+export interface SelectionContext {
+  path: string;               // workspace-relative
+  startLine: number;
+  endLine: number;
+  text: string;
+  languageId?: string;
+}
+
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
@@ -208,6 +221,26 @@ export interface HarnessSettings {
 }
 
 // ---------------------------------------------------------------------------
+// Skills (model-invoked, lazy-loaded instruction docs)
+// ---------------------------------------------------------------------------
+
+/**
+ * A skill's catalog entry — name + one-line description. This is what is listed
+ * in a system prompt so the model can decide, cheaply, whether to load a skill's
+ * full instructions via the `load_skill` tool. Bodies are NOT included here (that
+ * is the whole point — skills stay out of context until explicitly loaded).
+ */
+export interface SkillMeta {
+  name: string;
+  description: string;
+}
+
+/** A full skill: its catalog metadata plus the markdown instructions to inject on load. */
+export interface Skill extends SkillMeta {
+  body: string;
+}
+
+// ---------------------------------------------------------------------------
 // Agent tools (model-facing)
 // ---------------------------------------------------------------------------
 
@@ -258,4 +291,10 @@ export interface FowlPlaySettings {
   harness: HarnessSettings;
   providers: ProviderConfig[]; // keys stored separately in SecretStorage
   defaultModel: ModelRef | null;
+  /**
+   * Skills discovered for the active workspace (bundled defaults + `.fowlplay/skills/*.md`),
+   * attached by the host when it posts settings so the UI can show what is available.
+   * Not persisted — recomputed on demand.
+   */
+  skills?: SkillMeta[];
 }

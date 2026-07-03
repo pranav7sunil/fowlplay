@@ -111,6 +111,27 @@ Two run modes, toggleable per tab from the status line:
 - Role prompts are markdown files bundled with the extension and overridable per workspace
   (`.fowlplay/roles/*.md`).
 
+### Skills (opt-in, lazy, model-invoked)
+
+Adapted from the Safe Agentic Workflow's model-invoked skills. A **skill** is a reusable
+markdown instruction doc (e.g. "commit-message", "test-writing") the model can pull in on
+demand. Unlike an always-on `AGENTS.md` (a Dino non-goal, see §8), skills are deliberately
+**lazy**: only each skill's name + one-line description is injected into the system prompt (a
+compact catalog). The full body stays out of context until the model explicitly calls the
+`load_skill` tool — preserving FowlPlay's context-GC philosophy (§1) rather than dumping
+instructions on every turn.
+
+- Skills come from two places, merged with **workspace overriding bundled by name**:
+  a couple of short **bundled defaults** (so the feature is demoable with zero setup) and
+  workspace files at **`.fowlplay/skills/*.md`**. A skill's name/description come from YAML
+  frontmatter (`name:` / `description:`), falling back to the first `#` heading / first prose
+  line / the filename.
+- The `load_skill` tool is offered **only when skills exist** — with no skills, the toolset is
+  unchanged. It is surfaced to the **Builder** (Coop) and the **Solo** loop, where
+  implementation happens; Scout/Inspector/Sentry do not get skills.
+- The Harness settings tab lists the discovered skills so you can see what is available and
+  where to add more.
+
 ## 7. Settings
 
 Settings panel (from the chat title bar), three tabs:

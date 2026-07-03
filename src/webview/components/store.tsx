@@ -12,6 +12,7 @@ import type {
   FowlPlaySettings,
   MessageNode,
   ContentBlock,
+  SelectionContext,
   TokenUsage,
   ToolCallRecord,
 } from '../../shared/types';
@@ -32,6 +33,7 @@ export interface AppState {
   conversation: Conversation | null;
   streaming: boolean;
   streamNodeId: string | null;
+  selectionContext: SelectionContext | null;
   changeset: ChangeSetView | null;
   diffReadOnly: boolean;
   rebase: RebaseState;
@@ -51,6 +53,7 @@ const initialState: AppState = {
   conversation: null,
   streaming: false,
   streamNodeId: null,
+  selectionContext: null,
   changeset: null,
   diffReadOnly: false,
   rebase: { needed: false, conflictedPaths: [] },
@@ -119,6 +122,9 @@ class Store {
         break;
       case 'turnStarted':
         this.beginTurn(msg.nodeId);
+        break;
+      case 'selectionContext':
+        this.patch({ selectionContext: msg.context });
         break;
       case 'stream':
         this.applyStream(msg.event);

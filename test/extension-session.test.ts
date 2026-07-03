@@ -223,6 +223,20 @@ function assistantLeaf(conv: Conversation) {
   return conv.currentLeafId ? conv.nodes[conv.currentLeafId] : undefined;
 }
 
+/** Concatenated text of the last user message in a wire request. */
+function userWireText(req: ChatRequest): string {
+  for (let i = req.messages.length - 1; i >= 0; i--) {
+    const m = req.messages[i];
+    if (m.role === 'user') {
+      return m.content
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n');
+    }
+  }
+  return '';
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -291,6 +305,96 @@ describe('solo prompt turn', () => {
         ),
     );
     expect(userVisibleEarly).toBe(true);
+  });
+});
+
+describe('edit selection context', () => {
+  it('prepends the highlighted region to the prompt once, then does not leak into later turns', async () => {
+    const { session, posted, requests } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+
+    session.receiveSelection({
+      path: 'src/auth/login.ts',
+      startLine: 10,
+      endLine: 14,
+      text: 'const token = res.data.token;',
+      languageId: 'typescript',
+    });
+    // receiveSelection surfaces the chip to the webview.
+    expect(posted.some((m) => m.type === 'selectionContext' && m.context?.path === 'src/auth/login.ts')).toBe(true);
+
+    const firstReqIdx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'rename token to session' });
+
+    const firstUserText = userWireText(requests[firstReqIdx]);
+    expect(firstUserText).toContain('src/auth/login.ts');       // file path
+    expect(firstUserText).toContain('10');                       // start line
+    expect(firstUserText).toContain('14');                       // end line
+    expect(firstUserText).toContain('const token = res.data.token;'); // selected text
+    expect(firstUserText).toContain('rename token to session');  // the user's request
+
+    // The host clears the chip after consuming the selection.
+    const clears = posted.filter((m) => m.type === 'selectionContext' && m.context === null);
+    expect(clears.length).toBeGreaterThan(0);
+
+    // A follow-up prompt WITHOUT a new selection must not carry stale context.
+    const secondReqIdx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'now add a test' });
+    const secondUserText = userWireText(requests[secondReqIdx]);
+    expect(secondUserText).toContain('now add a test');
+    expect(secondUserText).not.toContain('src/auth/login.ts');
+    expect(secondUserText).not.toContain('const token = res.data.token;');
+  });
+
+  it('clearSelection drops the pending selection and posts a null chip', async () => {
+    const { session, posted, requests } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+
+    session.receiveSelection({ path: 'a.ts', startLine: 1, endLine: 2, text: 'noop();', languageId: 'typescript' });
+    await session.handle({ type: 'clearSelection' });
+    expect(posted.some((m) => m.type === 'selectionContext' && m.context === null)).toBe(true);
+
+    const reqIdx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'do the thing' });
+    const userText = userWireText(requests[reqIdx]);
+    expect(userText).not.toContain('a.ts');
+    expect(userText).not.toContain('noop();');
+  });
+
+  it('fences a selection that itself contains ``` without breaking out', async () => {
+    const { session, requests } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+
+    // A markdown selection containing its own fenced block.
+    const md = 'Example:\n```ts\nconst x = 1;\n```\nEnd.';
+    session.receiveSelection({ path: 'README.md', startLine: 1, endLine: 5, text: md, languageId: 'markdown' });
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'tighten this doc' });
+    const text = userWireText(requests[idx]);
+    // The outer fence must be longer than the inner ``` so the selection is
+    // fully enclosed and the user's request stays outside the quoted block.
+    expect(text).toContain('````'); // >=4 backticks chosen for the wrapper
+    expect(text).toContain('const x = 1;');
+    expect(text).toContain('tighten this doc');
+    // The wrapper fence encloses the inner block: the segment between the first
+    // and last 4-backtick runs contains the inner triple-fence and the text.
+    const first = text.indexOf('````');
+    const last = text.lastIndexOf('````');
+    expect(last).toBeGreaterThan(first);
+    expect(text.slice(first, last)).toContain('```ts');
+  });
+
+  it('re-surfaces a selection delivered before the webview mounted, on ready', async () => {
+    const { session, posted } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    // Selection arrives BEFORE ready (freshly opened tab); the initial chip post
+    // may be dropped by the not-yet-subscribed webview.
+    session.receiveSelection({ path: 'a.ts', startLine: 1, endLine: 2, text: 'noop();', languageId: 'typescript' });
+    const before = posted.filter((m) => m.type === 'selectionContext' && m.context?.path === 'a.ts').length;
+    await session.handle({ type: 'ready' });
+    const after = posted.filter((m) => m.type === 'selectionContext' && m.context?.path === 'a.ts').length;
+    // ready re-posts the pending chip so it isn't lost.
+    expect(after).toBeGreaterThan(before);
   });
 });
 
@@ -416,6 +520,79 @@ describe('View Changes on historical commits', () => {
       | undefined;
     expect(liveMsg?.view).toBeTruthy();
     expect(JSON.stringify(liveMsg!.view!.files)).not.toBe(frozenFingerprint);
+  });
+});
+
+describe('skills', () => {
+  it('injects the skill catalog into the solo system prompt and offers load_skill', async () => {
+    const { session, io, requests } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    io.files.set('.fowlplay/skills/foo.md', '---\nname: foo-skill\ndescription: does foo things\n---\n\n# Foo\n\nBody of foo.');
+    await session.handle({ type: 'ready' });
+
+    const reqIdx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'create foo.txt' });
+
+    // The opening request's system prompt carries the catalog (bundled + workspace).
+    const sys = requests[reqIdx].system;
+    expect(sys).toContain('AVAILABLE SKILLS');
+    expect(sys).toContain('foo-skill');
+    expect(sys).toContain('does foo things');
+    expect(sys).toContain('commit-message'); // a bundled default is present too
+
+    // load_skill is offered as a tool when skills exist.
+    expect(requests[reqIdx].tools.map((t) => t.name)).toContain('load_skill');
+  });
+
+  it('a load_skill tool call returns the skill body to the model', async () => {
+    const io = new FakeIo();
+    io.files.set('.fowlplay/skills/foo.md', '---\nname: foo-skill\ndescription: does foo\n---\n\nBODY-OF-FOO-SKILL');
+    const posted: HostToWebview[] = [];
+    const requests: ChatRequest[] = [];
+    // Round 1: call load_skill. Round 2 (after the tool result arrives): finish.
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        requests.push(request);
+        const hasToolResult = request.messages.some((m) => m.role === 'tool');
+        const events: StreamEvent[] = hasToolResult
+          ? textEvents('done')
+          : [
+              { type: 'tool_call_start', id: 's1', name: 'load_skill' },
+              { type: 'tool_call_args', id: 's1', delta: JSON.stringify({ name: 'foo-skill' }) },
+              { type: 'tool_call_end', id: 's1' },
+              USAGE,
+              { type: 'done', stopReason: 'tool_use' },
+            ];
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('solo'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'use the foo skill' });
+
+    // The continuation request carries the tool result with the skill body.
+    const continuation = requests.find((r) => r.messages.some((m) => m.role === 'tool'));
+    expect(continuation).toBeDefined();
+    const toolMsg = continuation!.messages.find((m) => m.role === 'tool');
+    const content = toolMsg && toolMsg.role === 'tool' ? toolMsg.results.map((r) => r.content).join('\n') : '';
+    expect(content).toContain('BODY-OF-FOO-SKILL');
+
+    // The tool call was surfaced to the UI and reported ok.
+    const toolStream = posted.some((m) => m.type === 'stream' && m.event.type === 'tool_call_start');
+    expect(toolStream).toBe(true);
   });
 });
 
