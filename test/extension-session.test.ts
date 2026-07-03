@@ -360,6 +360,42 @@ describe('edit selection context', () => {
     expect(userText).not.toContain('a.ts');
     expect(userText).not.toContain('noop();');
   });
+
+  it('fences a selection that itself contains ``` without breaking out', async () => {
+    const { session, requests } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+
+    // A markdown selection containing its own fenced block.
+    const md = 'Example:\n```ts\nconst x = 1;\n```\nEnd.';
+    session.receiveSelection({ path: 'README.md', startLine: 1, endLine: 5, text: md, languageId: 'markdown' });
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'tighten this doc' });
+    const text = userWireText(requests[idx]);
+    // The outer fence must be longer than the inner ``` so the selection is
+    // fully enclosed and the user's request stays outside the quoted block.
+    expect(text).toContain('````'); // >=4 backticks chosen for the wrapper
+    expect(text).toContain('const x = 1;');
+    expect(text).toContain('tighten this doc');
+    // The wrapper fence encloses the inner block: the segment between the first
+    // and last 4-backtick runs contains the inner triple-fence and the text.
+    const first = text.indexOf('````');
+    const last = text.lastIndexOf('````');
+    expect(last).toBeGreaterThan(first);
+    expect(text.slice(first, last)).toContain('```ts');
+  });
+
+  it('re-surfaces a selection delivered before the webview mounted, on ready', async () => {
+    const { session, posted } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    // Selection arrives BEFORE ready (freshly opened tab); the initial chip post
+    // may be dropped by the not-yet-subscribed webview.
+    session.receiveSelection({ path: 'a.ts', startLine: 1, endLine: 2, text: 'noop();', languageId: 'typescript' });
+    const before = posted.filter((m) => m.type === 'selectionContext' && m.context?.path === 'a.ts').length;
+    await session.handle({ type: 'ready' });
+    const after = posted.filter((m) => m.type === 'selectionContext' && m.context?.path === 'a.ts').length;
+    // ready re-posts the pending chip so it isn't lost.
+    expect(after).toBeGreaterThan(before);
+  });
 });
 
 describe('diff review — toggleRevert then sendFeedback', () => {

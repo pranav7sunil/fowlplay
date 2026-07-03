@@ -344,6 +344,9 @@ export class SessionCore {
     }
     this.sendConversation();
     if (!this.overlay.isEmpty()) this.sendChangeset();
+    // A selection delivered before the webview mounted (freshly opened tab) had
+    // its chip message dropped; re-surface it now that the webview is listening.
+    if (this.pendingSelection) this.deps.post({ type: 'selectionContext', context: this.pendingSelection });
   }
 
   private async ensureSettings(): Promise<FowlPlaySettings> {
@@ -416,12 +419,12 @@ export class SessionCore {
     // naturally persists / replays on branch or resume.
     let displayText = trimmed;
     if (selection) {
-      const fence = selection.languageId || selection.path;
+      const label = selection.languageId || selection.path;
       const header = `The user highlighted lines ${selection.startLine}–${selection.endLine} of \`${selection.path}\`. Scope the change to this selection unless related code must change too.`;
-      displayText = `${header}\n\n\`\`\`${fence}\n${selection.text}\n\`\`\`\n\n${displayText}`;
+      displayText = `${header}\n\n${fencedBlock(label, selection.text)}\n\n${displayText}`;
     }
     for (const f of textFiles) {
-      displayText += `\n\n\`\`\`${f.name}\n${f.data}\n\`\`\``;
+      displayText += `\n\n${fencedBlock(f.name, f.data)}`;
     }
     for (const img of images) {
       displayText += `\n\n_[Attached image: ${img.name}]_`;
@@ -1190,6 +1193,19 @@ function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
 function firstText(blocks: ContentBlock[]): string | null {
   for (const b of blocks) if (b.type === 'text' && b.text.trim()) return b.text;
   return null;
+}
+
+/**
+ * Wrap arbitrary content in a fenced code block whose backtick run is longer
+ * than any run inside the content, so selected text or a file that itself
+ * contains ``` cannot break out of the fence (which would corrupt the pinned
+ * context / open a prompt-injection seam).
+ */
+function fencedBlock(info: string, content: string): string {
+  let longest = 0;
+  for (const m of content.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const fence = '`'.repeat(Math.max(3, longest + 1));
+  return `${fence}${info}\n${content}\n${fence}`;
 }
 
 function joinText(blocks: ContentBlock[]): string {

@@ -106,12 +106,12 @@ export class TabManager {
     }
     const panel = this.openTab();
     panel.reveal();
-    const session = this.sessions.get(panel);
-    // A freshly created webview may not have subscribed yet and would drop the
-    // chip message; re-deliver a few times. receiveSelection is idempotent.
-    for (const delay of [0, 600, 1500]) {
-      setTimeout(() => session?.receiveSelection(ctx), delay);
-    }
+    // The session stores the selection immediately; the chip message it posts is
+    // dropped because the new webview hasn't subscribed yet, but the session
+    // re-surfaces the pending selection on the webview's `ready` handshake. No
+    // timer retry — that could re-arm a selection the user already sent or
+    // dismissed in the interim.
+    this.sessions.get(panel)?.receiveSelection(ctx);
   }
 
   /** Reset providers + keys + workspace settings (history is preserved). */

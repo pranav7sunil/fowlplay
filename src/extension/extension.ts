@@ -27,10 +27,21 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       const sel = editor.selection;
+      const uri = editor.document.uri;
+      // asRelativePath returns the (absolute) path unchanged for files outside
+      // any workspace folder — which would leak the home dir to the model. Use a
+      // basename in that case.
+      const inWorkspace = vscode.workspace.getWorkspaceFolder(uri) !== undefined;
+      const path = inWorkspace
+        ? vscode.workspace.asRelativePath(uri, false)
+        : uri.path.replace(/^.*\//, '');
+      // A whole-line selection ends at column 0 of the line *after* the last
+      // highlighted line; don't count that trailing line in the reported range.
+      const endLine = sel.end.character === 0 && sel.end.line > sel.start.line ? sel.end.line : sel.end.line + 1;
       const ctx: SelectionContext = {
-        path: vscode.workspace.asRelativePath(editor.document.uri, false),
+        path,
         startLine: sel.start.line + 1,
-        endLine: sel.end.line + 1,
+        endLine,
         text: editor.document.getText(sel),
         languageId: editor.document.languageId,
       };
