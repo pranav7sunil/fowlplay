@@ -4,6 +4,7 @@ import type { FowlPlaySettings, ProviderConfig, ModelRef } from '../../shared/ty
 import { AddProvider } from './ProviderForm';
 import { post, store, useStore } from './store';
 import { IconArrowRight, IconCheck } from './icons';
+import { Logo } from './Logo';
 
 export function Onboarding({ settings }: { settings: FowlPlaySettings | null }) {
   const [step, setStep] = useState(0);
@@ -20,7 +21,7 @@ export function Onboarding({ settings }: { settings: FowlPlaySettings | null }) 
 
         {step === 0 && (
           <div>
-            <div class="fp-onboard-logo">🐓</div>
+            <div class="fp-onboard-logo"><Logo size={72} /></div>
             <div class="fp-onboard-wordmark">FowlPlay</div>
             <div class="fp-onboard-tagline">Collaboration, not automation — with a safety harness.</div>
             <button type="button" class="fp-btn fp-btn-primary fp-hero-btn" onClick={() => setStep(1)}>

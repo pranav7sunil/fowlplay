@@ -1,0 +1,42 @@
+/**
+ * FowlPlay phoenix logo — full-colour, self-contained inline SVG.
+ * A rising blue phoenix: spread scalloped wings, flame crest, profile head,
+ * and a curled flame tail, in the ultramarine cyan→blue gradient.
+ * Each instance mints unique gradient ids so multiple logos never collide.
+ */
+let uid = 0;
+
+export function Logo({ size = 28 }: { size?: number }) {
+  const id = `fp-logo-${uid++}`;
+  const wing =
+    'M 244 172 C 224 122 192 90 150 76 L 90 104 Q 150 146 72 170 Q 150 198 98 228 Q 178 240 162 264 Q 214 262 238 250 C 248 214 249 190 244 172 Z';
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 512 512"
+      fill="none"
+      role="img"
+      aria-label="FowlPlay"
+    >
+      <defs>
+        <linearGradient id={id} x1="256" y1="24" x2="256" y2="478" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#5BC8FF" />
+          <stop offset="0.34" stop-color="#4C9BFF" />
+          <stop offset="0.62" stop-color="#4166F5" />
+          <stop offset="1" stop-color="#2743CC" />
+        </linearGradient>
+      </defs>
+      <g fill={`url(#${id})`}>
+        <path d={wing} />
+        <path d={wing} transform="translate(512,0) scale(-1,1)" />
+        <path d="M 232.23 342.71 Q 179.69 362.92 184 428 Q 229.47 402.21 255.77 361.29 Z M 265.37 361.11 Q 292.3 398.75 336 422 Q 337.93 359.63 286.63 342.89 Z" />
+        <path d="M 269.99 104.57 Q 279.8 62.94 262 20 Q 234.21 60.77 246.01 103.43 Z M 250.7 105.7 Q 243.32 71.27 224 40 Q 203.34 81.85 233.3 110.3 Z M 282.56 110.77 Q 314.44 83.52 296 40 Q 274.59 70.63 265.44 105.23 Z" />
+        <path d="M 230 182 C 222 224 230 300 240 338 C 246 356 251 366 256 372 C 261 366 266 356 272 338 C 282 300 290 224 282 182 C 272 176 240 176 230 182 Z" />
+        <path d="M 252 360 C 228 390 212 424 236 452 C 254 474 288 476 304 450 C 318 428 308 404 286 400 C 272 398 262 408 268 420 C 273 429 284 428 286 420 C 276 444 248 442 246 416 C 245 396 258 378 260 360 Z" />
+        <path d="M 258 98 C 290 100 302 124 297 148 C 293 170 280 184 262 186 C 256 180 252 172 246 166 C 238 160 230 156 222 152 L 210 134 L 232 142 C 240 126 246 108 258 98 Z" />
+      </g>
+      <circle cx="266" cy="130" r="5" fill="#0A1030" />
+    </svg>
+  );
+}
