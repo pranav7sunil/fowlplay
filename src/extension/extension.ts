@@ -4,6 +4,7 @@
  */
 
 import * as vscode from 'vscode';
+import type { SelectionContext } from '../shared/types';
 import { TabManager } from './tabManager';
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -18,6 +19,22 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand('fowlplay.openSettings', () => {
       tabs.openSettings();
+    }),
+    vscode.commands.registerCommand('fowlplay.editSelection', () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.selection.isEmpty) {
+        void vscode.window.showInformationMessage('Select some code (or Markdown) first, then run FowlPlay: Edit Selection.');
+        return;
+      }
+      const sel = editor.selection;
+      const ctx: SelectionContext = {
+        path: vscode.workspace.asRelativePath(editor.document.uri, false),
+        startLine: sel.start.line + 1,
+        endLine: sel.end.line + 1,
+        text: editor.document.getText(sel),
+        languageId: editor.document.languageId,
+      };
+      tabs.editSelection(ctx);
     }),
     vscode.commands.registerCommand('fowlplay.resetSettings', async () => {
       const choice = await vscode.window.showWarningMessage(

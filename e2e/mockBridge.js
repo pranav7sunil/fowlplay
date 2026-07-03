@@ -34,6 +34,10 @@
       if (msg && msg.type === 'openDiff' && msg.changesetId === 'cs-hist-1') {
         emit({ type: 'changeset', view: historicalView() });
       }
+      // "Edit Selection" chip dismissed → the host clears the pinned selection.
+      if (msg && msg.type === 'clearSelection') {
+        emit({ type: 'selectionContext', context: null });
+      }
     },
     onMessage(handler) {
       handlers.push(handler);
@@ -384,6 +388,20 @@
         emit(settings(true));
         emit(conversationList());
         setView('history');
+        break;
+      case 'selection':
+        emit(settings(true));
+        emit(conversation());
+        emit({
+          type: 'selectionContext',
+          context: {
+            path: 'src/auth/authService.ts',
+            startLine: 12,
+            endLine: 20,
+            text: 'export async function login(u, p) {\n  return api.post("/login", { u, p });\n}',
+            languageId: 'typescript',
+          },
+        });
         break;
       case 'chat':
       default:

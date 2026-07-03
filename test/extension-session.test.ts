@@ -223,6 +223,20 @@ function assistantLeaf(conv: Conversation) {
   return conv.currentLeafId ? conv.nodes[conv.currentLeafId] : undefined;
 }
 
+/** Concatenated text of the last user message in a wire request. */
+function userWireText(req: ChatRequest): string {
+  for (let i = req.messages.length - 1; i >= 0; i--) {
+    const m = req.messages[i];
+    if (m.role === 'user') {
+      return m.content
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n');
+    }
+  }
+  return '';
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -291,6 +305,60 @@ describe('solo prompt turn', () => {
         ),
     );
     expect(userVisibleEarly).toBe(true);
+  });
+});
+
+describe('edit selection context', () => {
+  it('prepends the highlighted region to the prompt once, then does not leak into later turns', async () => {
+    const { session, posted, requests } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+
+    session.receiveSelection({
+      path: 'src/auth/login.ts',
+      startLine: 10,
+      endLine: 14,
+      text: 'const token = res.data.token;',
+      languageId: 'typescript',
+    });
+    // receiveSelection surfaces the chip to the webview.
+    expect(posted.some((m) => m.type === 'selectionContext' && m.context?.path === 'src/auth/login.ts')).toBe(true);
+
+    const firstReqIdx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'rename token to session' });
+
+    const firstUserText = userWireText(requests[firstReqIdx]);
+    expect(firstUserText).toContain('src/auth/login.ts');       // file path
+    expect(firstUserText).toContain('10');                       // start line
+    expect(firstUserText).toContain('14');                       // end line
+    expect(firstUserText).toContain('const token = res.data.token;'); // selected text
+    expect(firstUserText).toContain('rename token to session');  // the user's request
+
+    // The host clears the chip after consuming the selection.
+    const clears = posted.filter((m) => m.type === 'selectionContext' && m.context === null);
+    expect(clears.length).toBeGreaterThan(0);
+
+    // A follow-up prompt WITHOUT a new selection must not carry stale context.
+    const secondReqIdx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'now add a test' });
+    const secondUserText = userWireText(requests[secondReqIdx]);
+    expect(secondUserText).toContain('now add a test');
+    expect(secondUserText).not.toContain('src/auth/login.ts');
+    expect(secondUserText).not.toContain('const token = res.data.token;');
+  });
+
+  it('clearSelection drops the pending selection and posts a null chip', async () => {
+    const { session, posted, requests } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+
+    session.receiveSelection({ path: 'a.ts', startLine: 1, endLine: 2, text: 'noop();', languageId: 'typescript' });
+    await session.handle({ type: 'clearSelection' });
+    expect(posted.some((m) => m.type === 'selectionContext' && m.context === null)).toBe(true);
+
+    const reqIdx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'do the thing' });
+    const userText = userWireText(requests[reqIdx]);
+    expect(userText).not.toContain('a.ts');
+    expect(userText).not.toContain('noop();');
   });
 });
 

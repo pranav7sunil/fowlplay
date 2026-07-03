@@ -1,12 +1,13 @@
 /** Auto-growing composer with attachments, send / stop. */
 import { useRef, useState } from 'preact/hooks';
 import type { Attachment } from '../../shared/protocol';
-import { post } from './store';
+import { post, useStore } from './store';
 import { IconPaperclip, IconArrowUp, IconStop, IconX } from './icons';
 
 export function Composer({ streaming }: { streaming: boolean }) {
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const selection = useStore((s) => s.selectionContext);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -60,6 +61,16 @@ export function Composer({ streaming }: { streaming: boolean }) {
 
   return (
     <div class="fp-composer-wrap">
+      {selection && (
+        <div class="fp-attachments">
+          <span class="fp-attach-chip fp-selection-chip" title={`${selection.path}:${selection.startLine}-${selection.endLine}`}>
+            ⌗ {(selection.path.split('/').pop() || selection.path)}:{selection.startLine}-{selection.endLine}
+            <button type="button" class="fp-btn-ghost" style={{ padding: 0 }} onClick={() => post({ type: 'clearSelection' })} aria-label="Clear selection">
+              <IconX size={13} />
+            </button>
+          </span>
+        </div>
+      )}
       {attachments.length > 0 && (
         <div class="fp-attachments">
           {attachments.map((a, i) => (

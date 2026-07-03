@@ -124,6 +124,17 @@ if (await review.isVisible().catch(() => false)) {
   ok(false, 'Review Changes button visible');
 }
 
+// ============================== EDIT SELECTION ===============================
+console.log('\n# edit selection');
+await open('selection');
+await waitFor(page, () => document.body.innerText.includes('authService.ts:12-20'), 'selection chip shows basename:range');
+const chip = page.locator('.fp-selection-chip').first();
+ok(await chip.isVisible().catch(() => false), 'selection chip visible above composer');
+await page.screenshot({ path: join(SHOTS, 'selection.png'), fullPage: false });
+await chip.getByRole('button', { name: /clear selection/i }).click();
+ok((await sent(page, 'clearSelection')).length === 1, 'clicking × posts clearSelection');
+await waitFor(page, () => !document.body.innerText.includes('authService.ts:12-20'), 'chip clears after dismiss');
+
 // ============================== DIFF =========================================
 console.log('\n# diff');
 await open('diff');

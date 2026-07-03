@@ -10,7 +10,7 @@
 
 import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
-import type { Conversation, SerializedOverlay } from '../shared/types';
+import type { Conversation, SelectionContext, SerializedOverlay } from '../shared/types';
 import type { WebviewToHost } from '../shared/protocol';
 import { createSessionCore, type SessionCore, type SessionDeps } from './session';
 import { WorkspaceIo } from './workspaceIo';
@@ -90,6 +90,27 @@ export class TabManager {
       void session?.handle({ type: 'newConversation' });
     } else {
       this.openTab();
+    }
+  }
+
+  /**
+   * Deliver a highlighted editor region to a session as scoped context for its
+   * next change, targeting the active/most-recent panel (opening one if none).
+   */
+  editSelection(ctx: SelectionContext): void {
+    const active = [...this.panels].find((p) => p.active) ?? [...this.panels].pop();
+    if (active) {
+      active.reveal();
+      this.sessions.get(active)?.receiveSelection(ctx);
+      return;
+    }
+    const panel = this.openTab();
+    panel.reveal();
+    const session = this.sessions.get(panel);
+    // A freshly created webview may not have subscribed yet and would drop the
+    // chip message; re-deliver a few times. receiveSelection is idempotent.
+    for (const delay of [0, 600, 1500]) {
+      setTimeout(() => session?.receiveSelection(ctx), delay);
     }
   }
 

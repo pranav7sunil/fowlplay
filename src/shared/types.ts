@@ -35,6 +35,19 @@ export interface ModelRef {
   modelId: string;
 }
 
+/**
+ * A region the user highlighted in the editor, passed to a session as scoped
+ * context for the next change ("Edit Selection"). Line numbers are 1-based and
+ * inclusive.
+ */
+export interface SelectionContext {
+  path: string;               // workspace-relative
+  startLine: number;
+  endLine: number;
+  text: string;
+  languageId?: string;
+}
+
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;

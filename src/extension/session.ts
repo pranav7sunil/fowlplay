@@ -28,6 +28,7 @@ import type {
   ModelRef,
   ProviderConfig,
   SdkType,
+  SelectionContext,
   SerializedOverlay,
   StreamEvent,
   TokenUsage,
@@ -151,6 +152,9 @@ export class SessionCore {
   /** Monotonic counter for disk-only applies that have no commit sha. */
   private appliedSeq = 0;
 
+  /** A highlighted editor region pinned as scoped context for the NEXT prompt. */
+  private pendingSelection: SelectionContext | null = null;
+
   /** Full (un-GC'd) wire history ending at each assistant node id, for follow-up turns. */
   private wireByNode = new Map<string, WireMessage[]>();
 
@@ -175,6 +179,16 @@ export class SessionCore {
     return this.conv;
   }
 
+  /**
+   * Pin a highlighted editor region as scoped context for the next prompt
+   * ("Edit Selection"). Stored host-side so it survives even if the webview
+   * misses the chip message; consumed once by the next `sendPrompt`.
+   */
+  receiveSelection(ctx: SelectionContext): void {
+    this.pendingSelection = ctx;
+    this.deps.post({ type: 'selectionContext', context: ctx });
+  }
+
   // -------------------------------------------------------------------------
   // Message dispatch
   // -------------------------------------------------------------------------
@@ -189,6 +203,10 @@ export class SessionCore {
         return;
       case 'cancelResponse':
         this.abort?.abort();
+        return;
+      case 'clearSelection':
+        this.pendingSelection = null;
+        this.deps.post({ type: 'selectionContext', context: null });
         return;
       case 'editMessage':
         await this.onEditMessage(msg.nodeId, msg.text);
@@ -369,13 +387,26 @@ export class SessionCore {
     const atts = attachments ?? [];
     if (!trimmed && atts.length === 0) return;
 
+    // A pinned "Edit Selection" region applies to exactly one turn. Consume it
+    // now so a follow-up prompt without a fresh selection is unscoped.
+    const selection = this.pendingSelection;
+    this.pendingSelection = null;
+
     // Text-like files are inlined into the prompt so they persist in the tree
     // and replay on branch/resume; images are passed as image wire parts for
     // this turn (there is no image content block to persist them in).
     const images = atts.filter((a) => a.mimeType.startsWith('image/'));
     const textFiles = atts.filter((a) => !a.mimeType.startsWith('image/'));
 
+    // Prepend the highlighted region as a pinned context block (mirrors the
+    // attachment-inlining style) so it folds into the user node's text and
+    // naturally persists / replays on branch or resume.
     let displayText = trimmed;
+    if (selection) {
+      const fence = selection.languageId || selection.path;
+      const header = `The user highlighted lines ${selection.startLine}–${selection.endLine} of \`${selection.path}\`. Scope the change to this selection unless related code must change too.`;
+      displayText = `${header}\n\n\`\`\`${fence}\n${selection.text}\n\`\`\`\n\n${displayText}`;
+    }
     for (const f of textFiles) {
       displayText += `\n\n\`\`\`${f.name}\n${f.data}\n\`\`\``;
     }
@@ -387,6 +418,9 @@ export class SessionCore {
       type: 'image',
       image: { mimeType: a.mimeType, data: a.data },
     }));
+
+    // The selection has been folded into this turn's prompt — clear the chip.
+    if (selection) this.deps.post({ type: 'selectionContext', context: null });
 
     const { conv, nodeId } = appendUser(this.conv, [{ type: 'text', text: displayText || '(see attachments)' }]);
     this.conv = conv;
