@@ -67,16 +67,24 @@ describe('OpenAiCompletionsAdapter', () => {
     const thinking = events.find((e) => e.type === 'thinking');
     expect(thinking).toEqual({ type: 'thinking', delta: 'hmm' });
 
-    const start = events.find((e) => e.type === 'tool_call_start');
-    expect(start).toEqual({ type: 'tool_call_start', id: 'call_1', name: 'open_files' });
+    // The adapter mints a stable synthetic stream id per tool-call index and
+    // uses it for every emitted event (start / args / end), independent of the
+    // provider's own id.
+    const start = events.find((e) => e.type === 'tool_call_start') as
+      | { id: string; name: string }
+      | undefined;
+    expect(start?.name).toBe('open_files');
+    const streamId = start!.id;
 
-    const argsJoined = events
-      .filter((e) => e.type === 'tool_call_args')
-      .map((e) => (e as { delta: string }).delta)
-      .join('');
-    expect(argsJoined).toBe('{"paths":["a.ts"]}');
+    const argEvents = events.filter((e) => e.type === 'tool_call_args') as Array<{
+      id: string;
+      delta: string;
+    }>;
+    expect(argEvents.map((e) => e.delta).join('')).toBe('{"paths":["a.ts"]}');
+    expect(argEvents.every((e) => e.id === streamId)).toBe(true);
 
-    expect(events.some((e) => e.type === 'tool_call_end')).toBe(true);
+    const endEvents = events.filter((e) => e.type === 'tool_call_end') as Array<{ id: string }>;
+    expect(endEvents).toEqual([{ type: 'tool_call_end', id: streamId }]);
 
     const usage = events.find((e) => e.type === 'usage');
     expect(usage).toEqual({
@@ -94,6 +102,94 @@ describe('OpenAiCompletionsAdapter', () => {
     expect(body.stream).toBe(true);
     expect(body.stream_options).toEqual({ include_usage: true });
     expect((init.headers as Record<string, string>).authorization).toBe('Bearer sk-test');
+  });
+
+  it('assembles a tool call when the name arrives in a LATER chunk than args', async () => {
+    // C1: chunk1 has id + args but NO name; chunk2 supplies the name.
+    const chunks = [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"arguments":"{\\"p"}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"grep","arguments":"attern\\":\\"x\\"}"}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(chunks)));
+    const adapter = createAdapter('openai-completions');
+    const events = await collect(adapter.chat({ ...baseReq, baseUrl: 'http://x/v1' }));
+
+    const start = events.find((e) => e.type === 'tool_call_start') as
+      | { id: string; name: string }
+      | undefined;
+    expect(start?.name).toBe('grep'); // name corrected, not ''
+    const id = start!.id;
+
+    // A single consistent id across start / args / end.
+    const argEvents = events.filter((e) => e.type === 'tool_call_args') as Array<{
+      id: string;
+      delta: string;
+    }>;
+    const endEvents = events.filter((e) => e.type === 'tool_call_end') as Array<{ id: string }>;
+    expect(argEvents.every((e) => e.id === id)).toBe(true);
+    expect(endEvents.every((e) => e.id === id)).toBe(true);
+    expect(endEvents).toHaveLength(1);
+
+    // Args buffered before the name are flushed in order.
+    expect(argEvents.map((e) => e.delta).join('')).toBe('{"pattern":"x"}');
+    expect(events.at(-1)).toEqual({ type: 'done', stopReason: 'tool_use' });
+  });
+
+  it('uses one consistent id when the real id arrives in a LATER chunk than args', async () => {
+    // C1: chunk1 has name + args but NO id; chunk2 supplies the id late.
+    const chunks = [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"grep","arguments":"{\\"p"}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"arguments":"\\":1}"}}]}}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(chunks)));
+    const adapter = createAdapter('openai-completions');
+    const events = await collect(adapter.chat({ ...baseReq, baseUrl: 'http://x/v1' }));
+
+    const start = events.find((e) => e.type === 'tool_call_start') as
+      | { id: string; name: string }
+      | undefined;
+    expect(start?.name).toBe('grep');
+    const id = start!.id;
+
+    const argEvents = events.filter((e) => e.type === 'tool_call_args') as Array<{
+      id: string;
+      delta: string;
+    }>;
+    const endEvents = events.filter((e) => e.type === 'tool_call_end') as Array<{ id: string }>;
+    // The stream id is stable and used for every event, regardless of the late
+    // provider id — no split across mismatched ids.
+    expect(argEvents.every((e) => e.id === id)).toBe(true);
+    expect(endEvents).toEqual([{ type: 'tool_call_end', id }]);
+    expect(argEvents.map((e) => e.delta).join('')).toBe('{"p":1}');
+  });
+
+  it('serializes a thinking-only assistant message with content:"" (not null)', async () => {
+    // S1: an assistant turn with only thinking (no text, no tool_calls) must not
+    // send content:null with no tool_calls — OpenAI rejects that.
+    const fetchMock = vi.fn(async () => sseResponse(['data: [DONE]\n\n']));
+    vi.stubGlobal('fetch', fetchMock);
+    const adapter = createAdapter('openai-completions');
+    await collect(
+      adapter.chat({
+        ...baseReq,
+        baseUrl: 'http://x/v1',
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+          { role: 'assistant', content: [{ type: 'thinking', text: 'pondering' }] },
+        ],
+      }),
+    );
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    const asst = body.messages.find(
+      (m: { role: string }) => m.role === 'assistant',
+    ) as { content: unknown; tool_calls?: unknown };
+    expect(asst.content).toBe('');
+    expect(asst.tool_calls).toBeUndefined();
   });
 
   it('emits an error event with a body snippet on non-2xx', async () => {

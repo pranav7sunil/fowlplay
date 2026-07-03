@@ -81,7 +81,20 @@ export class OpenAiCompletionsAdapter implements ProviderAdapter {
     }
 
     // Tool-call assembly state, keyed by the OpenAI `index`.
-    const toolCalls = new Map<number, { id: string; name: string; started: boolean }>();
+    //
+    // We mint a STABLE synthetic stream id per index (`tc_${idx}`) and use it for
+    // every event we emit for that index. The provider's real id/name may arrive
+    // in any chunk (sometimes after args), so relying on them for the emitted id
+    // would split a single tool call across mismatched ids. The loop only needs
+    // the emitted id to be internally consistent between the assistant tool_call
+    // record and its matching result — the synthetic id guarantees that.
+    //
+    // `tool_call_start` is deferred until the NAME is known: any args deltas that
+    // arrive first are buffered and flushed right after start fires.
+    const toolCalls = new Map<
+      number,
+      { streamId: string; name: string; started: boolean; gotArgs: boolean; bufferedArgs: string[] }
+    >();
     let usage: TokenUsage | undefined;
     let stopReason: 'end' | 'tool_use' = 'end';
     let sawToolCalls = false;
@@ -127,26 +140,38 @@ export class OpenAiCompletionsAdapter implements ProviderAdapter {
               const idx = tc.index ?? 0;
               let entry = toolCalls.get(idx);
               if (!entry) {
-                entry = { id: tc.id ?? `call_${idx}`, name: tc.function?.name ?? '', started: false };
+                entry = {
+                  streamId: `tc_${idx}`,
+                  name: tc.function?.name ?? '',
+                  started: false,
+                  gotArgs: false,
+                  bufferedArgs: [],
+                };
                 toolCalls.set(idx, entry);
+              } else if (tc.function?.name) {
+                // Name can arrive in a later chunk than the first args/id.
+                entry.name = tc.function.name;
               }
-              // Late-arriving id/name can appear across chunks.
-              if (tc.id) entry.id = tc.id;
-              if (tc.function?.name) entry.name = tc.function.name;
 
+              // Once the name is known, fire start and flush any buffered args.
               if (!entry.started && entry.name) {
                 entry.started = true;
-                yield { type: 'tool_call_start', id: entry.id, name: entry.name };
+                yield { type: 'tool_call_start', id: entry.streamId, name: entry.name };
+                for (const buffered of entry.bufferedArgs) {
+                  yield { type: 'tool_call_args', id: entry.streamId, delta: buffered };
+                }
+                entry.bufferedArgs = [];
               }
+
               const argsDelta = tc.function?.arguments;
               if (typeof argsDelta === 'string' && argsDelta.length > 0) {
-                // If start hasn't fired yet (no name seen), fire it now so the
-                // loop can associate args with an id.
-                if (!entry.started) {
-                  entry.started = true;
-                  yield { type: 'tool_call_start', id: entry.id, name: entry.name };
+                entry.gotArgs = true;
+                if (entry.started) {
+                  yield { type: 'tool_call_args', id: entry.streamId, delta: argsDelta };
+                } else {
+                  // Name not seen yet — buffer until start fires.
+                  entry.bufferedArgs.push(argsDelta);
                 }
-                yield { type: 'tool_call_args', id: entry.id, delta: argsDelta };
               }
             }
           }
@@ -166,9 +191,18 @@ export class OpenAiCompletionsAdapter implements ProviderAdapter {
       return;
     }
 
-    // Close any open tool calls.
+    // Close any open tool calls. For an index that received args but never a
+    // name, still emit start + buffered args + end so records stay consistent.
     for (const entry of toolCalls.values()) {
-      if (entry.started) yield { type: 'tool_call_end', id: entry.id };
+      if (!entry.started && entry.gotArgs) {
+        entry.started = true;
+        yield { type: 'tool_call_start', id: entry.streamId, name: entry.name };
+        for (const buffered of entry.bufferedArgs) {
+          yield { type: 'tool_call_args', id: entry.streamId, delta: buffered };
+        }
+        entry.bufferedArgs = [];
+      }
+      if (entry.started) yield { type: 'tool_call_end', id: entry.streamId };
     }
 
     if (usage) yield { type: 'usage', usage };
@@ -270,8 +304,14 @@ function buildAssistantMessage(parts: WireAssistantPart[]): unknown {
     }));
 
   const msg: Record<string, unknown> = { role: 'assistant' };
-  // OpenAI requires content to be present (may be null when only tool calls).
-  msg.content = text.length > 0 ? text : null;
+  // OpenAI requires content to be present. `null` is only valid when tool_calls
+  // are present; a turn with neither text nor tool_calls (e.g. thinking-only)
+  // must send an empty string, or OpenAI rejects the message.
+  if (text.length > 0) {
+    msg.content = text;
+  } else {
+    msg.content = toolCalls.length > 0 ? null : '';
+  }
   if (toolCalls.length > 0) msg.tool_calls = toolCalls;
   return msg;
 }

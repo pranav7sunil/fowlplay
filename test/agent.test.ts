@@ -204,6 +204,47 @@ describe('runAgentLoop', () => {
     expect(seen.filter((e) => e.type === 'done')).toHaveLength(2);
   });
 
+  it('drops unanswered tool_call parts when cancelled mid-tool-call', async () => {
+    // C3: the model started a tool call, then the turn was cancelled before any
+    // result could be produced. The persisted history must not end with an
+    // assistant tool_call that has no matching tool result.
+    const adapter = new ScriptedAdapter([
+      [
+        { type: 'text', delta: 'let me look' },
+        { type: 'tool_call_start', id: 'c1', name: 'open_files' },
+        { type: 'tool_call_args', id: 'c1', delta: '{"paths":["a.ts"]}' },
+        { type: 'tool_call_end', id: 'c1' },
+        { type: 'done', stopReason: 'cancelled' },
+      ],
+    ]);
+
+    const result = await runAgentLoop({
+      adapter,
+      baseUrl: 'http://x',
+      modelId: 'm',
+      system: '',
+      history: [{ role: 'user', content: [{ type: 'text', text: 'go' }] }],
+      tools: buildToolSpecs(),
+      toolHost: makeHost({ 'a.ts': 'x' }),
+      onEvent: () => {},
+    });
+
+    // No tool result was appended...
+    expect(result.wireHistory.some((m) => m.role === 'tool')).toBe(false);
+    // ...so no assistant message may carry a tool_call part.
+    for (const m of result.wireHistory) {
+      if (m.role === 'assistant') {
+        expect(m.content.some((p) => p.type === 'tool_call')).toBe(false);
+      }
+    }
+    // The assistant text is still preserved.
+    const asst = result.wireHistory[1];
+    expect(asst.role).toBe('assistant');
+    if (asst.role === 'assistant') {
+      expect(asst.content).toEqual([{ type: 'text', text: 'let me look' }]);
+    }
+  });
+
   it('stops immediately when the first turn ends without tools', async () => {
     const adapter = new ScriptedAdapter([
       [{ type: 'text', delta: 'hi' }, { type: 'done', stopReason: 'end' }],
@@ -293,5 +334,46 @@ describe('gcHistory', () => {
     const newer = gc[3];
     if (older.role === 'tool') expect(older.results[0].content).toContain('garbage-collected');
     if (newer.role === 'tool') expect(newer.results[0].content).toBe('NEW a.ts');
+  });
+
+  it('dedups per-path: an older [a,b] open keeps fresh a and b, drops only stale a', () => {
+    // C2: older result opened [a,b]; a was re-opened newer. The stale a section
+    // must be stubbed, but b (no newer copy) must survive.
+    const olderContent = '===== a.ts =====\n1\tstale a body\n\n===== b.ts =====\n1\tb body';
+    const newerContent = '===== a.ts =====\n1\tfresh a body';
+    const messages: WireMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'work' }] },
+      {
+        role: 'tool',
+        results: [
+          { toolCallId: 't1', content: olderContent, gcClass: 'file-content', paths: ['a.ts', 'b.ts'] },
+        ],
+      },
+      { role: 'assistant', content: [{ type: 'text', text: 'reopen a' }] },
+      {
+        role: 'tool',
+        results: [
+          { toolCallId: 't2', content: newerContent, gcClass: 'file-content', paths: ['a.ts'] },
+        ],
+      },
+    ];
+
+    const gc = gcHistory(messages);
+
+    // Fresh a is untouched.
+    const newer = gc[3];
+    if (newer.role === 'tool') expect(newer.results[0].content).toBe(newerContent);
+
+    // Older result message is preserved (pairing intact), but its a section is
+    // stubbed and its b section is kept verbatim.
+    const older = gc[1];
+    expect(older.role).toBe('tool');
+    if (older.role === 'tool') {
+      const content = older.results[0].content;
+      expect(content).not.toContain('stale a body'); // no stale a
+      expect(content).toContain('garbage-collected'); // a stubbed
+      expect(content).toContain('b body'); // fresh b survives
+      expect(older.results[0].toolCallId).toBe('t1'); // result not dropped
+    }
   });
 });

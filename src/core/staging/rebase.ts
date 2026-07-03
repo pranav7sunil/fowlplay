@@ -123,6 +123,13 @@ function locate(lines: string[], h: DiffHunk): { start: number; end: number } | 
   const near = h.baseStart - 1; // expected 0-based position in the old base
 
   if (h.baseLines.length > 0) {
+    // A hunk that originally had context on either side must be anchored by at
+    // least one real context side. Matching its bare removed lines anywhere in
+    // a drifted file lets a coincidental copy hijack the edit and produce a
+    // false-clean merge (see BUG R1). Only a hunk that genuinely had no context
+    // (e.g. the removed lines were the whole file) may match context-light.
+    const hadContext = h.contextBefore.length > 0 || h.contextAfter.length > 0;
+
     // Try progressively looser context around the removed lines.
     const attempts: { pre: string[]; post: string[] }[] = [
       { pre: h.contextBefore, post: h.contextAfter },
@@ -131,6 +138,9 @@ function locate(lines: string[], h: DiffHunk): { start: number; end: number } | 
       { pre: [], post: [] },
     ];
     for (const a of attempts) {
+      // Skip any attempt that carries no real context when the hunk actually
+      // had context — those collapse to a bare removed-lines match.
+      if (hadContext && a.pre.length === 0 && a.post.length === 0) continue;
       const needle = [...a.pre, ...h.baseLines, ...a.post];
       const s = search(lines, needle, near - a.pre.length);
       if (s >= 0) {

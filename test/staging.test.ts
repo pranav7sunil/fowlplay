@@ -226,4 +226,46 @@ describe('rebase / drift detection', () => {
     expect(res.ok).toBe(false);
     expect(res.conflictedPaths).toContain('a.ts');
   });
+
+  it('R1: conflicts (not false-clean) when context is destroyed but a stray copy of the removed line survives', async () => {
+    // base A/B/TARGET/C/D, edit TARGET -> CHANGED.
+    const disk = new MockDisk({ 'a.ts': 'A\nB\nTARGET\nC\nD' });
+    const o = new StagingOverlay(disk);
+    await o.stageModify('a.ts', 'A\nB\nCHANGED\nC\nD');
+    // Disk drifts: all real context (A/B/C/D) is gone; an UNRELATED stray
+    // TARGET now sits on line 1. The edit's context no longer exists.
+    disk.files['a.ts'] = 'TARGET\nP\nQ\nR';
+    const res = await rebase(o, disk);
+    // Must be a conflict — must NOT silently rewrite the unrelated top line.
+    expect(res.ok).toBe(false);
+    expect(res.conflictedPaths).toContain('a.ts');
+    expect(res.merged['a.ts']).toBeUndefined();
+  });
+
+  it('R1: a genuine clean shift with the edit context intact still merges', async () => {
+    const disk = new MockDisk({ 'a.ts': 'A\nB\nTARGET\nC\nD' });
+    const o = new StagingOverlay(disk);
+    await o.stageModify('a.ts', 'A\nB\nCHANGED\nC\nD');
+    // Unrelated lines prepended; the edit's real context (A/B/C/D) survives.
+    disk.files['a.ts'] = 'H1\nH2\nA\nB\nTARGET\nC\nD';
+    const res = await rebase(o, disk);
+    expect(res.ok).toBe(true);
+    expect(res.merged['a.ts']).toBe('H1\nH2\nA\nB\nCHANGED\nC\nD');
+  });
+});
+
+describe('ChangeSet.resetReviewState', () => {
+  it('clears all revert and comment state', async () => {
+    const disk = new MockDisk({ 'a.ts': 'a\nb\nc' });
+    const o = new StagingOverlay(disk);
+    await o.stageModify('a.ts', 'a\nB\nc');
+    const cs = new ChangeSet(o, 'cs1');
+    const hunkId = cs.view().files[0].hunks[0].id;
+    cs.toggleRevert(hunkId, true);
+    cs.setComment(hunkId, 'please keep b');
+    cs.resetReviewState();
+    const h = cs.view().files[0].hunks[0];
+    expect(h.reverted).toBe(false);
+    expect(h.comment).toBeUndefined();
+  });
 });

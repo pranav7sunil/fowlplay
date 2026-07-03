@@ -83,6 +83,16 @@ export class ChangeSet {
   }
 
   /**
+   * Clear all per-hunk review state (reverts + comments). Callers use this
+   * after a Send-Feedback revision produces a fresh changeset, so stale
+   * revert/comment state from the previous revision does not leak onto the new
+   * hunks.
+   */
+  resetReviewState(): void {
+    this.state.clear();
+  }
+
+  /**
    * Render all comments and reverted hunks into a single markdown prompt that
    * asks the model to revise the changeset. Returns null when there is nothing
    * to send (no comments, no reverts).

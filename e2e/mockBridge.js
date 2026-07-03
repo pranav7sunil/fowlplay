@@ -353,7 +353,9 @@
     steps.push(() => emit({ type: 'gateUpdate', card: sentryGate }));
     steps.push(() => emit({ type: 'stream', event: { type: 'usage', usage: { inputTokens: 8450, outputTokens: 1120, cachedTokens: 6000 } } }));
     steps.push(() => emit({ type: 'stream', event: { type: 'done', stopReason: 'end' } }));
-    // Authoritative final conversation ending with a changes block.
+    // Real host order: turnFinished fires BEFORE the authoritative conversation
+    // (the conversation carries the correct totals and overwrites node state).
+    steps.push(() => emit({ type: 'turnFinished', nodeId: 'a1', usage: { inputTokens: 8450, outputTokens: 1120, cachedTokens: 6000 } }));
     steps.push(() =>
       emit({
         type: 'conversation',
@@ -375,7 +377,6 @@
         },
       }),
     );
-    steps.push(() => emit({ type: 'turnFinished', nodeId: 'a1', usage: { inputTokens: 8450, outputTokens: 1120, cachedTokens: 6000 } }));
 
     let i = 0;
     const tick = () => {

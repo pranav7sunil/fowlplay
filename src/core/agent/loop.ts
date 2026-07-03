@@ -132,17 +132,25 @@ export async function runAgentLoop(opts: LoopOptions): Promise<LoopResult> {
     });
 
     // Append the assistant turn to the wire history.
+    //
+    // tool_call parts are only persisted when we are ALSO going to append their
+    // results this turn (the tool_use branch below). On cancelled/error/end,
+    // emitting the tool_call parts without matching tool results would leave the
+    // history with unanswered tool calls — the next provider request 400s.
+    const willRunTools = stopReason === 'tool_use' && parsedCalls.length > 0;
     const assistantParts: WireAssistantPart[] = [];
     if (thinking.length > 0) assistantParts.push({ type: 'thinking', text: thinking });
     if (text.length > 0) assistantParts.push({ type: 'text', text });
-    for (const pc of parsedCalls) {
-      assistantParts.push({ type: 'tool_call', id: pc.id, name: pc.name, args: pc.args });
+    if (willRunTools) {
+      for (const pc of parsedCalls) {
+        assistantParts.push({ type: 'tool_call', id: pc.id, name: pc.name, args: pc.args });
+      }
     }
     if (assistantParts.length > 0) {
       messages.push({ role: 'assistant', content: assistantParts });
     }
 
-    if (stopReason === 'tool_use' && parsedCalls.length > 0) {
+    if (willRunTools) {
       const results: WireToolResult[] = [];
       for (const pc of parsedCalls) {
         const result = await dispatchToolCall(opts.toolHost, pc.name, pc.args);

@@ -74,6 +74,9 @@ const rejectWith = (findings: string[]) =>
   JSON.stringify({ verdict: 'reject', findings, evidence: 'criterion unmet' }) +
   '\n```';
 
+/** Token usage the fake Builder loop "spends" — must be counted by the pipeline. */
+const BUILDER_USAGE = { inputTokens: 10, outputTokens: 5, cachedTokens: 0 };
+
 // ---------------------------------------------------------------------------
 // Happy path
 // ---------------------------------------------------------------------------
@@ -86,7 +89,7 @@ describe('runCoopPipeline — happy path', () => {
       sentry: [approve],
     });
     const { onGate, emitted } = gateCollector();
-    const buildStage = vi.fn(async () => {});
+    const buildStage = vi.fn(async () => BUILDER_USAGE);
 
     const result = await runCoopPipeline({
       userPrompt: 'add feature X',
@@ -117,7 +120,7 @@ describe('runCoopPipeline — happy path', () => {
     expect(statusOf('builder')).toBe('passed');
     expect(statusOf('inspector')).toBe('passed');
     expect(statusOf('sentry')).toBe('passed');
-    expect(statusOf('hitl')).toBe('running'); // awaiting the human
+    expect(statusOf('hitl')).toBe('awaiting'); // terminal "your turn" state, not a spinner
 
     // Stop-the-line carries the criteria.
     expect(result.cards.find((c) => c.role === 'stop-the-line')?.acceptanceCriteria).toEqual([
@@ -129,9 +132,10 @@ describe('runCoopPipeline — happy path', () => {
     const runningThenFinal = emitted.filter((c) => c.role === 'inspector');
     expect(runningThenFinal.map((c) => c.status)).toEqual(['running', 'passed']);
 
-    // Usage accumulated across scout + inspector + sentry (3 runner calls).
-    expect(result.usage.inputTokens).toBe(3);
-    expect(result.usage.outputTokens).toBe(3);
+    // Usage accumulates scout + inspector + sentry (3 runner calls @ 1/1) PLUS
+    // the Builder loop (BUILDER_USAGE) — the Builder must not be dropped.
+    expect(result.usage.inputTokens).toBe(3 + BUILDER_USAGE.inputTokens);
+    expect(result.usage.outputTokens).toBe(3 + BUILDER_USAGE.outputTokens);
   });
 });
 
@@ -150,7 +154,7 @@ describe('runCoopPipeline — ambiguous scout', () => {
       ],
     });
     const { emitted } = gateCollector();
-    const buildStage = vi.fn(async () => {});
+    const buildStage = vi.fn(async () => BUILDER_USAGE);
 
     const result = await runCoopPipeline({
       userPrompt: 'add a cache',
@@ -188,8 +192,9 @@ describe('runCoopPipeline — inspector route-back then approve', () => {
     });
 
     const buildInstructions: string[] = [];
-    const buildStage = vi.fn(async (instructions: string) => {
+    const buildStage = vi.fn(async (instructions: string): Promise<typeof BUILDER_USAGE> => {
       buildInstructions.push(instructions);
+      return BUILDER_USAGE;
     });
 
     const result = await runCoopPipeline({
@@ -230,7 +235,7 @@ describe('runCoopPipeline — retry budget exhaustion', () => {
       inspector: [rejectWith(['still broken'])],
       sentry: [approve],
     });
-    const buildStage = vi.fn(async () => {});
+    const buildStage = vi.fn(async () => BUILDER_USAGE);
 
     const result = await runCoopPipeline({
       userPrompt: 'do the thing',
@@ -270,7 +275,7 @@ describe('runCoopPipeline — sentry security block', () => {
           '\n```',
       ],
     });
-    const buildStage = vi.fn(async () => {});
+    const buildStage = vi.fn(async () => BUILDER_USAGE);
 
     const result = await runCoopPipeline({
       userPrompt: 'wire up the client',
@@ -300,7 +305,7 @@ describe('runCoopPipeline — cancellation', () => {
     const controller = new AbortController();
     controller.abort();
     const { runner } = scriptedRunner({ scout: [scoutOk(['C1'])] });
-    const buildStage = vi.fn(async () => {});
+    const buildStage = vi.fn(async () => BUILDER_USAGE);
 
     const result: CoopResult = await runCoopPipeline({
       userPrompt: 'x',

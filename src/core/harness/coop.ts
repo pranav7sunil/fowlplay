@@ -76,9 +76,10 @@ export interface CoopPipelineOptions {
   /**
    * Runs the real agentic Builder loop with the composed instructions. The extension owns
    * this; the harness only supplies instructions and reads the resulting staged diff back
-   * through `inspector`.
+   * through `inspector`. Returns the Builder's token usage so it is counted toward the
+   * conversation totals (the Builder is usually the dominant cost in a Coop turn).
    */
-  buildStage: (instructions: string, signal?: AbortSignal) => Promise<void>;
+  buildStage: (instructions: string, signal?: AbortSignal) => Promise<TokenUsage>;
   settings: HarnessSettings;
   /** Called on every card transition (create + each status change). */
   onGate: (card: GateCard) => void;
@@ -234,7 +235,8 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
         ? composeBuilderInstructions(userPrompt, scout.criteria, scout.plan)
         : composeBuilderFix(userPrompt, scout.criteria, scout.plan, inspectorFindings);
 
-    await buildStage(instructions, signal);
+    const builderUsage = await buildStage(instructions, signal);
+    addUsage(builderUsage);
     if (aborted()) return cancel(builderCard);
 
     const summary = inspector.summary();
@@ -352,10 +354,14 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
   );
 
   // ---- 6. HITL gate — the human is the final authority -------------------
+  // Created in a terminal `awaiting` state (not `running`) so it renders as a
+  // settled "your turn" card rather than a perpetual spinner in live chat and
+  // in saved history.
   emit(
     createCard(nextId('hitl'), {
       role: 'hitl',
       title: 'Human review',
+      status: 'awaiting',
       evidence: 'Awaiting your diff review — you are the final gate.',
     }),
   );

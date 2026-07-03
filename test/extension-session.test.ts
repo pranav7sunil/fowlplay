@@ -252,6 +252,26 @@ describe('solo prompt turn', () => {
     // Usage accumulated into the conversation totals.
     expect(conv.usageTotals.inputTokens).toBeGreaterThan(0);
   });
+
+  it('makes the user prompt visible before the turn finishes (no blank-transcript window)', async () => {
+    const { session, posted } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    const before = posted.length;
+    await session.handle({ type: 'sendPrompt', text: 'create foo.txt please' });
+
+    const turnFinishedIdx = posted.findIndex((m, i) => i >= before && m.type === 'turnFinished');
+    expect(turnFinishedIdx).toBeGreaterThan(-1);
+    // A conversation carrying the user's text must be delivered before the turn
+    // ends — otherwise the prompt is invisible for the whole (possibly long) turn.
+    const userVisibleEarly = posted.slice(before, turnFinishedIdx).some(
+      (m) =>
+        m.type === 'conversation' &&
+        Object.values(m.conversation.nodes).some(
+          (n) => n.role === 'user' && n.blocks.some((b) => b.type === 'text' && b.text.includes('create foo.txt please')),
+        ),
+    );
+    expect(userVisibleEarly).toBe(true);
+  });
 });
 
 describe('diff review — toggleRevert then sendFeedback', () => {
@@ -317,5 +337,9 @@ describe('coop pipeline', () => {
     const leaf = assistantLeaf(conv)!;
     expect(leaf.blocks.filter((b) => b.type === 'gate').length).toBe(6);
     expect(leaf.blocks.some((b) => b.type === 'changes')).toBe(true);
+    // The Builder loop's usage must be counted, not just the three role calls.
+    // Scout+Inspector+Sentry each spend 5in/3out; the Builder loop makes two
+    // model calls (edit round + finish round), so totals must exceed 3 calls.
+    expect(conv.usageTotals.inputTokens).toBeGreaterThan(3 * 5);
   });
 });

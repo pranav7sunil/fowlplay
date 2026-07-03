@@ -365,6 +365,7 @@ a:hover { text-decoration: underline; }
 .fp-status-failed { background: rgba(217, 48, 37, 0.14); color: var(--fp-block); }
 .fp-status-blocked { background: rgba(229, 165, 10, 0.16); color: var(--fp-warn); }
 .fp-status-skipped { background: var(--fp-bg-sunken); color: var(--fp-fg-subtle); }
+.fp-status-awaiting { background: var(--fp-accent-soft); color: var(--fp-accent); }
 .fp-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
 @keyframes fp-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
 

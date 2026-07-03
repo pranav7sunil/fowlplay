@@ -68,6 +68,24 @@ describe('computeFileDiff hunks', () => {
     expect(fd2.hunks[0].id).not.toBe(fd1.hunks[0].id);
   });
 
+  it('C4: identical-content hunks with different context get distinct, stable ids', () => {
+    const base = 'x\nfoo\ny\nfoo\nz';
+    // Both foo -> bar: two byte-identical hunks in different surrounding context.
+    const both = computeFileDiff('f.ts', 'modify', base, 'x\nbar\ny\nbar\nz');
+    expect(both.hunks).toHaveLength(2);
+    const firstId = both.hunks[0].id;
+    const secondId = both.hunks[1].id;
+    expect(firstId).not.toBe(secondId);
+
+    // Recompute with ONLY the second foo -> bar applied; the first is dropped.
+    const onlySecond = computeFileDiff('f.ts', 'modify', base, 'x\nfoo\ny\nbar\nz');
+    expect(onlySecond.hunks).toHaveLength(1);
+    // The survivor keeps ITS OWN id and does not inherit the first hunk's id,
+    // so review state stays attached to the correct hunk.
+    expect(onlySecond.hunks[0].id).toBe(secondId);
+    expect(onlySecond.hunks[0].id).not.toBe(firstId);
+  });
+
   it('create uses empty base, delete uses empty staged', () => {
     const create = computeFileDiff('n.ts', 'create', '', 'hello\nworld');
     expect(applyHunksToBase('', create.hunks, false)).toBe('hello\nworld');

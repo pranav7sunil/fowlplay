@@ -43,21 +43,57 @@ function gcResult(
   const collectible = r.gcClass === 'file-content' || r.gcClass === 'search-result';
   if (!collectible) return r;
 
+  // Anything before the most recent turn is fully collected.
+  if (beforeLastTurn) return stub(r);
+
+  // Within the last turn, only file-content is deduped across repeated opens.
+  if (r.gcClass !== 'file-content') return r;
+
   const paths = r.paths ?? [];
-  // A file-content result is a duplicate if every path it covers has already
-  // appeared in a newer result.
-  const duplicate =
-    r.gcClass === 'file-content' && paths.length > 0 && paths.every((p) => seenPaths.has(p));
+  if (paths.length === 0) return r;
 
-  if (beforeLastTurn || duplicate) {
-    return stub(r);
+  const seenCount = paths.reduce((n, p) => (seenPaths.has(p) ? n + 1 : n), 0);
+
+  let result = r;
+  if (seenCount === paths.length) {
+    // Every path already appeared in a newer result — the whole payload is stale.
+    result = stub(r);
+  } else if (seenCount > 0) {
+    // Partial overlap: some paths were re-opened more recently, others weren't.
+    // Stub only the already-seen files' sections; keep the fresh ones so we
+    // never drop a path that has no newer copy. The tool result message itself
+    // is preserved (never dropped) so tool_call/tool_result pairing holds.
+    const rewritten = stubSeenSections(r.content, seenPaths);
+    if (rewritten !== null) result = { ...r, content: rewritten };
   }
 
-  // Keeping this one — record its paths so older duplicates get collected.
-  if (r.gcClass === 'file-content') {
-    for (const p of paths) seenPaths.add(p);
-  }
-  return r;
+  // Record every path this result covers so older copies get collected. Paths
+  // already seen (a newer copy exists) stay owned by that newer copy.
+  for (const p of paths) seenPaths.add(p);
+  return result;
+}
+
+/**
+ * Rewrite an `open_files` payload, replacing the sections whose path is already
+ * seen (a newer copy exists) with the stub, and keeping the rest verbatim.
+ *
+ * The payload is `===== <path> =====\n<numbered body>` sections joined by a
+ * blank line; numbered bodies never contain a blank line, so splitting on the
+ * blank-line separator recovers the sections. Returns `null` if the payload is
+ * not in the expected shape, so the caller can leave it untouched.
+ */
+function stubSeenSections(content: string, seenPaths: Set<string>): string | null {
+  const sections = content.split('\n\n');
+  let matchedAny = false;
+  const rewritten = sections.map((section) => {
+    const nl = section.indexOf('\n');
+    const header = nl === -1 ? section : section.slice(0, nl);
+    const m = /^===== (.+?) =====$/.exec(header);
+    if (!m) return section;
+    matchedAny = true;
+    return seenPaths.has(m[1]) ? `${header}\n${STUB}` : section;
+  });
+  return matchedAny ? rewritten.join('\n\n') : null;
 }
 
 function stub(r: WireToolResult): WireToolResult {

@@ -32,9 +32,9 @@ import type {
   TokenUsage,
   ToolSpec,
 } from '../shared/types';
-import type { HostToWebview, WebviewToHost } from '../shared/protocol';
+import type { Attachment, HostToWebview, WebviewToHost } from '../shared/protocol';
 
-import { createAdapter as coreCreateAdapter, type ProviderAdapter, type WireAssistantPart, type WireMessage } from '../core/providers/adapter';
+import { createAdapter as coreCreateAdapter, type ProviderAdapter, type WireAssistantPart, type WireMessage, type WireUserPart } from '../core/providers/adapter';
 import { fetchModels as coreFetchModels, type FetchModelsConfig } from '../core/providers/registry';
 import { runAgentLoop } from '../core/agent/loop';
 import { buildToolSpecs, type DirEntry, type GrepMatch, type GrepOptions, type StageOp, type ToolHost } from '../core/agent/tools';
@@ -182,7 +182,7 @@ export class SessionCore {
         await this.onReady();
         return;
       case 'sendPrompt':
-        await this.onSendPrompt(msg.text);
+        await this.onSendPrompt(msg.text, msg.attachments);
         return;
       case 'cancelResponse':
         this.abort?.abort();
@@ -343,12 +343,33 @@ export class SessionCore {
   // Turn flow
   // -------------------------------------------------------------------------
 
-  private async onSendPrompt(text: string): Promise<void> {
+  private async onSendPrompt(text: string, attachments?: Attachment[]): Promise<void> {
     const trimmed = text.trim();
-    if (!trimmed) return;
-    const { conv, nodeId } = appendUser(this.conv, [{ type: 'text', text: trimmed }]);
+    const atts = attachments ?? [];
+    if (!trimmed && atts.length === 0) return;
+
+    // Text-like files are inlined into the prompt so they persist in the tree
+    // and replay on branch/resume; images are passed as image wire parts for
+    // this turn (there is no image content block to persist them in).
+    const images = atts.filter((a) => a.mimeType.startsWith('image/'));
+    const textFiles = atts.filter((a) => !a.mimeType.startsWith('image/'));
+
+    let displayText = trimmed;
+    for (const f of textFiles) {
+      displayText += `\n\n\`\`\`${f.name}\n${f.data}\n\`\`\``;
+    }
+    for (const img of images) {
+      displayText += `\n\n_[Attached image: ${img.name}]_`;
+    }
+
+    const imageParts: WireUserPart[] = images.map((a) => ({
+      type: 'image',
+      image: { mimeType: a.mimeType, data: a.data },
+    }));
+
+    const { conv, nodeId } = appendUser(this.conv, [{ type: 'text', text: displayText || '(see attachments)' }]);
     this.conv = conv;
-    await this.runAssistantTurn(nodeId);
+    await this.runAssistantTurn(nodeId, imageParts);
   }
 
   private async onEditMessage(nodeId: string, text: string): Promise<void> {
@@ -372,7 +393,7 @@ export class SessionCore {
   }
 
   /** The shared turn engine: given a user node, produce an assistant response. */
-  private async runAssistantTurn(userNodeId: string): Promise<void> {
+  private async runAssistantTurn(userNodeId: string, imageParts: WireUserPart[] = []): Promise<void> {
     const settings = await this.ensureSettings();
     const resolved = await this.resolveModel();
     if (!resolved) {
@@ -384,6 +405,11 @@ export class SessionCore {
     const userNode = this.conv.nodes[userNodeId];
     const userText = firstText(userNode?.blocks ?? []) ?? '';
     const baseWire = this.wireBaseFor(userNodeId);
+
+    // Surface the user's message (and any new branch) before streaming begins,
+    // so the prompt is visible for the whole turn and the streaming assistant
+    // node parents onto it rather than a stale leaf.
+    this.sendConversation();
 
     const assistant = appendAssistant(this.conv, [], { parentId: userNodeId, model: this.conv.model ?? undefined });
     this.conv = assistant.conv;
@@ -397,11 +423,11 @@ export class SessionCore {
     let usage: TokenUsage = emptyUsage();
     try {
       if (this.conv.harnessMode === 'coop') {
-        const out = await this.runCoop(userText, baseWire, resolved, settings.harness, signal);
+        const out = await this.runCoop(userText, imageParts, baseWire, resolved, settings.harness, signal);
         blocks = out.blocks;
         usage = out.usage;
       } else {
-        const out = await this.runSolo(userText, baseWire, resolved, assistantId, signal);
+        const out = await this.runSolo(userText, imageParts, baseWire, resolved, assistantId, signal);
         blocks = out.blocks;
         usage = out.usage;
       }
@@ -429,12 +455,16 @@ export class SessionCore {
 
   private async runSolo(
     userText: string,
+    imageParts: WireUserPart[],
     baseWire: WireMessage[],
     resolved: ResolvedModel,
     assistantId: string,
     signal: AbortSignal,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
-    const fullHistory: WireMessage[] = [...baseWire, { role: 'user', content: [{ type: 'text', text: userText }] }];
+    const fullHistory: WireMessage[] = [
+      ...baseWire,
+      { role: 'user', content: [{ type: 'text', text: userText }, ...imageParts] },
+    ];
     const sent = gcHistory(fullHistory);
 
     const result = await runAgentLoop({
@@ -458,6 +488,7 @@ export class SessionCore {
 
   private async runCoop(
     userText: string,
+    imageParts: WireUserPart[],
     baseWire: WireMessage[],
     resolved: ResolvedModel,
     harness: HarnessSettings,
@@ -491,12 +522,12 @@ export class SessionCore {
       },
     };
 
-    const buildStage = async (instructions: string, s?: AbortSignal): Promise<void> => {
+    const buildStage = async (instructions: string, s?: AbortSignal): Promise<TokenUsage> => {
       const base: WireMessage[] = [
         ...baseWire,
-        { role: 'user', content: [{ type: 'text', text: instructions }] },
+        { role: 'user', content: [{ type: 'text', text: instructions }, ...imageParts] },
       ];
-      await runAgentLoop({
+      const res = await runAgentLoop({
         adapter: resolved.adapter,
         baseUrl: resolved.baseUrl,
         apiKey: resolved.apiKey,
@@ -508,6 +539,9 @@ export class SessionCore {
         onEvent: (e) => this.deps.post({ type: 'stream', event: e }),
         signal: s,
       });
+      // Return the Builder's usage so the pipeline counts it — it is usually the
+      // dominant cost of a Coop turn.
+      return res.usage;
     };
 
     const result = await runCoopPipeline({
@@ -565,10 +599,23 @@ export class SessionCore {
       this.toast('info', 'Add a comment or revert a change before sending feedback.');
       return;
     }
+    // Physically materialize the user's reverts out of the overlay before the
+    // revision turn, so a reverted change actually disappears from the staged
+    // state regardless of whether the (possibly weak/local) model honors the
+    // prose instruction. This also drops stale comment/revert state.
+    this.materializeReverts();
     const { conv, nodeId } = appendUser(this.conv, [{ type: 'text', text: prompt }]);
     this.conv = conv;
     this.sendConversation();
     await this.runAssistantTurn(nodeId);
+  }
+
+  /** Rebuild the overlay from the changeset's effective ops (reverted hunks removed). */
+  private materializeReverts(): void {
+    const eff = this.changeset.effectiveOps();
+    this.overlay.discard();
+    for (const op of eff) this.overlay.setOp(op);
+    this.changeset = new ChangeSet(this.overlay, 'changeset');
   }
 
   private async onApply(commit: boolean, message: string | undefined, coAuthor: boolean): Promise<void> {
@@ -598,13 +645,16 @@ export class SessionCore {
     }
 
     if (commit) {
-      const ok = await this.commit(paths, message, coAuthor, ops.length);
-      if (!ok) return; // commit path already posted its own result
+      // commit() posts its own applied/error result. Even if the commit fails,
+      // the files were already written to disk above, so the staged copy is now
+      // stale and must be cleared — otherwise the next apply sees spurious drift
+      // against the user's own just-written content.
+      await this.commit(paths, message, coAuthor, ops.length);
     } else {
       this.deps.post({ type: 'applied', committed: false });
     }
 
-    // Applied changes are no longer staged.
+    // Applied changes are on disk now — no longer staged.
     this.overlay.discard();
     this.changeset = new ChangeSet(this.overlay, 'changeset');
     this.sendChangeset();
@@ -727,6 +777,11 @@ export class SessionCore {
     this.conv = conv;
     this.restoreOverlayFor(conv.currentLeafId);
     this.sendConversation();
+    // The overlay was swapped to the target branch's snapshot — refresh the diff
+    // view (and changes indicator) so it doesn't show the previous branch's hunks
+    // and so hunk-id-keyed review actions don't target a stale changeset.
+    if (!this.overlay.isEmpty()) this.sendChangeset();
+    else this.deps.post({ type: 'changeset', view: null });
     void this.persist();
   }
 
@@ -734,8 +789,11 @@ export class SessionCore {
     const target = nodeId ?? this.conv.currentLeafId;
     if (!target) return;
     const fork = forkAt(this.conv, target);
-    // Copy the staging state at the fork point so chat + workspace stay consistent.
-    const snapshot = this.conv.stagingSnapshots?.[target] ?? this.overlay.serialize();
+    // Copy the staging state as of the fork point so chat + workspace stay
+    // consistent. Walk to the nearest ancestor snapshot (a user node has none of
+    // its own) rather than defaulting to the live overlay, which may belong to a
+    // different active branch than the fork target.
+    const snapshot = this.snapshotAsOf(target);
     this.deps.openTab?.(fork, snapshot);
   }
 
@@ -876,6 +934,25 @@ export class SessionCore {
       cur = n.parentId;
     }
     return out;
+  }
+
+  /**
+   * The serialized staging state as of a node: the snapshot at that node, or the
+   * nearest ancestor's, walking the real tree ancestry (not the active path).
+   * Falls back to the live overlay only when no ancestor snapshot exists (e.g.
+   * forking the current leaf mid-review, where the live overlay is correct).
+   */
+  private snapshotAsOf(nodeId: string): SerializedOverlay {
+    const snapshots = this.conv.stagingSnapshots ?? {};
+    let cur: string | null = nodeId;
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      const snap = snapshots[cur];
+      if (snap) return snap;
+      cur = this.conv.nodes[cur]?.parentId ?? null;
+    }
+    return this.overlay.serialize();
   }
 
   private snapshotOverlay(nodeId: string): void {

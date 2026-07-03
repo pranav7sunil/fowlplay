@@ -177,7 +177,7 @@ export type HarnessMode = 'solo' | 'coop';
 
 export type CoopRole = 'scout' | 'builder' | 'inspector' | 'sentry';
 
-export type GateStatus = 'running' | 'passed' | 'failed' | 'blocked' | 'skipped';
+export type GateStatus = 'running' | 'passed' | 'failed' | 'blocked' | 'skipped' | 'awaiting';
 
 /** Evidence-based delivery: every gate emits a card with its proof. */
 export interface GateCard {

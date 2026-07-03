@@ -133,6 +133,9 @@ class Store {
         this.patch({ changeset: msg.view });
         // Host sends a changeset in response to an openDiff request → review it.
         if (msg.view && this.state.view === 'chat') this.patch({ view: 'diff' });
+        // The changeset went away (e.g. applied/discarded) while reviewing it →
+        // don't strand the user on an empty diff view.
+        if (!msg.view && this.state.view === 'diff') this.patch({ view: 'chat' });
         break;
       case 'rebaseState':
         this.patch({ rebase: msg.state });
@@ -296,13 +299,11 @@ class Store {
   private finishTurn(nodeId: string, usage: TokenUsage) {
     const conv = this.cloneConversation();
     if (conv && conv.nodes[nodeId]) {
+      // Set the node's own usage for immediate display, but do NOT fold it into
+      // usageTotals here: the host always sends the authoritative `conversation`
+      // right after `turnFinished`, and it carries the correct totals. Adding
+      // here too would double-count.
       conv.nodes[nodeId] = { ...conv.nodes[nodeId], usage };
-      const totals = conv.usageTotals ?? EMPTY_USAGE;
-      conv.usageTotals = {
-        inputTokens: totals.inputTokens + usage.inputTokens,
-        outputTokens: totals.outputTokens + usage.outputTokens,
-        cachedTokens: totals.cachedTokens + usage.cachedTokens,
-      };
       this.patch({ conversation: conv, streaming: false, streamNodeId: null });
     } else {
       this.patch({ streaming: false, streamNodeId: null });

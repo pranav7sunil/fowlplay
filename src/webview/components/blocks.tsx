@@ -4,7 +4,7 @@ import type { ContentBlock, ToolCallRecord, GateCard, CoopRole, GateStatus } fro
 import { Markdown, Collapsible } from './common';
 import {
   IconCheck, IconX, IconWrench, IconCompass, IconHammer, IconEye, IconShield,
-  IconDiff, IconGit, IconAlert, IconArrowRight, IconChevronRight,
+  IconDiff, IconGit, IconAlert, IconArrowRight, IconArrowUp, IconChevronRight,
 } from './icons';
 import { store } from './store';
 
@@ -111,12 +111,14 @@ function StatusChip({ status }: { status: GateStatus }) {
     failed: 'Failed',
     blocked: 'Blocked',
     skipped: 'Skipped',
+    awaiting: 'Your review',
   };
   const icon =
     status === 'passed' ? <IconCheck size={13} /> :
     status === 'failed' ? <IconX size={13} /> :
     status === 'running' ? <span class="fp-dot" /> :
-    status === 'blocked' ? <IconAlert size={13} /> : null;
+    status === 'blocked' ? <IconAlert size={13} /> :
+    status === 'awaiting' ? <IconArrowUp size={13} /> : null;
   return (
     <span class={`fp-status-chip fp-status-${status}`}>
       {icon}
