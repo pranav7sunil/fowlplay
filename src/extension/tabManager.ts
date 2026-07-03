@@ -9,6 +9,7 @@
  */
 
 import * as vscode from 'vscode';
+import { randomBytes } from 'node:crypto';
 import type { Conversation, SerializedOverlay } from '../shared/types';
 import type { WebviewToHost } from '../shared/protocol';
 import { createSessionCore, type SessionCore, type SessionDeps } from './session';
@@ -165,10 +166,8 @@ export class TabManager {
 }
 
 function makeNonce(): string {
-  let text = '';
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  for (let i = 0; i < 32; i++) text += chars.charAt(Math.floor(Math.random() * chars.length));
-  return text;
+  // CSP nonce must be unpredictable — use a CSPRNG, not Math.random.
+  return randomBytes(24).toString('base64').replace(/[^A-Za-z0-9]/g, '');
 }
 
 /** Fallback IO when there is no workspace folder open — every op is a safe no-op. */
