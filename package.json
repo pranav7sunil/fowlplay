@@ -5,6 +5,10 @@
   "version": "0.1.0",
   "publisher": "fowlplay",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pranav7sunil/fowlplay.git"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -140,9 +144,9 @@
     "@types/node": "^22.10.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.2.0",
-    "esbuild": "^0.24.0",
+    "esbuild": "^0.25.0",
     "preact": "^10.25.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0"
+    "vitest": "^3.2.6"
   }
 }

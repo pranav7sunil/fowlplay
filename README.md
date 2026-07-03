@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="media/phoenix.svg" alt="FowlPlay" width="120" />
+<img src="media/icon.png" alt="FowlPlay" width="120" />
 
 # FowlPlay
 
