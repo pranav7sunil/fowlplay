@@ -156,8 +156,7 @@ disk yet. When it finishes, a **Review Changes** block appears.
 Toggle the mode in the status line.
 
 - **Solo** — the plain loop: prompt → edits → review. Fast; best with strong models.
-- **Coop** *(default)* — the Safe Agentic Workflow harness runs between your prompt and your
-  review:
+- **Coop** *(default)* — the verification harness runs between your prompt and your review:
 
 ![Coop mode gate cards](images/coop-gates.png)
 

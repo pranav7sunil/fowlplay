@@ -1,25 +1,24 @@
 # FowlPlay — Specification
 
-FowlPlay is an AI coding partner for Visual Studio Code that combines two proven ideas:
+FowlPlay is an AI coding partner for Visual Studio Code that combines two core features:
 
-1. **The Dino interaction model** (smartdino.dev) — collaborative, synchronous, diff-first
-   AI coding with an in-memory staging layer, so nothing ever touches disk without review.
-2. **The Safe Agentic Workflow harness** (github.com/bybren-llc/safe-agentic-workflow) —
-   a role-based, gated pipeline with stop-the-line authority and evidence-based delivery,
-   so local and self-hosted models produce reliable results.
+1. **Interactability** — collaborative, synchronous, diff-first AI coding with an in-memory
+   staging layer, so nothing ever touches disk without review.
+2. **A verification harness** — a role-based, gated pipeline with stop-the-line authority
+   and evidence-based delivery, so local and self-hosted models produce reliable results.
 
 The thesis: local/open-weight models are good enough for daily IDE work *when a harness
-verifies their output before a human sees it*. FowlPlay runs a SAW-style pipeline between
-your prompt and the staging layer; the human diff review is the final HITL gate.
+verifies their output before a human sees it*. FowlPlay runs a gated verification pipeline
+between your prompt and the staging layer; the human diff review is the final HITL gate.
 
-Visual identity: FowlPlay looks like Dino — clean, minimal, fast — but in **ultramarine
-blue** (primary `#4166F5`, deep `#2743CC`, ink `#141B7A`) instead of Dino orange.
+Visual identity: FowlPlay is clean, minimal, fast, and **ultramarine blue** (primary
+`#4166F5`, deep `#2743CC`, ink `#141B7A`).
 
 ---
 
 ## 1. Chat (the primary interface)
 
-- Chat opens as a **webview tab in the editor area** (like Dino), plus an activity-bar icon.
+- Chat opens as a **webview tab in the editor area**, plus an activity-bar icon.
   Keybinding: `Ctrl+Alt+F` / `Cmd+Alt+F` ("FowlPlay: Open Tab"), command palette entries.
 - Natural-language prompts; responses render **markdown with syntax-highlighted code
   blocks**, tables, and collapsible **thinking blocks** (with duration) when the model emits
@@ -77,7 +76,7 @@ blue** (primary `#4166F5`, deep `#2743CC`, ink `#141B7A`) instead of Dino orange
     OpenRouter, MiniMax, Z.ai, Moonshot.
   - **Local models** — presets: Ollama (`http://localhost:11434/v1`), LM Studio
     (`http://localhost:1234/v1`), llama.cpp (`http://localhost:8080/v1`), mlx-lm. No API
-    key required. *This is the primary deployment target (LLM-in-a-Box / UC2).*
+    key required. *This is the primary deployment target.*
   - **Custom** — any endpoint speaking OpenAI or Anthropic API format.
 - **SDK types**: `openai-completions` (Chat Completions, the lingua franca of local
   servers), `anthropic` (Messages API). Streaming + tool calling on both.
@@ -87,12 +86,12 @@ blue** (primary `#4166F5`, deep `#2743CC`, ink `#141B7A`) instead of Dino orange
 - **Model switcher in the status line** — switch provider/model mid-conversation; history
   and staged edits carry over across API formats.
 
-## 6. The Coop harness (SAW adaptation — FowlPlay's differentiator)
+## 6. The Coop harness
 
 Two run modes, toggleable per tab from the status line:
 
-- **Solo mode** — the plain Dino-style loop: prompt → agentic loop → changeset → review.
-- **Coop mode** (default for local models) — the SAW pipeline runs the roles below as
+- **Solo mode** — the plain agentic loop: prompt → agentic loop → changeset → review.
+- **Coop mode** (default for local models) — the verification pipeline runs the roles below as
   separate role-prompted calls to the *same* configured model, each stage rendered in chat
   as a **gate card** with pass/fail and evidence:
   1. **Scout (BSA)** — restates the request as acceptance criteria + a short task plan.
@@ -103,7 +102,7 @@ Two run modes, toggleable per tab from the status line:
      criteria (reads the diff fresh; no shared reasoning with Builder). Verdict: approve or
      route back to Builder with findings (bounded retries).
   5. **Sentry (security)** — reviews the diff for injection, secrets, unsafe patterns.
-     Cannot be bypassed in Coop mode (SAW role-collapsing policy: QAS + security stay).
+     Cannot be bypassed in Coop mode.
   6. **HITL gate** — the diff viewer. The human is the final authority, always.
 - **Stop-the-line authority**: any stage can halt the pipeline with a blocker card stating
   the concern; the user resolves or overrides.
@@ -122,7 +121,7 @@ Settings panel (from the chat title bar), three tabs:
 - **Harness** — Coop/Solo default, per-role model overrides, QAS retry budget, role prompt
   locations.
 
-## 8. Non-goals (Dino's "deliberately simple" list, kept)
+## 8. Non-goals
 
 No MCP, no CLI, no AGENTS.md format, no @-references/slash commands, no sub-agent
 delegation beyond the fixed Coop roles. Complexity must justify itself.

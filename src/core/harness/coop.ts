@@ -1,7 +1,7 @@
 /**
  * Coop harness — pipeline state machine.
  *
- * Sequences the SAW roles between the user's prompt and the human diff review:
+ * Sequences the verification roles between the user's prompt and the human diff review:
  *
  *   Scout → Stop-the-line gate → Builder ⇄ Inspector (bounded retries) → Sentry → HITL
  *

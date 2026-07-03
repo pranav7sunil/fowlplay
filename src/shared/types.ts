@@ -177,7 +177,7 @@ export interface RebaseState {
 }
 
 // ---------------------------------------------------------------------------
-// Coop harness (SAW adaptation)
+// Coop harness
 // ---------------------------------------------------------------------------
 
 export type HarnessMode = 'solo' | 'coop';

@@ -157,7 +157,7 @@ function HarnessTab({ settings }: { settings: FowlPlaySettings | null }) {
     <>
       <div class="fp-section">
         <h2>Default mode</h2>
-        <div class="fp-section-desc">Coop runs the Safe Agentic Workflow gates; Solo is the plain agentic loop.</div>
+        <div class="fp-section-desc">Coop runs verification gates; Solo is the plain agentic loop.</div>
         <div class="fp-segmented">
           <button type="button" class={mode === 'solo' ? 'active' : ''} onClick={() => { setMode('solo'); save({ defaultMode: 'solo' }); }}>Solo</button>
           <button type="button" class={mode === 'coop' ? 'active' : ''} onClick={() => { setMode('coop'); save({ defaultMode: 'coop' }); }}>Coop</button>

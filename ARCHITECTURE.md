@@ -125,5 +125,5 @@ fowlplay/
 --fp-gradient:      linear-gradient(135deg,#4166F5,#2743CC);
 --fp-ok: #2BA84A;  --fp-warn: #E5A50A;  --fp-block: #D93025;
 ```
-Typography and spacing mirror Dino: system font stack for UI, JetBrains Mono for code,
-rounded pill buttons with the gradient, generous whitespace, GitHub-style diff colors.
+Typography and spacing use a clean system font stack for UI, JetBrains Mono for code,
+rounded pill buttons with the gradient, generous whitespace, and GitHub-style diff colors.

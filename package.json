@@ -1,7 +1,7 @@
 {
   "name": "fowlplay",
   "displayName": "FowlPlay",
-  "description": "AI coding partner for VS Code — Dino-style collaborative diff-first workflow with a Safe Agentic Workflow harness for local models.",
+  "description": "AI coding partner for VS Code — interactive, diff-first workflow with a verification harness for local models.",
   "version": "0.1.0",
   "publisher": "fowlplay",
   "license": "MIT",

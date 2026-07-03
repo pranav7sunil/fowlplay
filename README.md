@@ -4,29 +4,24 @@
 
 # FowlPlay
 
-**An AI coding partner for VS Code — collaborative and diff-first like Dino, with a Safe Agentic Workflow harness that makes local models reliable.**
+**An AI coding partner for VS Code — interactive, diff-first, and built around a verification harness for local models.**
 
 </div>
 
 ---
 
-FowlPlay combines two ideas:
+FowlPlay combines two core features:
 
-1. **The Dino interaction model** — collaborative, synchronous, diff-first coding. Every
-   edit the model proposes lands in an in-memory **staging layer** and is shown to you in a
-   GitHub-style diff before anything touches disk. You review, comment, revert, and only
-   then apply.
-2. **The Safe Agentic Workflow (SAW) harness** — a role-gated pipeline (Scout → Stop-the-line
-   → Builder → Inspector → Sentry → **you**) with evidence-based gate cards. It exists to
-   make **local / self-hosted open-weight models** produce trustworthy output by verifying
+1. **Interactability** — collaborative, synchronous, diff-first coding. Every edit the model
+   proposes lands in an in-memory **staging layer** and is shown to you in a GitHub-style diff
+   before anything touches disk. You review, comment, revert, and only then apply.
+2. **A verification harness** — a role-gated pipeline with evidence-based gate cards. It exists
+   to make **local / self-hosted open-weight models** produce trustworthy output by checking
    their work *before* it reaches your review.
 
 The thesis: a self-hosted model is good enough for daily IDE work **when a harness checks
 its output and a human holds the final gate.** FowlPlay is that harness plus that gate,
-wrapped in a fast, minimal, Dino-style UI — in **ultramarine blue**, with a blue phoenix mark.
-
-> This project was built to explore **UC2 (VS Code Coding Assistant)** from the *LLM-in-a-Box*
-> initiative: evaluating whether self-hosted models are viable for everyday development.
+wrapped in a fast, minimal UI — in **ultramarine blue**, with a blue phoenix mark.
 
 ---
 
@@ -45,10 +40,10 @@ wrapped in a fast, minimal, Dino-style UI — in **ultramarine blue**, with a bl
   commit block in the transcript.
 - **Conversation branching.** Edit a past message, rerun, rewind, or fork into a new tab —
   the staging layer travels with the branch so chat and workspace stay consistent.
-- **The Coop harness.** Toggle **Solo** (plain Dino-style loop) or **Coop** (the SAW
-  pipeline). Coop runs Scout (acceptance criteria) → a stop-the-line gate → Builder →
-  an independent Inspector (QA) → Sentry (security), each emitting an evidence gate card,
-  before handing the diff to you. Security and QA gates cannot be bypassed.
+- **Verification harness.** Toggle **Solo** for a plain agentic loop or **Coop** for a gated
+  review pipeline. Coop turns planning, implementation, quality checks, and security checks
+  into evidence cards before handing the diff to you. Security and quality gates cannot be
+  bypassed.
 - **Model-agnostic reliability.** Precise multi-file diff edits with a fuzzy-matching ladder
   so weak/local models edit reliably instead of rewriting whole files. Garbage-collected
   context (not lossy compaction) sustains long sessions.
