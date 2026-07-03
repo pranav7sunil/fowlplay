@@ -102,7 +102,11 @@ class FakeSettings implements SettingsPort {
   async saveProviders(p: ProviderConfig[]) {
     this.providers = p;
   }
-  async saveDefaultModel() {}
+  savedDefault: { providerId: string; modelId: string } | null | undefined = undefined;
+  async saveDefaultModel(model: { providerId: string; modelId: string } | null) {
+    this.savedDefault = model;
+    this.defaultModel = model as typeof this.defaultModel;
+  }
 }
 
 class FakeHistory implements HistoryPort {
@@ -191,10 +195,11 @@ function makeSession(opts: { mode?: HarnessMode; path?: string; content?: string
   const io = new FakeIo();
   const posted: HostToWebview[] = [];
   const { adapter, requests } = scriptedAdapter(opts.path, opts.content);
+  const settings = new FakeSettings(opts.mode ?? 'solo');
   const deps: SessionDeps = {
     io,
     secrets: new FakeSecrets(),
-    settings: new FakeSettings(opts.mode ?? 'solo'),
+    settings,
     history: new FakeHistory(),
     git: fakeGit,
     post: (m) => posted.push(m),
@@ -203,7 +208,7 @@ function makeSession(opts: { mode?: HarnessMode; path?: string; content?: string
     clock: () => Date.now(),
   };
   const session = createSessionCore(deps);
-  return { session, posted, io, requests };
+  return { session, posted, io, requests, settings };
 }
 
 function lastConversation(posted: HostToWebview[]): Conversation | undefined {
@@ -232,6 +237,20 @@ describe('session ready handshake', () => {
     expect(conv).toBeDefined();
     expect(conv!.model).toEqual({ providerId: 'p1', modelId: 'm1' });
     expect(conv!.harnessMode).toBe('solo');
+  });
+});
+
+describe('setModel', () => {
+  it('persists the picked model as the default so new conversations inherit it', async () => {
+    const { session, posted, settings } = makeSession();
+    await session.handle({ type: 'ready' });
+    const pick = { providerId: 'p1', modelId: 'm2' };
+    await session.handle({ type: 'setModel', model: pick });
+
+    // Current conversation reflects the pick...
+    expect(lastConversation(posted)!.model).toEqual(pick);
+    // ...and it was persisted as the default for future conversations.
+    expect(settings.savedDefault).toEqual(pick);
   });
 });
 
