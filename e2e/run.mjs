@@ -190,6 +190,8 @@ for (const tab of ['Appearance', 'Harness']) {
   } else ok(false, `${tab} tab clickable`);
 }
 await waitFor(page, () => /Scout|Inspector|Sentry/.test(document.body.innerText), 'harness tab explains Coop pipeline');
+await waitFor(page, () => document.body.innerText.includes('commit-message'), 'harness tab lists discovered skills');
+await waitFor(page, () => /\.fowlplay\/skills/.test(document.body.innerText), 'harness tab documents .fowlplay/skills location');
 await page.screenshot({ path: join(SHOTS, 'settings.png'), fullPage: false });
 
 // ============================== ONBOARDING ===================================

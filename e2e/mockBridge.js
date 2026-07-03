@@ -89,6 +89,10 @@
         harness: { defaultMode: 'coop', qasRetryBudget: 2 },
         providers: hasProviders ? providers() : [],
         defaultModel: hasProviders ? { providerId: 'prov-ollama', modelId: 'qwen2.5-coder:32b' } : null,
+        skills: [
+          { name: 'commit-message', description: 'Write a clear, conventional commit message for a staged changeset.' },
+          { name: 'test-writing', description: 'Write focused, deterministic tests that pin the behavior a change introduces.' },
+        ],
       },
     };
   }

@@ -487,6 +487,79 @@ describe('View Changes on historical commits', () => {
   });
 });
 
+describe('skills', () => {
+  it('injects the skill catalog into the solo system prompt and offers load_skill', async () => {
+    const { session, io, requests } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    io.files.set('.fowlplay/skills/foo.md', '---\nname: foo-skill\ndescription: does foo things\n---\n\n# Foo\n\nBody of foo.');
+    await session.handle({ type: 'ready' });
+
+    const reqIdx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'create foo.txt' });
+
+    // The opening request's system prompt carries the catalog (bundled + workspace).
+    const sys = requests[reqIdx].system;
+    expect(sys).toContain('AVAILABLE SKILLS');
+    expect(sys).toContain('foo-skill');
+    expect(sys).toContain('does foo things');
+    expect(sys).toContain('commit-message'); // a bundled default is present too
+
+    // load_skill is offered as a tool when skills exist.
+    expect(requests[reqIdx].tools.map((t) => t.name)).toContain('load_skill');
+  });
+
+  it('a load_skill tool call returns the skill body to the model', async () => {
+    const io = new FakeIo();
+    io.files.set('.fowlplay/skills/foo.md', '---\nname: foo-skill\ndescription: does foo\n---\n\nBODY-OF-FOO-SKILL');
+    const posted: HostToWebview[] = [];
+    const requests: ChatRequest[] = [];
+    // Round 1: call load_skill. Round 2 (after the tool result arrives): finish.
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        requests.push(request);
+        const hasToolResult = request.messages.some((m) => m.role === 'tool');
+        const events: StreamEvent[] = hasToolResult
+          ? textEvents('done')
+          : [
+              { type: 'tool_call_start', id: 's1', name: 'load_skill' },
+              { type: 'tool_call_args', id: 's1', delta: JSON.stringify({ name: 'foo-skill' }) },
+              { type: 'tool_call_end', id: 's1' },
+              USAGE,
+              { type: 'done', stopReason: 'tool_use' },
+            ];
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('solo'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'use the foo skill' });
+
+    // The continuation request carries the tool result with the skill body.
+    const continuation = requests.find((r) => r.messages.some((m) => m.role === 'tool'));
+    expect(continuation).toBeDefined();
+    const toolMsg = continuation!.messages.find((m) => m.role === 'tool');
+    const content = toolMsg && toolMsg.role === 'tool' ? toolMsg.results.map((r) => r.content).join('\n') : '';
+    expect(content).toContain('BODY-OF-FOO-SKILL');
+
+    // The tool call was surfaced to the UI and reported ok.
+    const toolStream = posted.some((m) => m.type === 'stream' && m.event.type === 'tool_call_start');
+    expect(toolStream).toBe(true);
+  });
+});
+
 describe('coop pipeline', () => {
   it('emits gate cards in Scout → Gate → Builder → Inspector → Sentry → HITL order', async () => {
     const { session, posted } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });

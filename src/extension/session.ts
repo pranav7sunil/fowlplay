@@ -30,6 +30,8 @@ import type {
   SdkType,
   SelectionContext,
   SerializedOverlay,
+  Skill,
+  SkillMeta,
   StreamEvent,
   TokenUsage,
   ToolSpec,
@@ -40,6 +42,7 @@ import { createAdapter as coreCreateAdapter, type ProviderAdapter, type WireAssi
 import { fetchModels as coreFetchModels, type FetchModelsConfig } from '../core/providers/registry';
 import { runAgentLoop } from '../core/agent/loop';
 import { buildToolSpecs, type DirEntry, type GrepMatch, type GrepOptions, type StageOp, type ToolHost } from '../core/agent/tools';
+import { BUNDLED_SKILLS, formatSkillCatalog, parseSkill } from '../core/agent/skills';
 import { gcHistory } from '../core/agent/contextGc';
 import { StagingOverlay, type DiskReader } from '../core/staging/overlay';
 import { ChangeSet } from '../core/staging/changeset';
@@ -154,6 +157,13 @@ export class SessionCore {
 
   /** A highlighted editor region pinned as scoped context for the NEXT prompt. */
   private pendingSelection: SelectionContext | null = null;
+
+  /**
+   * Skills available for the current turn (bundled defaults + workspace
+   * `.fowlplay/skills/*.md`), rediscovered at the start of each turn. Consumed by
+   * `toolHost()` (for `load_skill`) and the system-prompt catalog injection.
+   */
+  private turnSkills: Skill[] = [];
 
   /** Full (un-GC'd) wire history ending at each assistant node id, for follow-up turns. */
   private wireByNode = new Map<string, WireMessage[]>();
@@ -344,7 +354,10 @@ export class SessionCore {
   private async sendSettings(forceReload = false): Promise<void> {
     if (forceReload) this.settingsCache = null;
     const settings = await this.ensureSettings();
-    this.deps.post({ type: 'settings', settings });
+    // Attach discovered skills so the Settings UI can show what is available.
+    // Not part of the persisted settings — recomputed on demand, never cached.
+    const skills = toSkillMetas(await this.discoverSkills());
+    this.deps.post({ type: 'settings', settings: { ...settings, skills } });
   }
 
   private sendConversation(): void {
@@ -457,6 +470,10 @@ export class SessionCore {
       return;
     }
 
+    // Discover skills once for this turn (bundled + workspace). Both run modes
+    // read this via `toolHost()` and the system-prompt catalog.
+    this.turnSkills = await this.discoverSkills();
+
     const userNode = this.conv.nodes[userNodeId];
     const userText = firstText(userNode?.blocks ?? []) ?? '';
     const baseWire = this.wireBaseFor(userNodeId);
@@ -527,9 +544,9 @@ export class SessionCore {
       baseUrl: resolved.baseUrl,
       apiKey: resolved.apiKey,
       modelId: resolved.modelId,
-      system: SOLO_SYSTEM,
+      system: this.systemWithSkills(SOLO_SYSTEM),
       history: sent,
-      tools: this.allTools,
+      tools: this.toolsWithSkills(),
       toolHost: this.toolHost(),
       onEvent: (e) => this.deps.post({ type: 'stream', event: e }),
       signal,
@@ -587,9 +604,9 @@ export class SessionCore {
         baseUrl: resolved.baseUrl,
         apiKey: resolved.apiKey,
         modelId: resolved.modelId,
-        system: SOLO_SYSTEM,
+        system: this.systemWithSkills(SOLO_SYSTEM),
         history: gcHistory(base),
-        tools: this.allTools,
+        tools: this.toolsWithSkills(),
         toolHost: this.toolHost(),
         onEvent: (e) => this.deps.post({ type: 'stream', event: e }),
         signal: s,
@@ -979,6 +996,7 @@ export class SessionCore {
   private toolHost(): ToolHost {
     const overlay = this.overlay;
     const io = this.deps.io;
+    const skills = this.turnSkills;
     return {
       async readFile(path: string): Promise<string> {
         const content = await overlay.read(path);
@@ -998,7 +1016,48 @@ export class SessionCore {
       async listStaged(): Promise<string[]> {
         return overlay.ops().map((o) => o.path);
       },
+      skills: toSkillMetas(skills),
+      async loadSkill(name: string): Promise<string | null> {
+        const target = name.trim();
+        const match =
+          skills.find((s) => s.name === target) ??
+          skills.find((s) => s.name.toLowerCase() === target.toLowerCase());
+        return match ? match.body : null;
+      },
     };
+  }
+
+  /**
+   * Discover skills for a turn: the bundled defaults, overlaid by any workspace
+   * skills under `.fowlplay/skills/*.md` (workspace wins on a name collision).
+   */
+  private async discoverSkills(): Promise<Skill[]> {
+    const byName = new Map<string, Skill>();
+    for (const s of BUNDLED_SKILLS) byName.set(s.name, s);
+    try {
+      const files = await this.deps.io.glob('.fowlplay/skills/*.md');
+      for (const file of files) {
+        const raw = await this.deps.io.read(file);
+        if (raw === null) continue;
+        const skill = parseSkill(file, raw);
+        byName.set(skill.name, skill);
+      }
+    } catch {
+      /* skills are best-effort; fall back to bundled defaults */
+    }
+    return [...byName.values()];
+  }
+
+  /** Prepend the skill catalog to a base system prompt (no-op when no skills). */
+  private systemWithSkills(base: string): string {
+    const catalog = formatSkillCatalog(toSkillMetas(this.turnSkills));
+    return catalog ? `${catalog}\n\n${base}` : base;
+  }
+
+  /** The base toolset, plus `load_skill` when skills are available this turn. */
+  private toolsWithSkills(): ToolSpec[] {
+    const metas = toSkillMetas(this.turnSkills);
+    return metas.length > 0 ? buildToolSpecs({ skills: metas }) : this.allTools;
   }
 
   private async resolveModel(): Promise<ResolvedModel | null> {
@@ -1113,6 +1172,11 @@ export function createSessionCore(
 
 function emptyUsage(): TokenUsage {
   return { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+}
+
+/** Strip skill bodies down to catalog metadata (name + description). */
+function toSkillMetas(skills: Skill[]): SkillMeta[] {
+  return skills.map(({ name, description }) => ({ name, description }));
 }
 
 function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
