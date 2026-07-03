@@ -212,6 +212,10 @@ export class SessionCore {
         this.conv = { ...this.conv, model: msg.model, updatedAt: this.clock() };
         this.sendConversation();
         void this.persist();
+        // Remember this as the default so new conversations (and onboarding's
+        // model pick) inherit it instead of reopening on "Select model".
+        void this.deps.settings.saveDefaultModel(msg.model);
+        if (this.settingsCache) this.settingsCache = { ...this.settingsCache, defaultModel: msg.model };
         return;
       case 'setHarnessMode':
         this.conv = { ...this.conv, harnessMode: msg.mode, updatedAt: this.clock() };
