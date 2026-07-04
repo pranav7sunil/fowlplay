@@ -1,5 +1,5 @@
 /** Auto-growing composer with attachments, slash commands, send / stop. */
-import { useRef, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import type { Attachment } from '../../shared/protocol';
 import type { Conversation, FowlPlaySettings, ModelRef, TokenUsage } from '../../shared/types';
 import { post, store, useStore } from './store';
@@ -43,6 +43,12 @@ export function Composer({ streaming }: { streaming: boolean }) {
   const conv = useStore((s) => s.conversation);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // A freshly pinned "Edit Selection" region means the user wants to talk about
+  // it — put the caret in the composer so they can type immediately.
+  useEffect(() => {
+    if (selection) taRef.current?.focus();
+  }, [selection]);
 
   const grow = () => {
     const ta = taRef.current;

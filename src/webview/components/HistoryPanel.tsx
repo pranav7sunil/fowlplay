@@ -43,7 +43,17 @@ export function HistoryPanel({ items }: { items: ConversationSummary[] }) {
         <div class="fp-history-list">
           {items.length === 0 && <div class="fp-empty">No conversations yet.</div>}
           {items.map((c) => (
-            <div class="fp-history-item" key={c.id} onClick={() => renameId !== c.id && post({ type: 'openConversation', id: c.id })}>
+            <div
+              class="fp-history-item"
+              key={c.id}
+              onClick={() => {
+                if (renameId === c.id) return;
+                post({ type: 'openConversation', id: c.id });
+                // Navigate to the chat immediately — the conversation loads into a
+                // view the user can actually see, instead of silently behind history.
+                store.setView('chat');
+              }}
+            >
               {renameId === c.id ? (
                 <input
                   class="fp-input"
