@@ -70,12 +70,12 @@ export function StatusLine({
       <div class="fp-spacer" />
 
       {ctx && (
-        <div class="fp-context" title={`${lastInput} / ${ctx} context tokens`}>
+        <div class="fp-context" title={`~${lastInput} tokens in context now / ${ctx} window`}>
           <div class="fp-context-bar"><div class="fp-context-fill" style={{ width: `${pct}%` }} /></div>
           <span>{pct}%</span>
         </div>
       )}
-      <span class="fp-tokens" title="input / output / cached tokens">
+      <span class="fp-tokens" title="cumulative this conversation: input / output / cached">
         ↑{fmt(totals.inputTokens)} ↓{fmt(totals.outputTokens)} ⚡{fmt(totals.cachedTokens)}
       </span>
     </div>

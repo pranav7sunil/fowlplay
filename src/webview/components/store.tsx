@@ -39,7 +39,7 @@ export interface AppState {
   rebase: RebaseState;
   commitMessage: string;
   historyItems: ConversationSummary[];
-  modelsFetched: Record<string, { id: string }[]>;
+  modelsFetched: Record<string, { id: string; contextWindow?: number }[]>;
   modelsError: Record<string, string | undefined>;
   toasts: Toast[];
   bootstrapped: boolean;

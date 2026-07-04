@@ -320,15 +320,118 @@ describe('registry', () => {
   });
 
   it('fetchModels returns sorted ids for openai-completions', async () => {
+    // A remote (non-local) provider: no enrichment, plain id list.
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: 'zeta' }, { id: 'alpha' }] }), { status: 200 }));
     vi.stubGlobal('fetch', fetchMock);
     const models = await fetchModels(
-      { sdkType: 'openai-completions', baseUrl: 'http://localhost:11434/v1' },
+      { sdkType: 'openai-completions', baseUrl: 'https://api.example.com/v1' },
       undefined,
     );
     expect(models).toEqual([{ id: 'alpha' }, { id: 'zeta' }]);
     const [url] = fetchMock.mock.calls[0] as unknown as [string];
-    expect(url).toBe('http://localhost:11434/v1/models');
+    expect(url).toBe('https://api.example.com/v1/models');
+  });
+
+  it('fetchModels picks up context_length from the /models payload', async () => {
+    // OpenRouter-style payload with per-model context_length (and vLLM max_model_len).
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            { id: 'big', context_length: 200000 },
+            { id: 'vllm', max_model_len: 32768 },
+            { id: 'plain' },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const models = await fetchModels(
+      { sdkType: 'openai-completions', baseUrl: 'https://openrouter.ai/api/v1' },
+      'sk-or',
+    );
+    expect(models).toEqual([
+      { id: 'big', contextWindow: 200000 },
+      { id: 'plain' },
+      { id: 'vllm', contextWindow: 32768 },
+    ]);
+  });
+
+  it('fetchModels enriches local models from LM Studio /api/v0/models', async () => {
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'qwen' }, { id: 'gemma' }] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v0/models')) {
+        return new Response(
+          JSON.stringify({
+            data: [
+              { id: 'qwen', max_context_length: 32768, loaded_context_length: 8192 },
+              { id: 'gemma', max_context_length: 8192 },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      // llama.cpp /props and Ollama /api/show are not this server → 404.
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const models = await fetchModels(
+      { sdkType: 'openai-completions', baseUrl: 'http://localhost:1234/v1', kind: 'local' },
+      undefined,
+    );
+    // gemma → max_context_length; qwen → loaded_context_length preferred over max.
+    expect(models).toEqual([
+      { id: 'gemma', contextWindow: 8192 },
+      { id: 'qwen', contextWindow: 8192 },
+    ]);
+  });
+
+  it('fetchModels: a failing local probe does not break the primary list', async () => {
+    const fetchMock = vi.fn(async (input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'solo' }] }), { status: 200 });
+      }
+      // Every enrichment probe blows up.
+      throw new Error('connection refused');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const models = await fetchModels(
+      { sdkType: 'openai-completions', baseUrl: 'http://localhost:11434/v1', kind: 'local' },
+      undefined,
+    );
+    expect(models).toEqual([{ id: 'solo' }]);
+  });
+
+  it('fetchModels arms a ~1.5s AbortSignal timeout on local probes (without sleeping)', async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout');
+    const fetchMock = vi.fn(async (input: unknown, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ data: [{ id: 'solo' }] }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchModels(
+      { sdkType: 'openai-completions', baseUrl: 'http://localhost:11434/v1', kind: 'local' },
+      undefined,
+    );
+    // Probes are armed with the bounded deadline; the primary /models call is not.
+    expect(timeoutSpy).toHaveBeenCalledWith(1500);
+    // Every enrichment fetch carried an AbortSignal.
+    const probeCalls = fetchMock.mock.calls.filter(([u]) => !String(u).endsWith('/v1/models'));
+    expect(probeCalls.length).toBeGreaterThan(0);
+    for (const [, init] of probeCalls) {
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+    }
   });
 
   it('fetchModels uses /v1/models + x-api-key for anthropic (no doubled /v1)', async () => {

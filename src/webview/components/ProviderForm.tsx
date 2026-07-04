@@ -145,11 +145,21 @@ export function ModelManagement({ provider }: { provider: ProviderConfig }) {
     post({ type: 'updateProvider', provider: { ...provider, models: next } });
   };
 
-  const toggle = (id: string, on: boolean) => {
-    persist(on ? [...models, { id }] : models.filter((m) => m.id !== id));
+  const add = (f: { id: string; contextWindow?: number }) => {
+    if (models.some((m) => m.id === f.id)) return;
+    // Carry the fetched context window into the saved config (manual override, below, wins later).
+    persist([...models, f.contextWindow ? { id: f.id, contextWindow: f.contextWindow } : { id: f.id }]);
+  };
+  const remove = (id: string) => {
+    persist(models.filter((m) => m.id !== id));
   };
   const rename = (id: string, displayName: string) => {
     persist(models.map((m) => (m.id === id ? { ...m, displayName: displayName || undefined } : m)));
+  };
+  const setContext = (id: string, raw: string) => {
+    const n = parseInt(raw, 10);
+    const contextWindow = Number.isFinite(n) && n > 0 ? n : undefined;
+    persist(models.map((m) => (m.id === id ? { ...m, contextWindow } : m)));
   };
   const addManual = () => {
     const id = manual.trim();
@@ -180,7 +190,17 @@ export function ModelManagement({ provider }: { provider: ProviderConfig }) {
                 value={m.displayName ?? ''}
                 onInput={(e) => rename(m.id, (e.target as HTMLInputElement).value)}
               />
-              <button type="button" class="fp-icon-btn" onClick={() => toggle(m.id, false)} aria-label="Remove model"><IconTrash size={14} /></button>
+              <input
+                class="fp-input"
+                type="number"
+                min={0}
+                style={{ width: 96, padding: '3px 8px' }}
+                placeholder="ctx tokens"
+                title="Context window (tokens) — overrides the fetched value"
+                value={m.contextWindow ?? ''}
+                onInput={(e) => setContext(m.id, (e.target as HTMLInputElement).value)}
+              />
+              <button type="button" class="fp-icon-btn" onClick={() => remove(m.id)} aria-label="Remove model"><IconTrash size={14} /></button>
             </div>
           ))}
         </div>
@@ -192,8 +212,9 @@ export function ModelManagement({ provider }: { provider: ProviderConfig }) {
           <div class="fp-model-list">
             {available.map((f) => (
               <label class="fp-model-item fp-checkbox" key={f.id}>
-                <input type="checkbox" onChange={(e) => toggle(f.id, (e.target as HTMLInputElement).checked)} />
+                <input type="checkbox" onChange={(e) => (e.target as HTMLInputElement).checked && add(f)} />
                 <span style={{ fontFamily: 'var(--fp-font)', fontSize: 12 }}>{f.id}</span>
+                {f.contextWindow && <span style={{ color: 'var(--fp-fg-muted)', fontSize: 11 }}>{Math.round(f.contextWindow / 1000)}k ctx</span>}
               </label>
             ))}
           </div>
