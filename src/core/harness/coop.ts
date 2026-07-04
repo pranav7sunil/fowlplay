@@ -22,6 +22,7 @@ import type {
   HarnessSettings,
   TokenUsage,
 } from '../../shared/types';
+import { fitDiffToBudget } from '../agent/contextBudget';
 import {
   createCard,
   joinSections,
@@ -31,6 +32,7 @@ import {
   section,
   transition,
   type ParsedVerdict,
+  type Verdict,
 } from './evidence';
 import {
   INSPECTOR_SYSTEM,
@@ -90,6 +92,14 @@ export interface CoopPipelineOptions {
    * `modelLabel` unset on cards (existing tests stay green).
    */
   modelLabelFor?: (role: CoopRole) => string | undefined;
+  /**
+   * Payload token budget a review role (Inspector/Sentry) may spend on the diff,
+   * already net of system-prompt / instruction / response overhead. When it
+   * returns a number and the diff overflows it, the role runs once per chunk and
+   * the verdicts are aggregated. Returning `undefined` (unknown context window)
+   * preserves the exact single-call path — the extension supplies this.
+   */
+  diffBudgetFor?: (role: CoopRole) => number | undefined;
   signal?: AbortSignal;
 }
 
@@ -98,12 +108,39 @@ export type CoopOutcome =
   | 'blocked'
   | 'qas-failed'
   | 'security-blocked'
+  | 'context-exceeded'
   | 'cancelled';
+
+/** Detail behind a `context-exceeded` outcome, for the caller's user-facing message. */
+export interface ContextExceededInfo {
+  role: CoopRole;
+  modelLabel?: string;
+  /** The model's full context window in tokens, when known. */
+  windowTokens?: number;
+  /** Estimated tokens the (already-trimmed) newest turn needs. */
+  neededTokens: number;
+  /** The payload budget it had to fit into. */
+  budgetTokens: number;
+}
+
+/**
+ * Thrown from `buildStage` when the newest turn alone cannot fit the Builder's
+ * payload budget even after trimming. The pipeline catches it, emits a blocked
+ * "Context limit" gate card, and returns the `context-exceeded` outcome.
+ */
+export class ContextExceededError extends Error {
+  constructor(public readonly info: ContextExceededInfo) {
+    super('Context window exceeded');
+    this.name = 'ContextExceededError';
+  }
+}
 
 export interface CoopResult {
   outcome: CoopOutcome;
   /** Present for `blocked` — the clarifying question to surface to the user. */
   question?: string;
+  /** Present for `context-exceeded` — sizes + model for the user-facing message. */
+  context?: ContextExceededInfo;
   cards: GateCard[];
   usage: TokenUsage;
 }
@@ -113,7 +150,7 @@ export interface CoopResult {
 // ---------------------------------------------------------------------------
 
 export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopResult> {
-  const { userPrompt, runner, inspector, buildStage, settings, onGate, modelLabelFor, signal } = opts;
+  const { userPrompt, runner, inspector, buildStage, settings, onGate, modelLabelFor, diffBudgetFor, signal } = opts;
   const labelFor = (role: CoopRole): string | undefined => modelLabelFor?.(role);
 
   const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
@@ -137,6 +174,87 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
   };
 
   const aborted = () => Boolean(signal?.aborted);
+
+  /**
+   * Run a read-only review role (Inspector/Sentry) over the diff, splitting it
+   * into budget-sized chunks when a budget is supplied and the diff overflows.
+   * Each chunk is reviewed sequentially (abort-aware); the verdicts are then
+   * aggregated — approve only if EVERY chunk approves, findings unioned. Returns
+   * the aggregated verdict, the role's summed usage, and a context note (empty
+   * when a single call sufficed).
+   */
+  const runReview = async (
+    role: CoopRole,
+    system: string,
+    buildPrompt: (chunk: string) => string,
+    diff: string,
+  ): Promise<{ verdict: ParsedVerdict; usage: TokenUsage; note: string; aborted: boolean }> => {
+    const budget = diffBudgetFor?.(role);
+    const fit =
+      budget !== undefined ? fitDiffToBudget(diff, budget) : { chunks: [diff], truncated: false };
+    const roleUsage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+    const spend = (u: TokenUsage) => {
+      roleUsage.inputTokens += u.inputTokens;
+      roleUsage.outputTokens += u.outputTokens;
+      roleUsage.cachedTokens += u.cachedTokens;
+    };
+
+    // Single-call path (no budget, or the whole diff fits): identical to before.
+    if (fit.chunks.length <= 1) {
+      const run = await runner.run({
+        role,
+        system,
+        userPrompt: buildPrompt(fit.chunks[0] ?? diff),
+        readOnly: true,
+        signal,
+      });
+      spend(run.usage);
+      const note = fit.truncated
+        ? 'Part of the diff was truncated to fit the model\'s context window.'
+        : '';
+      return { verdict: parseVerdict(run.text), usage: roleUsage, note, aborted: aborted() };
+    }
+
+    // Chunked path: review each part, then aggregate.
+    const n = fit.chunks.length;
+    const verdicts: ParsedVerdict[] = [];
+    for (let i = 0; i < n; i += 1) {
+      if (aborted()) {
+        return {
+          verdict: { verdict: 'reject', findings: [], evidence: '' },
+          usage: roleUsage,
+          note: '',
+          aborted: true,
+        };
+      }
+      const prompt = `(Reviewing part ${i + 1} of ${n} of the changeset — judge only what is present in this part.)\n\n${buildPrompt(fit.chunks[i])}`;
+      const run = await runner.run({ role, system, userPrompt: prompt, readOnly: true, signal });
+      spend(run.usage);
+      verdicts.push(parseVerdict(run.text));
+    }
+    const note = `Diff reviewed in ${n} parts (context budget).${fit.truncated ? ' Part of the diff was truncated to fit.' : ''}`;
+    return { verdict: aggregateVerdicts(verdicts), usage: roleUsage, note, aborted: aborted() };
+  };
+
+  /** Blocked "Context limit" card + `context-exceeded` result. */
+  const contextExceeded = (info: ContextExceededInfo): CoopResult => {
+    emit(
+      createCard(nextId('ctx'), {
+        role: 'stop-the-line',
+        title: 'Context limit',
+        status: 'blocked',
+        modelLabel: info.modelLabel,
+        evidence: joinSections(
+          section(
+            'Context window exceeded',
+            `The ${info.role} step's request needs ~${fmtK(info.neededTokens)} tokens but only ~${fmtK(info.budgetTokens)} fit ${info.modelLabel ?? 'the selected model'}'s payload budget${info.windowTokens ? ` (~${fmtK(info.windowTokens)} token window)` : ''}.`,
+          ),
+          section('What to do', 'Trim the request, start a fresh conversation, or pick a model with a larger context window.'),
+        ),
+      }),
+    );
+    return { outcome: 'context-exceeded', context: info, cards, usage };
+  };
 
   /** Finalize on cancellation: mark the in-flight card and return the cancelled result. */
   const cancel = (running?: GateCard): CoopResult => {
@@ -174,6 +292,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
   const scout = parseScout(scoutRun.text);
   emit(
     transition(scoutCard, 'passed', {
+      usage: scoutRun.usage,
       acceptanceCriteria: scout.criteria,
       evidence: scout.ambiguous
         ? joinSections(
@@ -245,7 +364,22 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
         ? composeBuilderInstructions(userPrompt, scout.criteria, scout.plan)
         : composeBuilderFix(userPrompt, scout.criteria, scout.plan, inspectorFindings);
 
-    const builderUsage = await buildStage(instructions, signal);
+    let builderUsage: TokenUsage;
+    try {
+      builderUsage = await buildStage(instructions, signal);
+    } catch (err) {
+      if (err instanceof ContextExceededError) {
+        // Mark the in-flight Builder card, then emit the Context limit gate.
+        emit(
+          transition(builderCard, 'failed', {
+            attempt,
+            evidence: joinSections(builderCard.evidence, '_Halted — request exceeds the context window._'),
+          }),
+        );
+        return contextExceeded(err.info);
+      }
+      throw err;
+    }
     addUsage(builderUsage);
     if (aborted()) return cancel(builderCard);
 
@@ -253,6 +387,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
     emit(
       transition(builderCard, 'passed', {
         attempt,
+        usage: builderUsage,
         evidence: joinSections(
           section('Changeset', renderChangeSummary(summary)),
           attempt > 1
@@ -274,23 +409,26 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
       }),
     );
     const diff = inspector.unifiedDiff();
-    const inspectorRun = await runner.run({
-      role: 'inspector',
-      system: INSPECTOR_SYSTEM,
-      userPrompt: composeInspectorPrompt(scout.criteria, diff),
-      readOnly: true,
-      signal,
-    });
-    addUsage(inspectorRun.usage);
-    if (aborted()) return cancel(inspectorCard);
+    const inspectorReview = await runReview(
+      'inspector',
+      INSPECTOR_SYSTEM,
+      (chunk) => composeInspectorPrompt(scout.criteria, chunk),
+      diff,
+    );
+    addUsage(inspectorReview.usage);
+    if (inspectorReview.aborted) return cancel(inspectorCard);
 
-    const verdict = parseVerdict(inspectorRun.text);
+    const verdict = inspectorReview.verdict;
     if (verdict.verdict === 'approve') {
       emit(
         transition(inspectorCard, 'passed', {
           attempt,
+          usage: inspectorReview.usage,
           findings: verdict.findings,
-          evidence: verdictEvidence('All acceptance criteria verified.', verdict),
+          evidence: joinSections(
+            verdictEvidence('All acceptance criteria verified.', verdict),
+            inspectorReview.note ? section('Context', inspectorReview.note) : '',
+          ),
         }),
       );
       break; // proceed to Sentry
@@ -306,12 +444,16 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
     emit(
       transition(inspectorCard, 'failed', {
         attempt,
+        usage: inspectorReview.usage,
         findings: inspectorFindings,
-        evidence: verdictEvidence(
-          budgetRemains
-            ? `Routing back to Builder (attempt ${attempt} of ${maxAttempts}).`
-            : 'Retry budget exhausted.',
-          verdict,
+        evidence: joinSections(
+          verdictEvidence(
+            budgetRemains
+              ? `Routing back to Builder (attempt ${attempt} of ${maxAttempts}).`
+              : 'Retry budget exhausted.',
+            verdict,
+          ),
+          inspectorReview.note ? section('Context', inspectorReview.note) : '',
         ),
       }),
     );
@@ -333,17 +475,16 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
       modelLabel: labelFor('sentry'),
     }),
   );
-  const sentryRun = await runner.run({
-    role: 'sentry',
-    system: SENTRY_SYSTEM,
-    userPrompt: composeSentryPrompt(inspector.unifiedDiff()),
-    readOnly: true,
-    signal,
-  });
-  addUsage(sentryRun.usage);
-  if (aborted()) return cancel(sentryCard);
+  const sentryReview = await runReview(
+    'sentry',
+    SENTRY_SYSTEM,
+    (chunk) => composeSentryPrompt(chunk),
+    inspector.unifiedDiff(),
+  );
+  addUsage(sentryReview.usage);
+  if (sentryReview.aborted) return cancel(sentryCard);
 
-  const sentryVerdict = parseVerdict(sentryRun.text);
+  const sentryVerdict = sentryReview.verdict;
   if (sentryVerdict.verdict !== 'approve') {
     // Security findings are never auto-fixed — the human decides.
     const findings =
@@ -352,16 +493,24 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
         : ['Sentry flagged a security concern but gave no specific finding; treat the changeset as suspect.'];
     emit(
       transition(sentryCard, 'blocked', {
+        usage: sentryReview.usage,
         findings,
-        evidence: verdictEvidence('Security concern — pipeline halted for human decision.', sentryVerdict),
+        evidence: joinSections(
+          verdictEvidence('Security concern — pipeline halted for human decision.', sentryVerdict),
+          sentryReview.note ? section('Context', sentryReview.note) : '',
+        ),
       }),
     );
     return { outcome: 'security-blocked', cards, usage };
   }
   emit(
     transition(sentryCard, 'passed', {
+      usage: sentryReview.usage,
       findings: sentryVerdict.findings,
-      evidence: verdictEvidence('No security concerns found in the diff.', sentryVerdict),
+      evidence: joinSections(
+        verdictEvidence('No security concerns found in the diff.', sentryVerdict),
+        sentryReview.note ? section('Context', sentryReview.note) : '',
+      ),
     }),
   );
 
@@ -384,6 +533,38 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Aggregate per-chunk review verdicts into one: approve ONLY if every chunk
+ * approves; any `block` wins over `reject`; findings are unioned (dedup, order
+ * preserved); evidence lists each part's verdict.
+ */
+function aggregateVerdicts(verdicts: ParsedVerdict[]): ParsedVerdict {
+  const allApprove = verdicts.length > 0 && verdicts.every((v) => v.verdict === 'approve');
+  const anyBlock = verdicts.some((v) => v.verdict === 'block');
+  const verdict: Verdict = allApprove ? 'approve' : anyBlock ? 'block' : 'reject';
+
+  const seen = new Set<string>();
+  const findings: string[] = [];
+  for (const v of verdicts) {
+    for (const f of v.findings) {
+      if (!seen.has(f)) {
+        seen.add(f);
+        findings.push(f);
+      }
+    }
+  }
+  const evidence = verdicts
+    .map((v, i) => `Part ${i + 1}: ${v.verdict.toUpperCase()}${v.evidence ? ` — ${v.evidence}` : ''}`)
+    .join('\n');
+  return { verdict, findings, evidence };
+}
+
+/** Format a token count with a thousands suffix, e.g. 1234 → "1.2k". */
+function fmtK(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
+  return String(n);
+}
 
 /** Assemble a role card's evidence markdown from a headline + parsed verdict. */
 function verdictEvidence(headline: string, verdict: ParsedVerdict): string {

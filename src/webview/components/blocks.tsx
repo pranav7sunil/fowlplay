@@ -32,6 +32,12 @@ function fmtDuration(ms?: number): string {
   return ` for ${(ms / 1000).toFixed(1)}s`;
 }
 
+/** Compact token count, e.g. 1234 → "1.2k". Local to avoid cross-component imports. */
+function fmtTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
+  return String(n);
+}
+
 export function ThinkingBlock({ text, durationMs }: { text: string; durationMs?: number }) {
   return (
     <Collapsible
@@ -168,6 +174,14 @@ export function GateCardView({ card }: { card: GateCard }) {
           <button type="button" class="fp-btn fp-btn-primary fp-btn-sm" onClick={() => store.openReview()} style={{ alignSelf: 'flex-start' }}>
             <IconDiff size={15} /> Review Changes
           </button>
+        )}
+        {card.usage && (card.usage.inputTokens > 0 || card.usage.outputTokens > 0) && (
+          <div
+            class="fp-gate-usage"
+            style={{ fontSize: '11px', color: 'var(--fp-fg-muted)', fontFamily: 'var(--fp-font)' }}
+          >
+            ↑{fmtTokens(card.usage.inputTokens)} ↓{fmtTokens(card.usage.outputTokens)}
+          </div>
         )}
       </div>
     </div>

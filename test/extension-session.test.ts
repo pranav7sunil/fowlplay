@@ -665,6 +665,124 @@ describe('coop pipeline', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Hard context-window management
+// ---------------------------------------------------------------------------
+
+/** A session whose single model optionally advertises a context window. */
+function makeWindowSession(opts: { window?: number; mode?: HarnessMode; path?: string; content?: string }) {
+  const io = new FakeIo();
+  const posted: HostToWebview[] = [];
+  const { adapter, requests } = scriptedAdapter(opts.path, opts.content);
+  const model = opts.window ? { id: 'm1', contextWindow: opts.window } : { id: 'm1' };
+  const provider: ProviderConfig = { ...PROVIDER, models: [model] };
+  const mode = opts.mode ?? 'solo';
+  const settings: SettingsPort = {
+    async load(): Promise<FowlPlaySettings> {
+      return {
+        appearance: APPEARANCE,
+        harness: { defaultMode: mode, qasRetryBudget: 1 },
+        providers: [provider],
+        defaultModel: { providerId: 'p1', modelId: 'm1' },
+      };
+    },
+    async saveAppearance() {},
+    async saveHarness() {},
+    async saveProviders() {},
+    async saveDefaultModel() {},
+  };
+  const deps: SessionDeps = {
+    io,
+    secrets: new FakeSecrets(),
+    settings,
+    history: new FakeHistory(),
+    git: fakeGit,
+    post: (m) => posted.push(m),
+    createAdapter: () => adapter,
+    fetchModels: async () => [{ id: 'm1' }],
+    clock: () => Date.now(),
+  };
+  return { session: createSessionCore(deps), posted, io, requests };
+}
+
+/** Every text payload in a wire request (user text + tool results). */
+function allWireText(req: ChatRequest): string {
+  return req.messages
+    .map((m) =>
+      m.role === 'tool'
+        ? m.results.map((r) => r.content).join('\n')
+        : m.content.map((p) => (p.type === 'text' ? p.text : '')).join('\n'),
+    )
+    .join('\n');
+}
+
+describe('context-window management', () => {
+  // ~4000 tokens each (chars/4); a small-window model must trim one to fit.
+  const T1 = `TURN1MARK ${'x'.repeat(16000)}`;
+  const T2 = `TURN2MARK ${'x'.repeat(16000)}`;
+
+  it('trims the oldest turn when the conversation model has a small context window', async () => {
+    // window 8000 → reserve max(1500, 2000)=2000 → payload budget 6000.
+    const { session, requests } = makeWindowSession({ window: 8000, path: 'foo.txt', content: 'hi\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: T1 }); // fits alone (~4k ≤ 6k)
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: T2 }); // now T1+T2 overruns → trim T1
+    const first = allWireText(requests[idx]);
+
+    expect(first).toContain('trimmed to fit'); // synthetic note prepended
+    expect(first).toContain('TURN2MARK'); // newest turn preserved
+    expect(first).not.toContain('TURN1MARK'); // oldest whole turn dropped
+  });
+
+  it('a model with no known context window keeps full history (no regression)', async () => {
+    const { session, requests } = makeWindowSession({ path: 'foo.txt', content: 'hi\n' }); // no window
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: T1 });
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: T2 });
+    const first = allWireText(requests[idx]);
+
+    expect(first).not.toContain('trimmed to fit'); // no budget → no trim
+    expect(first).toContain('TURN1MARK'); // full history retained
+    expect(first).toContain('TURN2MARK');
+  });
+
+  it('surfaces a friendly block when the request exceeds the model context window (coop)', async () => {
+    // window 4000 → payload budget 2500; a ~3000-token prompt cannot fit.
+    const { session, posted } = makeWindowSession({ window: 4000, mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: `refactor everything ${'x'.repeat(12000)}` });
+
+    const conv = lastConversation(posted)!;
+    const leaf = assistantLeaf(conv)!;
+    const textBlock = leaf.blocks.find(
+      (b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text',
+    );
+    expect(textBlock?.text).toMatch(/exceeds .* context window/);
+    expect(textBlock?.text).toContain('4.0k');
+    // A blocked Context limit gate card was emitted.
+    expect(leaf.blocks.some((b) => b.type === 'gate' && b.card.title === 'Context limit')).toBe(true);
+  });
+
+  it('surfaces a friendly error block in solo mode when the request exceeds the window', async () => {
+    const { session, posted } = makeWindowSession({ window: 4000, mode: 'solo', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: `rewrite it all ${'x'.repeat(12000)}` });
+
+    const conv = lastConversation(posted)!;
+    const leaf = assistantLeaf(conv)!;
+    const errorBlock = leaf.blocks.find(
+      (b): b is Extract<ContentBlock, { type: 'error' }> => b.type === 'error',
+    );
+    expect(errorBlock?.message).toMatch(/exceeds .* context window/);
+    // No gate cards in solo mode.
+    expect(leaf.blocks.some((b) => b.type === 'gate')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Cross-surface settings sync
 // ---------------------------------------------------------------------------
 

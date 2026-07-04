@@ -45,11 +45,13 @@ import { runAgentLoop } from '../core/agent/loop';
 import { buildToolSpecs, type DirEntry, type GrepMatch, type GrepOptions, type StageOp, type ToolHost } from '../core/agent/tools';
 import { BUNDLED_SKILLS, formatSkillCatalog, parseSkill } from '../core/agent/skills';
 import { gcHistory } from '../core/agent/contextGc';
+import { trimWireToBudget, wireTokens } from '../core/agent/contextBudget';
 import { StagingOverlay, type DiskReader } from '../core/staging/overlay';
 import { ChangeSet } from '../core/staging/changeset';
 import { detectDrift, rebase as coreRebase } from '../core/staging/rebase';
 import { renderHunkDiff } from '../core/diff/compute';
 import {
+  ContextExceededError,
   runCoopPipeline,
   type ChangesetInspector,
   type RoleRunner,
@@ -709,11 +711,29 @@ export class SessionCore {
     assistantId: string,
     signal: AbortSignal,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
+    const settings = await this.ensureSettings();
     const fullHistory: WireMessage[] = [
       ...baseWire,
       { role: 'user', content: [{ type: 'text', text: userText }, ...imageParts] },
     ];
-    const sent = gcHistory(fullHistory);
+    let sent = gcHistory(fullHistory);
+
+    // Hard context-window management: trim oldest turns to fit the conversation
+    // model's payload budget. If the newest turn alone still overruns, surface a
+    // friendly error block instead of letting the provider 400 on us.
+    const budget = this.payloadBudget(settings);
+    if (budget !== undefined) {
+      const trimmed = trimWireToBudget(sent, budget);
+      sent = trimmed.messages;
+      if (wireTokens(sent) > budget) {
+        const label = this.roleModelLabel(settings) ?? 'the selected model';
+        const window = this.roleWindow(settings);
+        return {
+          blocks: [{ type: 'error', message: contextExceededMessage(label, window) }],
+          usage: emptyUsage(),
+        };
+      }
+    }
 
     const result = await runAgentLoop({
       adapter: resolved.adapter,
@@ -781,13 +801,34 @@ export class SessionCore {
         ...baseWire,
         { role: 'user', content: [{ type: 'text', text: instructions }, ...imageParts] },
       ];
+      let history = gcHistory(base);
+
+      // Trim oldest turns to the Builder model's payload budget. If the newest
+      // turn alone overruns, throw — the pipeline turns this into a Context limit
+      // gate and a `context-exceeded` outcome.
+      const budget = this.payloadBudget(settings, 'builder');
+      if (budget !== undefined) {
+        const trimmed = trimWireToBudget(history, budget);
+        history = trimmed.messages;
+        const needed = wireTokens(history);
+        if (needed > budget) {
+          throw new ContextExceededError({
+            role: 'builder',
+            modelLabel: this.roleModelLabel(settings, 'builder'),
+            windowTokens: this.roleWindow(settings, 'builder'),
+            neededTokens: needed,
+            budgetTokens: budget,
+          });
+        }
+      }
+
       const res = await runAgentLoop({
         adapter: rm.adapter,
         baseUrl: rm.baseUrl,
         apiKey: rm.apiKey,
         modelId: rm.modelId,
         system: this.systemWithSkills(SOLO_SYSTEM),
-        history: gcHistory(base),
+        history,
         tools: this.toolsWithSkills(),
         toolHost: this.toolHost(),
         onEvent: (e) => this.deps.post({ type: 'stream', event: e }),
@@ -809,6 +850,7 @@ export class SessionCore {
         this.deps.post({ type: 'gateUpdate', card });
       },
       modelLabelFor: (role) => this.roleModelLabel(settings, role),
+      diffBudgetFor: (role) => this.payloadBudget(settings, role),
       signal,
     });
 
@@ -823,6 +865,11 @@ export class SessionCore {
       case 'security-blocked':
         blocks.push({ type: 'text', text: 'Sentry flagged a security concern. The changes remain staged — review carefully before applying.' });
         break;
+      case 'context-exceeded': {
+        const label = result.context?.modelLabel ?? 'the selected model';
+        blocks.push({ type: 'text', text: contextExceededMessage(label, result.context?.windowTokens) });
+        break;
+      }
       case 'cancelled':
         blocks.push({ type: 'text', text: 'Cancelled.' });
         break;
@@ -1299,11 +1346,32 @@ export class SessionCore {
   }
 
   /** Display label for the model a role resolves to (for gate cards / status). */
-  private roleModelLabel(settings: FowlPlaySettings, role: CoopRole): string | undefined {
+  private roleModelLabel(settings: FowlPlaySettings, role?: CoopRole): string | undefined {
     const found = this.resolveRef(settings, role);
     if (!found) return undefined;
     const model = found.provider.models.find((m) => m.id === found.ref.modelId);
     return model?.displayName || model?.id || found.ref.modelId;
+  }
+
+  /** The known context window (tokens) of the model a role resolves to, if any. */
+  private roleWindow(settings: FowlPlaySettings, role?: CoopRole): number | undefined {
+    const found = this.resolveRef(settings, role);
+    const model = found?.provider.models.find((m) => m.id === found.ref.modelId);
+    const window = model?.contextWindow;
+    return window && window > 0 ? window : undefined;
+  }
+
+  /**
+   * The payload token budget for a role's model: the context window minus a
+   * reserve for the system prompt, instructions, and response headroom
+   * (`max(1500, 25% of window)`). Returns `undefined` when the window is unknown
+   * — no hard budget, preserving today's behavior for such providers.
+   */
+  private payloadBudget(settings: FowlPlaySettings, role?: CoopRole): number | undefined {
+    const window = this.roleWindow(settings, role);
+    if (window === undefined) return undefined;
+    const reserve = Math.max(1500, Math.floor(window * 0.25));
+    return Math.max(0, window - reserve);
   }
 
   /** Display label for an explicit ModelRef (used in mention confirmations). */
@@ -1410,6 +1478,18 @@ export function createSessionCore(
 
 function emptyUsage(): TokenUsage {
   return { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
+}
+
+/** User-facing message when a request + its context overruns the model's window. */
+function contextExceededMessage(modelLabel: string, windowTokens?: number): string {
+  const size = windowTokens ? ` (~${fmtTokensK(windowTokens)})` : '';
+  return `The request plus its context exceeds ${modelLabel}'s context window${size}. Trim the request, start a fresh conversation, or pick a larger model.`;
+}
+
+/** Format a token count with a thousands suffix, e.g. 1234 → "1.2k". */
+function fmtTokensK(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
+  return String(n);
 }
 
 /** Strip skill bodies down to catalog metadata (name + description). */

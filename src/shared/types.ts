@@ -221,6 +221,8 @@ export interface GateCard {
   /** For inspector/sentry: findings that routed work back. */
   findings?: string[];
   attempt?: number;            // builder/inspector retry round
+  /** Token usage this role spent (shown dimmed in the card footer). */
+  usage?: TokenUsage;
 }
 
 export interface HarnessSettings {
