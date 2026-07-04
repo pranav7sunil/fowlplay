@@ -176,19 +176,31 @@ export function highlightCode(code: string, lang: string): string {
 // Inline markdown (bold, italic, code, links)
 // ---------------------------------------------------------------------------
 
+// Private-use sentinel char used to placeholder inline-code spans. It passes
+// through escapeHtml unchanged, so it survives the single formatInline pass.
+const CODE_SENTINEL = '\uE000';
+
 function renderInline(src: string): string {
-  // Tokenize inline code first so its contents are not further processed.
-  const parts: string[] = [];
-  let rest = src;
-  const codeRe = /`([^`]+)`/;
-  let m: RegExpExecArray | null;
-  while ((m = codeRe.exec(rest))) {
-    parts.push(formatInline(rest.slice(0, m.index)));
-    parts.push(`<code class="fp-inline-code">${escapeHtml(m[1])}</code>`);
-    rest = rest.slice(m.index + m[0].length);
-  }
-  parts.push(formatInline(rest));
-  return parts.join('');
+  // Strip any sentinel chars from the raw input so user text can never forge a
+  // placeholder (they are not derivable from escaped input either).
+  const clean = src.split(CODE_SENTINEL).join('');
+  // Extract inline-code spans and replace them with index-based placeholders,
+  // so emphasis that spans a code span (e.g. **bold `code` inside**) is matched
+  // as a single run by formatInline instead of being split across fragments.
+  const codes: string[] = [];
+  const withPlaceholders = clean.replace(/`([^`]+)`/g, (_all, code) => {
+    const idx = codes.length;
+    codes.push(code);
+    return `${CODE_SENTINEL}${idx}${CODE_SENTINEL}`;
+  });
+  // Run inline formatting (which HTML-escapes everything) over the whole string
+  // once, then substitute the rendered <code> elements back in.
+  let html = formatInline(withPlaceholders);
+  html = html.replace(
+    new RegExp(`${CODE_SENTINEL}(\\d+)${CODE_SENTINEL}`, 'g'),
+    (_all, n) => `<code class="fp-inline-code">${escapeHtml(codes[Number(n)])}</code>`,
+  );
+  return html;
 }
 
 function formatInline(src: string): string {
@@ -210,6 +222,64 @@ function formatInline(src: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Lists (indentation-aware, nested, mixed ul/ol)
+// ---------------------------------------------------------------------------
+
+interface ListItem {
+  indent: number;
+  ordered: boolean;
+  start: number;
+  text: string;
+}
+
+// Matches a single list-marker line, capturing leading whitespace, the marker
+// (bullet or "N."), and the item text.
+const LIST_ITEM_RE = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
+
+// Visual indent width; a tab counts as 4 columns so a single tab always reads
+// as a nested level (>= 2 columns deeper).
+function leadingIndent(ws: string): number {
+  let n = 0;
+  for (const ch of ws) n += ch === '\t' ? 4 : 1;
+  return n;
+}
+
+/**
+ * Build nested <ul>/<ol> HTML from a flat list of items, starting at `start`.
+ * Items whose indent is >= 2 columns deeper than the current level become a
+ * nested list attached to the preceding item; a change of marker type at the
+ * same level opens a fresh sibling list. Returns the HTML and the index of the
+ * first item not consumed at this level.
+ */
+function buildListLevel(items: ListItem[], start: number): [string, number] {
+  const levelIndent = items[start].indent;
+  // Same level = within one column of tolerance (models emit 2/3/4-space
+  // indents); deeper by >= 2 columns is a child.
+  const sameLevel = (indent: number) => Math.abs(indent - levelIndent) < 2;
+  let html = '';
+  let i = start;
+  while (i < items.length && sameLevel(items[i].indent)) {
+    const ordered = items[i].ordered;
+    const startNum = items[i].start;
+    let list = ordered ? (startNum !== 1 ? `<ol start="${startNum}">` : '<ol>') : '<ul>';
+    while (i < items.length && sameLevel(items[i].indent) && items[i].ordered === ordered) {
+      let li = `<li>${renderInline(items[i].text)}`;
+      i++;
+      if (i < items.length && items[i].indent - levelIndent >= 2) {
+        const [childHtml, next] = buildListLevel(items, i);
+        li += childHtml;
+        i = next;
+      }
+      li += '</li>';
+      list += li;
+    }
+    list += ordered ? '</ol>' : '</ul>';
+    html += list;
+  }
+  return [html, i];
+}
+
+// ---------------------------------------------------------------------------
 // Block markdown
 // ---------------------------------------------------------------------------
 
@@ -217,13 +287,6 @@ export function renderMarkdown(src: string): string {
   const lines = (src || '').replace(/\r\n/g, '\n').split('\n');
   const out: string[] = [];
   let i = 0;
-
-  const flushList = (buf: string[], ordered: boolean) => {
-    if (!buf.length) return;
-    const tag = ordered ? 'ol' : 'ul';
-    out.push(`<${tag}>${buf.map((li) => `<li>${renderInline(li)}</li>`).join('')}</${tag}>`);
-    buf.length = 0;
-  };
 
   while (i < lines.length) {
     const line = lines[i];
@@ -299,25 +362,23 @@ export function renderMarkdown(src: string): string {
       continue;
     }
 
-    // Unordered list
-    if (/^\s*[-*+]\s+/.test(line)) {
-      const buf: string[] = [];
-      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
-        buf.push(lines[i].replace(/^\s*[-*+]\s+/, ''));
+    // List (ordered or unordered, indentation-aware nesting, mixed types)
+    if (LIST_ITEM_RE.test(line)) {
+      const items: ListItem[] = [];
+      while (i < lines.length && LIST_ITEM_RE.test(lines[i])) {
+        const mm = lines[i].match(LIST_ITEM_RE)!;
+        const marker = mm[2];
+        const ordered = /^\d+\.$/.test(marker);
+        items.push({
+          indent: leadingIndent(mm[1]),
+          ordered,
+          start: ordered ? parseInt(marker, 10) : 1,
+          text: mm[3],
+        });
         i++;
       }
-      flushList(buf, false);
-      continue;
-    }
-
-    // Ordered list
-    if (/^\s*\d+\.\s+/.test(line)) {
-      const buf: string[] = [];
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-        buf.push(lines[i].replace(/^\s*\d+\.\s+/, ''));
-        i++;
-      }
-      flushList(buf, true);
+      const [html] = buildListLevel(items, 0);
+      out.push(html);
       continue;
     }
 
