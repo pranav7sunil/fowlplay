@@ -27,6 +27,9 @@ interface Seed {
 export class TabManager {
   private readonly panels = new Set<vscode.WebviewPanel>();
   private readonly sessions = new WeakMap<vscode.WebviewPanel, SessionCore>();
+  /** The activity-bar view (fowlplay.home) and its session, once resolved. */
+  private homeView: vscode.WebviewView | null = null;
+  private homeSession: SessionCore | null = null;
   private readonly secrets: SecretsStore;
   private readonly settings: SettingsStore;
   private readonly history: HistoryStore;
@@ -38,11 +41,11 @@ export class TabManager {
   }
 
   /** Open (or focus) a webview panel tab. An optional seed forks an existing conversation. */
-  openTab(seed?: Seed): vscode.WebviewPanel {
+  openTab(seed?: Seed, viewColumn: vscode.ViewColumn = vscode.ViewColumn.Active): vscode.WebviewPanel {
     const panel = vscode.window.createWebviewPanel(
       'fowlplay.tab',
       'FowlPlay',
-      vscode.ViewColumn.Active,
+      viewColumn,
       {
         enableScripts: true,
         retainContextWhenHidden: true,
@@ -66,7 +69,15 @@ export class TabManager {
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, 'dist')],
     };
     view.webview.html = this.html(view.webview);
-    this.attachSession(view.webview);
+    // Track the view + session so editSelection can target the sidebar chat.
+    this.homeView = view;
+    this.homeSession = this.attachSession(view.webview);
+    view.onDidDispose(() => {
+      if (this.homeView === view) {
+        this.homeView = null;
+        this.homeSession = null;
+      }
+    });
   }
 
   /** Open (or focus) a tab and switch its UI to the settings view. */
@@ -95,16 +106,35 @@ export class TabManager {
 
   /**
    * Deliver a highlighted editor region to a session as scoped context for its
-   * next change, targeting the active/most-recent panel (opening one if none).
+   * next change. Targets a FowlPlay surface the user can already see, so the
+   * code being discussed is never covered:
+   *   1. a visible editor-area panel (focused one first),
+   *   2. the sidebar view when it is visible (true side-by-side),
+   *   3. an existing hidden panel, revealed in a split beside the editor,
+   *   4. a fresh panel opened beside the editor.
+   * Focus moves to the chat so the user can type about the selection right away.
    */
   editSelection(ctx: SelectionContext): void {
-    const active = [...this.panels].find((p) => p.active) ?? [...this.panels].pop();
-    if (active) {
-      active.reveal();
-      this.sessions.get(active)?.receiveSelection(ctx);
+    const visible = [...this.panels].find((p) => p.active) ?? [...this.panels].find((p) => p.visible);
+    if (visible) {
+      visible.reveal();
+      this.sessions.get(visible)?.receiveSelection(ctx);
       return;
     }
-    const panel = this.openTab();
+    if (this.homeView?.visible && this.homeSession) {
+      this.homeView.show(false);
+      this.homeSession.receiveSelection(ctx);
+      return;
+    }
+    const recent = [...this.panels].pop();
+    if (recent) {
+      // Reveal beside the editor rather than in place — its remembered column
+      // may be the one holding the file the user just selected in.
+      recent.reveal(vscode.ViewColumn.Beside);
+      this.sessions.get(recent)?.receiveSelection(ctx);
+      return;
+    }
+    const panel = this.openTab(undefined, vscode.ViewColumn.Beside);
     panel.reveal();
     // The session stores the selection immediately; the chip message it posts is
     // dropped because the new webview hasn't subscribed yet, but the session
