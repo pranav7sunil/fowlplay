@@ -268,6 +268,42 @@ describe('setModel', () => {
   });
 });
 
+describe('fetchModels wiring', () => {
+  it('passes the provider kind through and forwards fetched contextWindow to the webview', async () => {
+    const posted: HostToWebview[] = [];
+    let receivedKind: string | undefined;
+    let receivedBaseUrl: string | undefined;
+    const deps: SessionDeps = {
+      io: new FakeIo(),
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('solo'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => scriptedAdapter().adapter,
+      fetchModels: async (cfg) => {
+        receivedKind = cfg.kind;
+        receivedBaseUrl = cfg.baseUrl;
+        return [{ id: 'm1', contextWindow: 32768 }, { id: 'm2' }];
+      },
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'fetchModels', providerId: 'p1' });
+
+    // The provider's kind (and baseUrl) reach the registry so it can decide to enrich.
+    expect(receivedKind).toBe('local');
+    expect(receivedBaseUrl).toBe('http://localhost:11434/v1');
+
+    const msg = posted.find(
+      (m): m is Extract<HostToWebview, { type: 'modelsFetched' }> => m.type === 'modelsFetched',
+    );
+    expect(msg?.providerId).toBe('p1');
+    expect(msg?.models).toEqual([{ id: 'm1', contextWindow: 32768 }, { id: 'm2' }]);
+  });
+});
+
 describe('solo prompt turn', () => {
   it('streams a turn, stages an edit, and appends a changes block', async () => {
     const { session, posted } = makeSession({ path: 'foo.txt', content: 'hello\nworld\n' });

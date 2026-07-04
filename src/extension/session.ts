@@ -120,7 +120,7 @@ export interface SessionDeps {
   openTab?: (conv: Conversation, overlay: SerializedOverlay) => void;
   /** Injectable for tests; defaults to the real core factory. */
   createAdapter?: (sdk: SdkType) => ProviderAdapter;
-  fetchModels?: (cfg: FetchModelsConfig, apiKey?: string) => Promise<{ id: string }[]>;
+  fetchModels?: (cfg: FetchModelsConfig, apiKey?: string) => Promise<{ id: string; contextWindow?: number }[]>;
   clock?: () => number;
 }
 
@@ -144,7 +144,7 @@ const READONLY_TOOL_NAMES = new Set(['open_files', 'list_dir', 'glob', 'grep']);
 export class SessionCore {
   private readonly deps: SessionDeps;
   private readonly createAdapter: (sdk: SdkType) => ProviderAdapter;
-  private readonly fetchModels: (cfg: FetchModelsConfig, apiKey?: string) => Promise<{ id: string }[]>;
+  private readonly fetchModels: (cfg: FetchModelsConfig, apiKey?: string) => Promise<{ id: string; contextWindow?: number }[]>;
   private readonly clock: () => number;
 
   private conv: Conversation;
@@ -985,7 +985,10 @@ export class SessionCore {
     }
     try {
       const key = provider.requiresApiKey ? await this.deps.secrets.get(providerId) : undefined;
-      const models = await this.fetchModels({ sdkType: provider.sdkType, baseUrl: provider.baseUrl }, key);
+      const models = await this.fetchModels(
+        { sdkType: provider.sdkType, baseUrl: provider.baseUrl, kind: provider.kind },
+        key,
+      );
       this.deps.post({ type: 'modelsFetched', providerId, models });
     } catch (err) {
       this.deps.post({ type: 'modelsFetched', providerId, models: [], error: errMessage(err) });

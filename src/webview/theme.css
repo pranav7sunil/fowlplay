@@ -399,7 +399,7 @@ a:hover { text-decoration: underline; }
 /* =====================================================================
    Composer + status line
    ===================================================================== */
-.fp-composer-wrap { border-top: 1px solid var(--fp-border); background: var(--fp-bg); flex-shrink: 0; }
+.fp-composer-wrap { position: relative; border-top: 1px solid var(--fp-border); background: var(--fp-bg); flex-shrink: 0; }
 .fp-composer { max-width: 820px; margin: 0 auto; padding: 12px 24px; }
 .fp-composer-box {
   border: 1px solid var(--fp-border-strong); border-radius: var(--fp-radius-lg);
@@ -441,6 +441,56 @@ a:hover { text-decoration: underline; }
 .fp-context-bar { width: 90px; height: 6px; border-radius: 999px; background: var(--fp-bg-sunken); overflow: hidden; border: 1px solid var(--fp-border); }
 .fp-context-fill { height: 100%; background: var(--fp-gradient); transition: width var(--fp-t); }
 .fp-tokens { font-family: var(--fp-font); }
+
+/* Slash-command popup (anchored above the composer) */
+.fp-slash-anchor {
+  position: absolute; bottom: 100%; left: 0; right: 0;
+  max-width: 820px; margin: 0 auto; padding: 0 24px;
+  pointer-events: none;
+}
+.fp-slash-menu {
+  pointer-events: auto;
+  background: var(--fp-surface); border: 1px solid var(--fp-border-strong);
+  border-radius: var(--fp-radius); box-shadow: var(--fp-shadow);
+  padding: 6px; margin-bottom: 8px;
+  max-height: 320px; overflow-y: auto;
+}
+.fp-slash-header {
+  padding: 5px 10px 7px; margin-bottom: 4px;
+  border-bottom: 1px solid var(--fp-border);
+  font-size: calc(11px * var(--fp-scale)); font-weight: 600;
+  color: var(--fp-fg-subtle); text-transform: uppercase; letter-spacing: 0.04em;
+}
+.fp-slash-item {
+  display: flex; align-items: baseline; gap: 10px; width: 100%;
+  padding: 7px 10px; border-radius: var(--fp-radius-sm);
+  text-align: left; color: var(--fp-fg);
+}
+.fp-slash-item.active { background: var(--fp-accent-soft); }
+.fp-slash-item.disabled { color: var(--fp-fg-subtle); cursor: default; }
+.fp-slash-item svg { color: var(--fp-accent); flex-shrink: 0; align-self: center; }
+.fp-slash-name { font-family: var(--fp-font); font-weight: 600; white-space: nowrap; }
+.fp-slash-item.active .fp-slash-name { color: var(--fp-accent); }
+.fp-slash-desc { color: var(--fp-fg-muted); font-size: calc(12px * var(--fp-scale)); margin-left: auto; text-align: right; }
+
+/* /status card (ephemeral, above the composer like the attachments strip) */
+.fp-status-card {
+  max-width: 820px; margin: 8px auto 0; padding: 10px 14px;
+  border: 1px solid var(--fp-border-strong); border-radius: var(--fp-radius);
+  background: var(--fp-bg-sunken);
+  width: calc(100% - 48px);
+}
+.fp-status-card-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-weight: 700; font-size: calc(12px * var(--fp-scale));
+  text-transform: uppercase; letter-spacing: 0.04em; color: var(--fp-fg-subtle);
+  margin-bottom: 8px;
+}
+.fp-status-card-rows { display: flex; flex-direction: column; gap: 5px; }
+.fp-status-row { display: flex; gap: 12px; font-size: calc(13px * var(--fp-scale)); }
+.fp-status-row .fp-status-key {
+  flex-shrink: 0; width: 72px; font-weight: 600; color: var(--fp-fg-muted);
+}
 
 /* =====================================================================
    Dropdowns / menus / modals

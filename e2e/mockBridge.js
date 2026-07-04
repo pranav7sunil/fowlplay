@@ -379,7 +379,7 @@
         break;
       case 'settings':
         emit(settings(true));
-        emit({ type: 'modelsFetched', providerId: 'prov-ollama', models: [{ id: 'qwen2.5-coder:32b' }, { id: 'llama3.1:8b' }, { id: 'deepseek-r1:14b' }] });
+        emit({ type: 'modelsFetched', providerId: 'prov-ollama', models: [{ id: 'qwen2.5-coder:32b', contextWindow: 32768 }, { id: 'llama3.1:8b', contextWindow: 131072 }, { id: 'deepseek-r1:14b' }] });
         setView('settings');
         break;
       case 'onboarding':
