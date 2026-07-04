@@ -116,6 +116,14 @@ export interface SessionDeps {
   git?: GitPort;
   /** Emit a message to the webview. */
   post(msg: HostToWebview): void;
+  /**
+   * Called after this session commits a settings mutation (provider add/update/
+   * delete, default-model change, appearance, harness). Lets the host broadcast a
+   * reload to sibling sessions so they refresh their own settings caches. Fired
+   * after the save + local re-send, so the shared store on disk is current when
+   * siblings reload. Never invoked by `reloadSettings` (that would loop).
+   */
+  onSettingsChanged?: () => void;
   /** Open a new tab seeded with a forked conversation + copied staging. */
   openTab?: (conv: Conversation, overlay: SerializedOverlay) => void;
   /** Injectable for tests; defaults to the real core factory. */
@@ -244,6 +252,7 @@ export class SessionCore {
         // model pick) inherit it instead of reopening on "Select model".
         void this.deps.settings.saveDefaultModel(msg.model);
         if (this.settingsCache) this.settingsCache = { ...this.settingsCache, defaultModel: msg.model };
+        this.deps.onSettingsChanged?.();
         return;
       case 'setHarnessMode':
         this.conv = { ...this.conv, harnessMode: msg.mode, updatedAt: this.clock() };
@@ -303,15 +312,19 @@ export class SessionCore {
         await this.onNewConversation();
         return;
       case 'getSettings':
-        await this.sendSettings();
+        // Force a disk read: cheap, and it guards against any missed broadcast
+        // (e.g. a settings mutation in a sibling surface that never reached here).
+        await this.sendSettings(true);
         return;
       case 'saveAppearance':
         await this.deps.settings.saveAppearance(msg.appearance);
         await this.sendSettings(true);
+        this.deps.onSettingsChanged?.();
         return;
       case 'saveHarnessSettings':
         await this.deps.settings.saveHarness(msg.harness);
         await this.sendSettings(true);
+        this.deps.onSettingsChanged?.();
         return;
       case 'addProvider':
       case 'updateProvider':
@@ -347,6 +360,26 @@ export class SessionCore {
     // A selection delivered before the webview mounted (freshly opened tab) had
     // its chip message dropped; re-surface it now that the webview is listening.
     if (this.pendingSelection) this.deps.post({ type: 'selectionContext', context: this.pendingSelection });
+  }
+
+  /**
+   * Force-reload settings from the shared store and re-send them, then — if this
+   * session's conversation is still brand-new and modelless — adopt the freshly
+   * loaded default model / harness mode (mirroring `onReady`'s inheritance) and
+   * re-send the conversation. This is how a sibling surface (e.g. the sidebar
+   * stuck on "Select model") flips to ready the moment a provider is added in a
+   * tab. Must NOT invoke `onSettingsChanged` — that would loop the broadcast.
+   */
+  async reloadSettings(): Promise<void> {
+    await this.sendSettings(true);
+    if (this.conv.currentLeafId === null && this.conv.model === null && this.settingsCache) {
+      this.conv = {
+        ...this.conv,
+        model: this.settingsCache.defaultModel,
+        harnessMode: this.settingsCache.harness.defaultMode,
+      };
+      this.sendConversation();
+    }
   }
 
   private async ensureSettings(): Promise<FowlPlaySettings> {
@@ -962,6 +995,7 @@ export class SessionCore {
     await this.deps.settings.saveProviders(providers);
     if (apiKey !== undefined && apiKey !== '') await this.deps.secrets.set(provider.id, apiKey);
     await this.sendSettings(true);
+    this.deps.onSettingsChanged?.();
   }
 
   private async onDeleteProvider(providerId: string): Promise<void> {
@@ -974,6 +1008,7 @@ export class SessionCore {
       this.sendConversation();
     }
     await this.sendSettings(true);
+    this.deps.onSettingsChanged?.();
   }
 
   private async onFetchModels(providerId: string): Promise<void> {

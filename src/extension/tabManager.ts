@@ -27,6 +27,13 @@ interface Seed {
 export class TabManager {
   private readonly panels = new Set<vscode.WebviewPanel>();
   private readonly sessions = new WeakMap<vscode.WebviewPanel, SessionCore>();
+  /**
+   * Every live session across all surfaces (editor-area panels + the sidebar
+   * view). The WeakMap above can't be iterated, so this backs settings
+   * broadcasts and reset re-syncs. Entries are added in `attachSession` and
+   * removed when the owning panel / view is disposed.
+   */
+  private readonly liveSessions = new Set<SessionCore>();
   /** The activity-bar view (fowlplay.home) and its session, once resolved. */
   private homeView: vscode.WebviewView | null = null;
   private homeSession: SessionCore | null = null;
@@ -58,7 +65,10 @@ export class TabManager {
     const session = this.attachSession(panel.webview, seed);
     this.sessions.set(panel, session);
     this.panels.add(panel);
-    panel.onDidDispose(() => this.panels.delete(panel));
+    panel.onDidDispose(() => {
+      this.panels.delete(panel);
+      this.liveSessions.delete(session);
+    });
     return panel;
   }
 
@@ -71,8 +81,10 @@ export class TabManager {
     view.webview.html = this.html(view.webview);
     // Track the view + session so editSelection can target the sidebar chat.
     this.homeView = view;
-    this.homeSession = this.attachSession(view.webview);
+    const session = this.attachSession(view.webview);
+    this.homeSession = session;
     view.onDidDispose(() => {
+      this.liveSessions.delete(session);
       if (this.homeView === view) {
         this.homeView = null;
         this.homeSession = null;
@@ -160,14 +172,37 @@ export class TabManager {
     ]) {
       await cfg.update(key, undefined, t);
     }
-    // Re-sync any open tabs.
-    for (const panel of this.panels) {
-      void this.sessions.get(panel)?.handle({ type: 'getSettings' });
+    // Re-sync every live surface (panels AND the sidebar view). getSettings now
+    // force-reloads from disk, so this reflects the just-cleared providers.
+    for (const session of this.liveSessions) {
+      void session.handle({ type: 'getSettings' });
+    }
+  }
+
+  /**
+   * A session committed a settings mutation: tell every OTHER live session to
+   * reload from the shared store. The originator already re-sent its own
+   * settings, so it is skipped to avoid a redundant double post. Fire-and-forget,
+   * wrapped so one failing session can't break the loop.
+   */
+  private broadcastSettingsChanged(originator: SessionCore): void {
+    for (const session of this.liveSessions) {
+      if (session === originator) continue;
+      try {
+        void session.reloadSettings().catch(() => {
+          /* a stale sibling must not break the broadcast */
+        });
+      } catch {
+        /* ignore synchronous failures too */
+      }
     }
   }
 
   private attachSession(webview: vscode.Webview, seed?: Seed): SessionCore {
     const io = WorkspaceIo.forActiveWorkspace();
+    // `session` is referenced by the onSettingsChanged closure below; it is
+    // assigned before any message (hence any mutation) can arrive.
+    let session: SessionCore;
     const deps: SessionDeps = {
       io: io ?? nullIo(),
       secrets: this.secrets,
@@ -180,8 +215,10 @@ export class TabManager {
       openTab: (conversation, overlay) => {
         this.openTab({ conversation, overlay });
       },
+      onSettingsChanged: () => this.broadcastSettingsChanged(session),
     };
-    const session = createSessionCore(deps, seed ? { conversation: seed.conversation, overlay: seed.overlay } : undefined);
+    session = createSessionCore(deps, seed ? { conversation: seed.conversation, overlay: seed.overlay } : undefined);
+    this.liveSessions.add(session);
     webview.onDidReceiveMessage((msg: WebviewToHost) => {
       void session.handle(msg);
     });

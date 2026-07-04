@@ -196,6 +196,8 @@ function makeSession(opts: { mode?: HarnessMode; path?: string; content?: string
   const posted: HostToWebview[] = [];
   const { adapter, requests } = scriptedAdapter(opts.path, opts.content);
   const settings = new FakeSettings(opts.mode ?? 'solo');
+  // Count broadcast triggers so tests can assert which mutations notify siblings.
+  const changed = { count: 0 };
   const deps: SessionDeps = {
     io,
     secrets: new FakeSecrets(),
@@ -206,9 +208,12 @@ function makeSession(opts: { mode?: HarnessMode; path?: string; content?: string
     createAdapter: () => adapter,
     fetchModels: async () => [{ id: 'm1' }],
     clock: () => Date.now(),
+    onSettingsChanged: () => {
+      changed.count += 1;
+    },
   };
   const session = createSessionCore(deps);
-  return { session, posted, io, requests, settings };
+  return { session, posted, io, requests, settings, changed };
 }
 
 function lastConversation(posted: HostToWebview[]): Conversation | undefined {
@@ -654,5 +659,129 @@ describe('coop pipeline', () => {
     // Scout+Inspector+Sentry each spend 5in/3out; the Builder loop makes two
     // model calls (edit round + finish round), so totals must exceed 3 calls.
     expect(conv.usageTotals.inputTokens).toBeGreaterThan(3 * 5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-surface settings sync
+// ---------------------------------------------------------------------------
+
+const PROVIDER_2: ProviderConfig = {
+  id: 'p2',
+  name: 'LM Studio',
+  kind: 'local',
+  sdkType: 'openai-completions',
+  baseUrl: 'http://localhost:1234/v1',
+  requiresApiKey: false,
+  models: [{ id: 'lm-1' }],
+};
+
+/** The provider list carried by the last posted `settings` message. */
+function lastSettingsProviders(posted: HostToWebview[]): ProviderConfig[] | undefined {
+  for (let i = posted.length - 1; i >= 0; i--) {
+    const m = posted[i];
+    if (m.type === 'settings') return m.settings.providers;
+  }
+  return undefined;
+}
+
+describe('settings mutations notify siblings (onSettingsChanged)', () => {
+  it('fires when a provider is added', async () => {
+    const { session, changed } = makeSession();
+    await session.handle({ type: 'ready' });
+    const before = changed.count;
+    await session.handle({ type: 'addProvider', provider: PROVIDER_2 });
+    expect(changed.count).toBe(before + 1);
+  });
+
+  it('fires when a provider is deleted', async () => {
+    const { session, changed } = makeSession();
+    await session.handle({ type: 'ready' });
+    const before = changed.count;
+    await session.handle({ type: 'deleteProvider', providerId: 'p1' });
+    expect(changed.count).toBe(before + 1);
+  });
+
+  it('fires when the model (default) changes', async () => {
+    const { session, changed } = makeSession();
+    await session.handle({ type: 'ready' });
+    const before = changed.count;
+    await session.handle({ type: 'setModel', model: { providerId: 'p1', modelId: 'm2' } });
+    expect(changed.count).toBe(before + 1);
+  });
+});
+
+describe('reloadSettings', () => {
+  it('re-sends settings reflecting providers written to the store after the cache was warmed', async () => {
+    const { session, posted, settings } = makeSession();
+    // Warm this session's cache with the original single-provider settings.
+    await session.handle({ type: 'ready' });
+    expect(lastSettingsProviders(posted)!.map((p) => p.id)).toEqual(['p1']);
+
+    // A sibling surface adds a provider directly to the shared store.
+    settings.providers = [PROVIDER, PROVIDER_2];
+
+    const before = posted.length;
+    await session.reloadSettings();
+
+    // reloadSettings force-reloads from disk, so the fresh provider is surfaced
+    // even though this session had already cached the older list.
+    const providers = lastSettingsProviders(posted.slice(before));
+    expect(providers).toBeDefined();
+    expect(providers!.map((p) => p.id)).toEqual(['p1', 'p2']);
+  });
+
+  it('adopts a newly written defaultModel into a brand-new, modelless conversation', async () => {
+    const { session, posted, settings } = makeSession();
+    // Do NOT call ready: the conversation stays brand-new (no leaf, no model).
+    settings.defaultModel = { providerId: 'p2', modelId: 'lm-1' };
+    settings.providers = [PROVIDER, PROVIDER_2];
+
+    await session.reloadSettings();
+
+    const conv = lastConversation(posted);
+    expect(conv).toBeDefined();
+    expect(conv!.model).toEqual({ providerId: 'p2', modelId: 'lm-1' });
+  });
+
+  it('does not overwrite the model of a conversation that already has one', async () => {
+    const { session, posted, settings } = makeSession();
+    // ready seeds the conversation with the current default (m1).
+    await session.handle({ type: 'ready' });
+    expect(lastConversation(posted)!.model).toEqual({ providerId: 'p1', modelId: 'm1' });
+
+    // The store's default changes elsewhere, but this conversation already has a model.
+    settings.defaultModel = { providerId: 'p2', modelId: 'lm-1' };
+    await session.reloadSettings();
+
+    expect(lastConversation(posted)!.model).toEqual({ providerId: 'p1', modelId: 'm1' });
+  });
+
+  it('does not adopt a default model into a conversation that already has messages', async () => {
+    const { session, posted, settings } = makeSession({ path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    // Send a prompt so the conversation has a leaf, then clear its model to prove
+    // the guard keys off currentLeafId (a touched conversation), not just model.
+    await session.handle({ type: 'sendPrompt', text: 'create foo.txt' });
+    await session.handle({ type: 'deleteProvider', providerId: 'p1' }); // clears conv.model (its provider)
+    expect(lastConversation(posted)!.model).toBeNull();
+
+    settings.defaultModel = { providerId: 'p2', modelId: 'lm-1' };
+    settings.providers = [PROVIDER, PROVIDER_2];
+    await session.reloadSettings();
+
+    // The conversation has messages (a non-null leaf), so the fresh default is
+    // NOT adopted — the model stays null.
+    expect(lastConversation(posted)!.model).toBeNull();
+  });
+
+  it('does not itself trigger a broadcast (no echo loop)', async () => {
+    const { session, settings, changed } = makeSession();
+    await session.handle({ type: 'ready' });
+    settings.providers = [PROVIDER, PROVIDER_2];
+
+    const before = changed.count;
+    await session.reloadSettings();
+    expect(changed.count).toBe(before);
   });
 });
