@@ -135,6 +135,31 @@ Open FowlPlay any time with **Ctrl/Cmd+Alt+F**, the phoenix icon in the activity
 - **Status line** (bottom) — the **model switcher** (click the model name to swap
   provider/model mid-conversation), the **Solo/Coop** toggle, and live token usage.
 
+### Slash commands
+
+Type **`/`** as the first character in the composer to open a command menu — most of
+the status-line and title-bar actions, without leaving the keyboard. Keep typing to
+filter (by name or description); **↑/↓** move the highlight, **Enter** or **Tab** runs the
+highlighted command, **Esc** closes the menu, and a click runs a command directly. If what
+you typed isn't a command, just press **Enter** to send it as an ordinary prompt.
+
+| Command | What it does |
+|---|---|
+| `/clear` (`/new`) | Start a new conversation |
+| `/model` | Switch the active model (opens a provider/model picker) |
+| `/solo` | Switch to Solo (direct single-agent) mode |
+| `/coop` | Switch to Coop (cooperative pipeline) mode |
+| `/diff` (`/review`) | Review the staged changes |
+| `/fork` | Fork this conversation into a new tab |
+| `/export` | Copy the conversation as Markdown or JSON |
+| `/settings` | Open settings |
+| `/history` | Browse past conversations |
+| `/status` | Show a session-status card (model, mode, context usage, token totals) |
+| `/skills` | Pick a discovered skill; the composer is pre-filled so you can add details before sending |
+
+`/model`, `/export`, and `/skills` open a second-level list in the same popup — keep typing
+to filter it, or press **Esc** to step back to the command list.
+
 ---
 
 ## 6. Making your first change
@@ -260,6 +285,7 @@ Open settings from the gear in the title bar. Three tabs:
 | Open FowlPlay tab | `Ctrl/Cmd+Alt+F` |
 | Send message | `Enter` |
 | New line | `Shift+Enter` |
+| Open slash-command menu | `/` (as the first character) |
 | Cancel response | `Escape` |
 | Next / previous change (diff) | `j` / `k` or `↓` / `↑` |
 | Save inline comment | `Enter` |
