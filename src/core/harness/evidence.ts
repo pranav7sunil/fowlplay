@@ -30,6 +30,8 @@ export interface GateCardInit {
   acceptanceCriteria?: string[];
   findings?: string[];
   attempt?: number;
+  /** Display label of the model that ran this role. */
+  modelLabel?: string;
 }
 
 /**
@@ -48,6 +50,7 @@ export function createCard(id: string, init: GateCardInit): GateCard {
   if (init.acceptanceCriteria) card.acceptanceCriteria = init.acceptanceCriteria;
   if (init.findings) card.findings = init.findings;
   if (init.attempt !== undefined) card.attempt = init.attempt;
+  if (init.modelLabel) card.modelLabel = init.modelLabel;
   return card;
 }
 

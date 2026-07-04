@@ -16,6 +16,8 @@ import type {
   ConversationSummary,
   FowlPlaySettings,
   HarnessMode,
+  HarnessSettings,
+  ModelRef,
   ProviderConfig,
   StreamEvent,
 } from '../src/shared/types';
@@ -783,5 +785,268 @@ describe('reloadSettings', () => {
     const before = changed.count;
     await session.reloadSettings();
     expect(changed.count).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-role model overrides + chat-mention parsing
+// ---------------------------------------------------------------------------
+
+/** A provider whose model ids/displayNames drive the resolution + mention tests. */
+const P_ROLES: ProviderConfig = {
+  id: 'p1',
+  name: 'Roles',
+  kind: 'local',
+  sdkType: 'openai-completions',
+  baseUrl: 'http://localhost/v1',
+  requiresApiKey: false,
+  models: [
+    { id: 'm-base' },
+    { id: 'm-scout-conv' },
+    { id: 'm-scout-settings' },
+    { id: 'm-builder', displayName: 'BuilderModel' },
+    { id: 'qwen-a', displayName: 'Qwen A' },
+    { id: 'qwen-b', displayName: 'Qwen B' },
+  ],
+};
+
+function makeCustomSession(opts: {
+  providers?: ProviderConfig[];
+  harness?: HarnessSettings;
+  conversation?: Conversation;
+  defaultModel?: ModelRef | null;
+}) {
+  const io = new FakeIo();
+  const posted: HostToWebview[] = [];
+  const { adapter, requests } = scriptedAdapter();
+  const providers = opts.providers ?? [P_ROLES];
+  const harness = opts.harness ?? { defaultMode: 'coop', qasRetryBudget: 1 };
+  const defaultModel = opts.defaultModel ?? { providerId: 'p1', modelId: 'm-base' };
+  const settings: SettingsPort = {
+    async load(): Promise<FowlPlaySettings> {
+      return { appearance: APPEARANCE, harness, providers, defaultModel };
+    },
+    async saveAppearance() {},
+    async saveHarness() {},
+    async saveProviders() {},
+    async saveDefaultModel() {},
+  };
+  const deps: SessionDeps = {
+    io,
+    secrets: new FakeSecrets(),
+    settings,
+    history: new FakeHistory(),
+    git: fakeGit,
+    post: (m) => posted.push(m),
+    createAdapter: () => adapter,
+    fetchModels: async () => [],
+    clock: () => Date.now(),
+  };
+  const session = createSessionCore(deps, opts.conversation ? { conversation: opts.conversation } : undefined);
+  return { session, posted, requests };
+}
+
+function coopConversation(overrides: Partial<Conversation> = {}): Conversation {
+  return {
+    id: 'c1',
+    title: 'test',
+    nodes: {},
+    rootIds: [],
+    currentLeafId: null,
+    model: { providerId: 'p1', modelId: 'm-base' },
+    harnessMode: 'coop',
+    createdAt: 0,
+    updatedAt: 0,
+    usageTotals: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+    ...overrides,
+  };
+}
+
+/** Which modelId each Coop role's request ran on, keyed off the role system prompt. */
+function coopModelIds(requests: ChatRequest[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const r of requests) {
+    if (r.system.includes('SCOUT')) out.scout = r.modelId;
+    else if (r.system.includes('INSPECTOR')) out.inspector = r.modelId;
+    else if (r.system.includes('SENTRY')) out.sentry = r.modelId;
+    else if (out.builder === undefined) out.builder = r.modelId; // Builder/agent loop
+  }
+  return out;
+}
+
+describe('per-role model resolution chain', () => {
+  it('resolves conv override > settings override > conv model, and stale overrides fall through', async () => {
+    const conversation = coopConversation({
+      roleModelOverrides: { scout: { providerId: 'p1', modelId: 'm-scout-conv' } },
+    });
+    const { session, requests } = makeCustomSession({
+      conversation,
+      harness: {
+        defaultMode: 'coop',
+        qasRetryBudget: 1,
+        roleModelOverrides: {
+          // conv override wins for scout; this settings one should be shadowed.
+          scout: { providerId: 'p1', modelId: 'm-scout-settings' },
+          // stale — references a model that no longer exists → falls through.
+          inspector: { providerId: 'p1', modelId: 'm-deleted' },
+        },
+      },
+    });
+
+    await session.handle({ type: 'sendPrompt', text: 'add a feature' });
+
+    const ids = coopModelIds(requests);
+    expect(ids.scout).toBe('m-scout-conv'); // conversation override wins
+    expect(ids.builder).toBe('m-base'); // no override anywhere → conv model
+    expect(ids.inspector).toBe('m-base'); // stale settings override → falls through
+    expect(ids.sentry).toBe('m-base'); // no override → conv model
+  });
+});
+
+describe('directive-only chat mention', () => {
+  it('applies a per-role override and does NOT start a turn', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+
+    const before = posted.length;
+    await session.handle({ type: 'sendPrompt', text: 'build with m-builder' });
+
+    // No turn ran.
+    expect(posted.slice(before).some((m) => m.type === 'turnStarted')).toBe(false);
+    // The override rode onto the conversation.
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides?.builder).toEqual({ providerId: 'p1', modelId: 'm-builder' });
+    // A confirmation toast summarizing the assignment was posted.
+    expect(
+      posted.some((m) => m.type === 'toast' && m.level === 'info' && m.message === 'Builder → BuilderModel'),
+    ).toBe(true);
+  });
+
+  it('warns and ignores a mention that matches no configured model', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'use nonexistent-model' });
+
+    expect(posted.some((m) => m.type === 'toast' && m.level === 'warn' && m.message.includes('nonexistent-model'))).toBe(true);
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides).toBeUndefined();
+  });
+});
+
+describe('ambiguous chat mention', () => {
+  it('holds the prompt, then releases it on resolveModelMention with the picked model', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+
+    const before = posted.length;
+    // "qwen" matches qwen-a AND qwen-b → ambiguous; trailing prose keeps it a real turn.
+    await session.handle({ type: 'sendPrompt', text: 'qwen to build the login page' });
+
+    // A choice was surfaced and the prompt is held (no turn yet).
+    const choice = posted.slice(before).find(
+      (m): m is Extract<HostToWebview, { type: 'modelMentionChoice' }> => m.type === 'modelMentionChoice',
+    );
+    expect(choice).toBeDefined();
+    expect(choice!.role).toBe('builder');
+    expect(choice!.query).toBe('qwen');
+    expect(choice!.candidates.map((c) => c.modelId).sort()).toEqual(['qwen-a', 'qwen-b']);
+    expect(posted.slice(before).some((m) => m.type === 'turnStarted')).toBe(false);
+
+    // Resolve with a pick → the held prompt runs with the ORIGINAL full text.
+    const pick = choice!.candidates[0];
+    const beforeResolve = posted.length;
+    await session.handle({ type: 'resolveModelMention', role: 'builder', model: { providerId: pick.providerId, modelId: pick.modelId } });
+
+    expect(posted.slice(beforeResolve).some((m) => m.type === 'turnStarted')).toBe(true);
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides?.builder).toEqual({ providerId: pick.providerId, modelId: pick.modelId });
+    // The stored user message keeps the original text (mentions not stripped).
+    const userNode = Object.values(conv.nodes).find((n) => n.role === 'user');
+    expect(userNode?.blocks.some((b) => b.type === 'text' && b.text.includes('qwen to build the login page'))).toBe(true);
+  });
+
+  it('a new prompt supersedes a held one — answering the stale picker releases nothing', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+
+    // Ambiguous mention → prompt held behind the picker.
+    await session.handle({ type: 'sendPrompt', text: 'qwen to build the login page' });
+    expect(posted.some((m) => m.type === 'modelMentionChoice')).toBe(true);
+
+    // The user abandons the picker and sends a plain prompt instead.
+    const beforeSecond = posted.length;
+    await session.handle({ type: 'sendPrompt', text: 'just fix the typo in README' });
+    const turnsAfterSecond = posted.slice(beforeSecond).filter((m) => m.type === 'turnStarted').length;
+    expect(turnsAfterSecond).toBe(1);
+
+    // Answering the stale picker now must not release the abandoned prompt.
+    const beforeStale = posted.length;
+    await session.handle({ type: 'resolveModelMention', role: 'builder', model: { providerId: 'p1', modelId: 'qwen-a' } });
+    expect(posted.slice(beforeStale).some((m) => m.type === 'turnStarted')).toBe(false);
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides?.builder).toBeUndefined();
+    // The abandoned prompt's text never became a user node.
+    expect(
+      Object.values(conv.nodes).some(
+        (n) => n.role === 'user' && n.blocks.some((b) => b.type === 'text' && b.text.includes('login page')),
+      ),
+    ).toBe(false);
+  });
+
+  it('dismissal (null) sends the prompt without applying any override', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'qwen to build the login page' });
+
+    const beforeResolve = posted.length;
+    await session.handle({ type: 'resolveModelMention', role: 'builder', model: null });
+
+    // The prompt still ran…
+    expect(posted.slice(beforeResolve).some((m) => m.type === 'turnStarted')).toBe(true);
+    // …with an info toast and NO override applied.
+    expect(posted.some((m) => m.type === 'toast' && m.level === 'info' && m.message.includes('without changing'))).toBe(true);
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides?.builder).toBeUndefined();
+  });
+});
+
+describe('conversation-level model directive persists (JSON round-trip)', () => {
+  it('keeps roleModelOverrides through a history save/load', async () => {
+    const history = new FakeHistory();
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    const { adapter } = scriptedAdapter();
+    const settings: SettingsPort = {
+      async load(): Promise<FowlPlaySettings> {
+        return { appearance: APPEARANCE, harness: { defaultMode: 'solo', qasRetryBudget: 1 }, providers: [P_ROLES], defaultModel: { providerId: 'p1', modelId: 'm-base' } };
+      },
+      async saveAppearance() {},
+      async saveHarness() {},
+      async saveProviders() {},
+      async saveDefaultModel() {},
+    };
+    const deps: SessionDeps = {
+      io, secrets: new FakeSecrets(), settings, history, git: fakeGit,
+      post: (m) => posted.push(m), createAdapter: () => adapter, fetchModels: async () => [], clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'build with m-builder' }); // directive-only → applies + persists
+
+    // Serialize exactly as persistence does, then reload.
+    const saved = [...history.store.values()][0];
+    expect(saved).toBeDefined();
+    const roundTripped: Conversation = JSON.parse(JSON.stringify(saved));
+    expect(roundTripped.roleModelOverrides?.builder).toEqual({ providerId: 'p1', modelId: 'm-builder' });
   });
 });

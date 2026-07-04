@@ -20,6 +20,7 @@ import type {
   Conversation,
   ContentBlock,
   ConversationSummary,
+  CoopRole,
   FowlPlaySettings,
   GateCard,
   HarnessMode,
@@ -64,6 +65,13 @@ import {
   switchBranch as treeSwitchBranch,
 } from '../core/conversation/tree';
 import { toJSON, toMarkdown } from '../core/conversation/serialize';
+import {
+  isDirectiveOnly,
+  matchModels,
+  parseModelMentions,
+  type MentionRole,
+  type ModelMatch,
+} from '../core/agent/modelMentions';
 
 // ---------------------------------------------------------------------------
 // Injected ports (implemented by the vscode layer or by test fakes)
@@ -167,6 +175,19 @@ export class SessionCore {
   private pendingSelection: SelectionContext | null = null;
 
   /**
+   * A prompt held while the webview disambiguates one or more model mentions that
+   * matched more than one configured model. `queue[0]` is the choice currently
+   * surfaced; each `resolveModelMention` shifts it. When the queue drains the held
+   * prompt is released (run as a turn, or applied silently if directive-only).
+   */
+  private heldMention: {
+    text: string;
+    attachments?: Attachment[];
+    queue: { role: MentionRole; query: string; candidates: ModelMatch[] }[];
+    assignments: string[];
+  } | null = null;
+
+  /**
    * Skills available for the current turn (bundled defaults + workspace
    * `.fowlplay/skills/*.md`), rediscovered at the start of each turn. Consumed by
    * `toolHost()` (for `load_skill`) and the system-prompt catalog injection.
@@ -258,6 +279,9 @@ export class SessionCore {
         this.conv = { ...this.conv, harnessMode: msg.mode, updatedAt: this.clock() };
         this.sendConversation();
         void this.persist();
+        return;
+      case 'resolveModelMention':
+        await this.onResolveModelMention(msg.role, msg.model);
         return;
       case 'openDiff':
         this.sendChangeset(msg.changesetId);
@@ -431,7 +455,123 @@ export class SessionCore {
   // Turn flow
   // -------------------------------------------------------------------------
 
+  /**
+   * Entry point for a user prompt. Before anything is appended to the tree, the
+   * text is scanned for per-role model directives ("qwen to orchestrate",
+   * "use glm for review", role-less "switch to qwen"). Each mention resolves to
+   * 0, 1, or >1 configured models:
+   *   0  → warn and ignore that mention.
+   *   1  → apply it (conversation model or a per-role override).
+   *   >1 → hold the ENTIRE prompt and ask the webview to disambiguate.
+   * Once mentions are settled, a directive-ONLY message applies without running a
+   * turn; otherwise the turn runs with the ORIGINAL full text (mentions are not
+   * stripped from what the model sees — keeping history honest is harmless).
+   */
   private async onSendPrompt(text: string, attachments?: Attachment[]): Promise<void> {
+    const trimmed = text.trim();
+    const atts = attachments ?? [];
+    if (!trimmed && atts.length === 0) return;
+
+    // A new prompt supersedes any prompt still held behind an unanswered
+    // disambiguation — otherwise answering the stale picker later would
+    // release (and run) the abandoned message.
+    this.heldMention = null;
+
+    const settings = await this.ensureSettings();
+    const mentions = parseModelMentions(text);
+    const assignments: string[] = [];
+    const queue: { role: MentionRole; query: string; candidates: ModelMatch[] }[] = [];
+
+    for (const mention of mentions) {
+      const candidates = matchModels(mention.query, settings.providers);
+      if (candidates.length === 0) {
+        this.toast('warn', `No configured model matches "${mention.query}"`);
+        continue;
+      }
+      if (candidates.length === 1) {
+        this.applyMention(mention.role, refOf(candidates[0]));
+        assignments.push(assignmentLabel(mention.role, candidates[0].label));
+        continue;
+      }
+      queue.push({ role: mention.role, query: mention.query, candidates });
+    }
+
+    if (queue.length > 0) {
+      // Hold the whole prompt (selection stays pinned) until every ambiguity is
+      // resolved; surface the first choice now.
+      this.heldMention = { text, attachments, queue, assignments };
+      const first = queue[0];
+      this.deps.post({
+        type: 'modelMentionChoice',
+        role: first.role,
+        query: first.query,
+        candidates: first.candidates.map((c) => ({ providerId: c.providerId, modelId: c.modelId, label: c.label })),
+      });
+      return;
+    }
+
+    await this.finishMentions(text, attachments, assignments);
+  }
+
+  /** Resolve one held ambiguity, then advance the queue or release the prompt. */
+  private async onResolveModelMention(role: MentionRole, model: ModelRef | null): Promise<void> {
+    const held = this.heldMention;
+    if (!held) return;
+    if (model) {
+      const label = this.labelForRef(model);
+      this.applyMention(role, model);
+      held.assignments.push(assignmentLabel(role, label));
+    } else {
+      this.toast('info', `Sent without changing the ${roleWord(role)} model`);
+    }
+    held.queue.shift();
+    if (held.queue.length > 0) {
+      const next = held.queue[0];
+      this.deps.post({
+        type: 'modelMentionChoice',
+        role: next.role,
+        query: next.query,
+        candidates: next.candidates.map((c) => ({ providerId: c.providerId, modelId: c.modelId, label: c.label })),
+      });
+      return;
+    }
+    this.heldMention = null;
+    await this.finishMentions(held.text, held.attachments, held.assignments);
+  }
+
+  /** Apply a resolved mention to the conversation (role override or the model itself). */
+  private applyMention(role: MentionRole, model: ModelRef): void {
+    if (role === 'conversation') {
+      // setModel semantics WITHOUT saving as the global default — a chat directive
+      // steers this conversation only.
+      this.conv = { ...this.conv, model, updatedAt: this.clock() };
+    } else {
+      const roleModelOverrides = { ...(this.conv.roleModelOverrides ?? {}), [role]: model };
+      this.conv = { ...this.conv, roleModelOverrides, updatedAt: this.clock() };
+    }
+  }
+
+  /**
+   * After mentions are settled: persist any assignments, then either apply-only
+   * (directive-only message: no turn, just a confirmation toast) or run the turn
+   * with the original full text.
+   */
+  private async finishMentions(text: string, attachments: Attachment[] | undefined, assignments: string[]): Promise<void> {
+    if (assignments.length > 0) {
+      this.sendConversation();
+      await this.persist();
+    }
+    // Only short-circuit when something was actually applied AND nothing but
+    // directives remain. A message whose "mentions" all matched nothing (e.g.
+    // "use the foo skill") still runs as an ordinary turn.
+    if (assignments.length > 0 && isDirectiveOnly(text)) {
+      this.toast('info', assignments.join(', '));
+      return;
+    }
+    await this.runPromptTurn(text, attachments);
+  }
+
+  private async runPromptTurn(text: string, attachments?: Attachment[]): Promise<void> {
     const trimmed = text.trim();
     const atts = attachments ?? [];
     if (!trimmed && atts.length === 0) return;
@@ -602,14 +742,18 @@ export class SessionCore {
     harness: HarnessSettings,
     signal: AbortSignal,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
+    const settings = await this.ensureSettings();
     const cards: GateCard[] = [];
     const runner: RoleRunner = {
-      run: async ({ system, userPrompt, readOnly, signal: s }) => {
+      run: async ({ role, system, userPrompt, readOnly, signal: s }) => {
+        // Each role resolves its own model through the override chain, falling
+        // back to the turn's conversation model.
+        const rm = (await this.resolveModel(role)) ?? resolved;
         const res = await runAgentLoop({
-          adapter: resolved.adapter,
-          baseUrl: resolved.baseUrl,
-          apiKey: resolved.apiKey,
-          modelId: resolved.modelId,
+          adapter: rm.adapter,
+          baseUrl: rm.baseUrl,
+          apiKey: rm.apiKey,
+          modelId: rm.modelId,
           system,
           history: [{ role: 'user', content: [{ type: 'text', text: userPrompt }] }],
           tools: readOnly ? this.readOnlyTools : this.allTools,
@@ -631,15 +775,17 @@ export class SessionCore {
     };
 
     const buildStage = async (instructions: string, s?: AbortSignal): Promise<TokenUsage> => {
+      // The Builder stage uses the `builder` role's resolution.
+      const rm = (await this.resolveModel('builder')) ?? resolved;
       const base: WireMessage[] = [
         ...baseWire,
         { role: 'user', content: [{ type: 'text', text: instructions }, ...imageParts] },
       ];
       const res = await runAgentLoop({
-        adapter: resolved.adapter,
-        baseUrl: resolved.baseUrl,
-        apiKey: resolved.apiKey,
-        modelId: resolved.modelId,
+        adapter: rm.adapter,
+        baseUrl: rm.baseUrl,
+        apiKey: rm.apiKey,
+        modelId: rm.modelId,
         system: this.systemWithSkills(SOLO_SYSTEM),
         history: gcHistory(base),
         tools: this.toolsWithSkills(),
@@ -662,6 +808,7 @@ export class SessionCore {
         upsertCard(cards, card);
         this.deps.post({ type: 'gateUpdate', card });
       },
+      modelLabelFor: (role) => this.roleModelLabel(settings, role),
       signal,
     });
 
@@ -1101,12 +1248,21 @@ export class SessionCore {
     return metas.length > 0 ? buildToolSpecs({ skills: metas }) : this.allTools;
   }
 
-  private async resolveModel(): Promise<ResolvedModel | null> {
+  /**
+   * Resolve the model to run a given Coop `role` (or, with no role, the plain
+   * conversation model). The chain is:
+   *   conversation `roleModelOverrides[role]` → settings `harness.roleModelOverrides[role]`
+   *   → conversation `model`.
+   * Override layers that reference a deleted provider/model fall through to the
+   * next layer; the final conversation-model layer only requires the provider to
+   * still exist (mirroring the historical behavior). Returns null only when
+   * nothing in the chain resolves.
+   */
+  private async resolveModel(role?: CoopRole): Promise<ResolvedModel | null> {
     const settings = await this.ensureSettings();
-    const ref = this.conv.model;
-    if (!ref) return null;
-    const provider = settings.providers.find((p) => p.id === ref.providerId);
-    if (!provider) return null;
+    const found = this.resolveRef(settings, role);
+    if (!found) return null;
+    const { provider, ref } = found;
     const apiKey = provider.requiresApiKey ? await this.deps.secrets.get(provider.id) : undefined;
     return {
       adapter: this.createAdapter(provider.sdkType),
@@ -1114,6 +1270,47 @@ export class SessionCore {
       apiKey,
       modelId: ref.modelId,
     };
+  }
+
+  /**
+   * The provider + ModelRef that a role resolves to under the override chain, or
+   * null. Override layers require the model to still exist; the conversation-model
+   * fallback requires only the provider (a model list may lag behind a fetch).
+   */
+  private resolveRef(
+    settings: FowlPlaySettings,
+    role?: CoopRole,
+  ): { provider: ProviderConfig; ref: ModelRef } | null {
+    const layers: Array<{ ref: ModelRef | null | undefined; requireModel: boolean }> = [];
+    if (role) {
+      layers.push({ ref: this.conv.roleModelOverrides?.[role], requireModel: true });
+      layers.push({ ref: settings.harness.roleModelOverrides?.[role], requireModel: true });
+    }
+    layers.push({ ref: this.conv.model, requireModel: false });
+
+    for (const { ref, requireModel } of layers) {
+      if (!ref) continue;
+      const provider = settings.providers.find((p) => p.id === ref.providerId);
+      if (!provider) continue;
+      if (requireModel && !provider.models.some((m) => m.id === ref.modelId)) continue;
+      return { provider, ref };
+    }
+    return null;
+  }
+
+  /** Display label for the model a role resolves to (for gate cards / status). */
+  private roleModelLabel(settings: FowlPlaySettings, role: CoopRole): string | undefined {
+    const found = this.resolveRef(settings, role);
+    if (!found) return undefined;
+    const model = found.provider.models.find((m) => m.id === found.ref.modelId);
+    return model?.displayName || model?.id || found.ref.modelId;
+  }
+
+  /** Display label for an explicit ModelRef (used in mention confirmations). */
+  private labelForRef(ref: ModelRef): string {
+    const provider = this.settingsCache?.providers.find((p) => p.id === ref.providerId);
+    const model = provider?.models.find((m) => m.id === ref.modelId);
+    return model?.displayName || model?.id || ref.modelId;
   }
 
   /** Wire history that a follow-up from `userNodeId` should build on. */
@@ -1311,4 +1508,20 @@ function stripFences(text: string): string {
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** A ModelMatch as a bare ModelRef. */
+function refOf(match: ModelMatch): ModelRef {
+  return { providerId: match.providerId, modelId: match.modelId };
+}
+
+/** Human word for a mention target, e.g. "conversation" or "Builder". */
+function roleWord(role: MentionRole): string {
+  return role === 'conversation' ? 'conversation' : role;
+}
+
+/** "Builder → Qwen3.6-35B-MoE" / "Model → Qwen3.6-35B-MoE" for confirmation toasts. */
+function assignmentLabel(role: MentionRole, modelLabel: string): string {
+  const who = role === 'conversation' ? 'Model' : `${role[0].toUpperCase()}${role.slice(1)}`;
+  return `${who} → ${modelLabel}`;
 }

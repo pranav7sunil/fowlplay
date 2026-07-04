@@ -140,6 +140,62 @@ describe('runCoopPipeline — happy path', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Per-role model labels
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — modelLabelFor', () => {
+  it('stamps each role card with the label from modelLabelFor', async () => {
+    const { runner } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      inspector: [approve],
+      sentry: [approve],
+    });
+    const labels: Record<string, string> = {
+      scout: 'Qwen-Plan',
+      builder: 'GLM-Build',
+      inspector: 'Fable-QA',
+      sentry: 'Fable-Sec',
+    };
+
+    const result = await runCoopPipeline({
+      userPrompt: 'do it',
+      runner,
+      inspector: fakeInspector(),
+      buildStage: vi.fn(async () => BUILDER_USAGE),
+      settings: settings(),
+      onGate: () => {},
+      modelLabelFor: (role) => labels[role],
+    });
+
+    const labelOf = (role: GateCard['role']) => result.cards.find((c) => c.role === role)?.modelLabel;
+    expect(labelOf('scout')).toBe('Qwen-Plan');
+    expect(labelOf('builder')).toBe('GLM-Build');
+    expect(labelOf('inspector')).toBe('Fable-QA');
+    expect(labelOf('sentry')).toBe('Fable-Sec');
+    // Synthetic gates carry no model label.
+    expect(labelOf('stop-the-line')).toBeUndefined();
+    expect(labelOf('hitl')).toBeUndefined();
+  });
+
+  it('leaves modelLabel unset when modelLabelFor is omitted', async () => {
+    const { runner } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      inspector: [approve],
+      sentry: [approve],
+    });
+    const result = await runCoopPipeline({
+      userPrompt: 'do it',
+      runner,
+      inspector: fakeInspector(),
+      buildStage: vi.fn(async () => BUILDER_USAGE),
+      settings: settings(),
+      onGate: () => {},
+    });
+    expect(result.cards.every((c) => c.modelLabel === undefined)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Ambiguous scout → blocked
 // ---------------------------------------------------------------------------
 

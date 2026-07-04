@@ -134,6 +134,7 @@ export function GateCardView({ card }: { card: GateCard }) {
       <div class="fp-gate-head">
         <span class="fp-gate-icon"><Icon size={17} /></span>
         <span class="fp-gate-title">{card.title}</span>
+        {card.modelLabel && <span class="fp-gate-model" title={`Ran on ${card.modelLabel}`}>{card.modelLabel}</span>}
         {card.attempt && card.attempt > 1 && <span class="fp-chip">attempt {card.attempt}</span>}
         <StatusChip status={card.status} />
       </div>

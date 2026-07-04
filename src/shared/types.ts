@@ -116,6 +116,13 @@ export interface Conversation {
   rootIds: string[];
   currentLeafId: string | null;
   model: ModelRef | null;
+  /**
+   * Per-conversation role model overrides (Coop). Highest-priority layer in the
+   * per-role resolution chain: conversation override → settings-level
+   * `harness.roleModelOverrides` → conversation `model`. Rides on the Conversation
+   * object so it persists with history (plain JSON).
+   */
+  roleModelOverrides?: Partial<Record<CoopRole, ModelRef>>;
   harnessMode: HarnessMode;
   createdAt: number;
   updatedAt: number;
@@ -205,6 +212,8 @@ export interface GateCard {
   role: CoopRole | 'stop-the-line' | 'hitl';
   title: string;               // e.g. "Inspector — QA validation"
   status: GateStatus;
+  /** Display label of the model that ran this role (Coop per-role models). */
+  modelLabel?: string;
   /** What was checked / produced. Markdown. */
   evidence: string;
   /** For scout: acceptance criteria. */

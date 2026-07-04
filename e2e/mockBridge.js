@@ -38,6 +38,11 @@
       if (msg && msg.type === 'clearSelection') {
         emit({ type: 'selectionContext', context: null });
       }
+      // Model-mention disambiguation answered → the real host would apply/dismiss
+      // and release the held prompt. The mock just acks (no scripted flow needs it).
+      if (msg && msg.type === 'resolveModelMention') {
+        /* no-op ack — protocol stays mirrored */
+      }
     },
     onMessage(handler) {
       handlers.push(handler);

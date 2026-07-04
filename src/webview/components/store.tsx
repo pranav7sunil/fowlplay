@@ -7,11 +7,13 @@ import { useState, useEffect } from 'preact/hooks';
 import type {
   Conversation,
   ChangeSetView,
+  CoopRole,
   RebaseState,
   ConversationSummary,
   FowlPlaySettings,
   MessageNode,
   ContentBlock,
+  ModelRef,
   SelectionContext,
   TokenUsage,
   ToolCallRecord,
@@ -27,10 +29,18 @@ export interface Toast {
   message: string;
 }
 
+/** A pending per-role model-mention disambiguation surfaced to the user. */
+export interface ModelMentionChoice {
+  role: CoopRole | 'conversation';
+  query: string;
+  candidates: { providerId: string; modelId: string; label: string }[];
+}
+
 export interface AppState {
   view: View;
   settings: FowlPlaySettings | null;
   conversation: Conversation | null;
+  modelMentionChoice: ModelMentionChoice | null;
   streaming: boolean;
   streamNodeId: string | null;
   selectionContext: SelectionContext | null;
@@ -51,6 +61,7 @@ const initialState: AppState = {
   view: 'chat',
   settings: null,
   conversation: null,
+  modelMentionChoice: null,
   streaming: false,
   streamNodeId: null,
   selectionContext: null,
@@ -98,6 +109,21 @@ class Store {
   openReview(changesetId?: string, readOnly = false) {
     this.patch({ view: 'diff', diffReadOnly: readOnly });
     getBridge().post({ type: 'openDiff', changesetId });
+  }
+
+  /** Drop the mention picker without answering (the user moved on to a new prompt). */
+  clearModelMentionChoice() {
+    if (this.state.modelMentionChoice) this.patch({ modelMentionChoice: null });
+  }
+
+  /** Answer the current model-mention disambiguation (a pick, or null to dismiss). */
+  resolveModelMention(model: ModelRef | null) {
+    const choice = this.state.modelMentionChoice;
+    if (!choice) return;
+    getBridge().post({ type: 'resolveModelMention', role: choice.role, model });
+    // The host drives the next choice (or releases the prompt); clear locally so the
+    // card dismisses immediately. A queued next choice arrives as a fresh message.
+    this.patch({ modelMentionChoice: null });
   }
 
   pushToast(level: Toast['level'], message: string) {
@@ -169,6 +195,11 @@ class Store {
           modelsError: { ...this.state.modelsError, [msg.providerId]: msg.error },
         });
         break;
+      case 'modelMentionChoice':
+        this.patch({
+          modelMentionChoice: { role: msg.role, query: msg.query, candidates: msg.candidates },
+        });
+        break;
       case 'showView':
         this.setView(msg.view);
         break;
@@ -196,6 +227,9 @@ class Store {
   }
 
   private beginTurn(nodeId: string) {
+    // A turn starting means any pending model-mention picker is moot — the host
+    // has already discarded the held prompt it belonged to.
+    if (this.state.modelMentionChoice) this.patch({ modelMentionChoice: null });
     const conv = this.cloneConversation();
     if (!conv) {
       this.patch({ streaming: true, streamNodeId: nodeId });

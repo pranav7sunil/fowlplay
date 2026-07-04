@@ -83,6 +83,13 @@ export interface CoopPipelineOptions {
   settings: HarnessSettings;
   /** Called on every card transition (create + each status change). */
   onGate: (card: GateCard) => void;
+  /**
+   * Resolves the display label of the model a given role will run on, so each
+   * role's gate card can show which model ran it. Optional — the pipeline itself
+   * knows nothing about models; the extension supplies this. Omitting it leaves
+   * `modelLabel` unset on cards (existing tests stay green).
+   */
+  modelLabelFor?: (role: CoopRole) => string | undefined;
   signal?: AbortSignal;
 }
 
@@ -106,7 +113,8 @@ export interface CoopResult {
 // ---------------------------------------------------------------------------
 
 export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopResult> {
-  const { userPrompt, runner, inspector, buildStage, settings, onGate, signal } = opts;
+  const { userPrompt, runner, inspector, buildStage, settings, onGate, modelLabelFor, signal } = opts;
+  const labelFor = (role: CoopRole): string | undefined => modelLabelFor?.(role);
 
   const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
   const cards: GateCard[] = [];
@@ -148,6 +156,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
       role: 'scout',
       title: 'Scout — acceptance criteria',
       evidence: 'Restating the request as testable acceptance criteria…',
+      modelLabel: labelFor('scout'),
     }),
   );
   if (aborted()) return cancel(scoutCard);
@@ -228,6 +237,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
           attempt === 1
             ? 'Implementing against the acceptance criteria…'
             : 'Revising to address Inspector findings…',
+        modelLabel: labelFor('builder'),
       }),
     );
     const instructions =
@@ -260,6 +270,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
         title: 'Inspector — QA validation',
         attempt,
         evidence: 'Validating the changeset against the acceptance criteria (fresh eyes)…',
+        modelLabel: labelFor('inspector'),
       }),
     );
     const diff = inspector.unifiedDiff();
@@ -319,6 +330,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
       role: 'sentry',
       title: 'Sentry — security review',
       evidence: 'Reviewing the diff for secrets, injection, and unsafe patterns…',
+      modelLabel: labelFor('sentry'),
     }),
   );
   const sentryRun = await runner.run({
