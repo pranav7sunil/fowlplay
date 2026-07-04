@@ -149,6 +149,7 @@ you typed isn't a command, just press **Enter** to send it as an ordinary prompt
 | `/model` | Switch the active model (opens a provider/model picker) |
 | `/solo` | Switch to Solo (direct single-agent) mode |
 | `/coop` | Switch to Coop (cooperative pipeline) mode |
+| `/prd` | Arm the next message as a **PRD build** — decompose it into stories and build them one at a time (see §7) |
 | `/diff` (`/review`) | Review the staged changes |
 | `/fork` | Fork this conversation into a new tab |
 | `/export` | Copy the conversation as Markdown or JSON |
@@ -197,6 +198,36 @@ Toggle the mode in the status line.
 Each stage emits an **evidence gate card** in the chat so you can see what was checked and
 why it passed. QA and Security gates can't be bypassed. Coop is what makes local models
 reliable: their output is verified before it reaches you.
+
+### PRD builds — long-horizon work
+
+A whole PRD (product requirements doc) is too big to build in one changeset. Run **`/prd`**
+to break it into a sequence of small stories and build them one at a time, with a human
+review between each.
+
+1. Type **`/prd`** — a **PRD build** chip appears above the composer (the `⚑` badge next to
+   your attachments). The `X` on the chip disarms it if you change your mind.
+2. Paste or type the PRD and send. The chip means *this one message* is treated as a PRD;
+   ordinary sends are unaffected.
+3. A **Foreman** gate card decomposes the PRD into 2–12 ordered, independently-buildable
+   **stories**, each with a title, summary, and its own acceptance criteria. Each story is
+   also written to disk as a spec under `.fowlplay/specs/<conversation>/NN-<slug>.md` so you
+   have a durable, editable record outside the chat.
+4. **Story 1 builds immediately** through the normal Coop pipeline (Scout → Builder →
+   Inspector → Sentry → your review), and a **plan block** shows the whole story list with a
+   status glyph each: ○ pending, spinner building, ◉ awaiting review, ✓ done, ✕ failed.
+5. Review story 1's diff as usual (apply, comment, revert, send feedback). When you're
+   satisfied, press **Continue — next story** on the plan block. That marks the story done
+   and builds the next one as a fresh turn. If a story failed, the button reads **Continue
+   anyway** — moving on is your call, and the skip is noted in that story's spec file.
+6. When the last story is done, a short **completion summary** lists every story's final
+   status.
+
+The plan lives on the conversation, so it survives save/reload and shows the live status
+each time you reopen it. If the Foreman can't produce at least two buildable stories, it
+blocks with guidance instead of creating a plan — rephrase or split the PRD, or send it as a
+normal request. Normal prompts between stories run exactly as usual and leave the plan
+untouched; starting a new conversation clears the plan with it.
 
 ---
 

@@ -30,6 +30,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'model', aliases: [], description: 'Switch the active model', kind: 'submenu' },
   { name: 'solo', aliases: [], description: 'Direct single-agent mode', kind: 'action' },
   { name: 'coop', aliases: [], description: 'Cooperative pipeline mode', kind: 'action' },
+  { name: 'prd', aliases: [], description: 'Break a PRD into stories and build them one by one', kind: 'action' },
   { name: 'diff', aliases: ['review'], description: 'Review staged changes', kind: 'action' },
   { name: 'fork', aliases: [], description: 'Fork this conversation into a new tab', kind: 'action' },
   { name: 'export', aliases: [], description: 'Copy conversation as Markdown or JSON', kind: 'submenu' },

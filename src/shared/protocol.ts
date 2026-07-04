@@ -29,8 +29,12 @@ export type WebviewToHost =
   // lifecycle
   | { type: 'ready' }
   // chat
-  | { type: 'sendPrompt'; text: string; attachments?: Attachment[] }
+  // `prd: true` decomposes the prompt as a PRD (Foreman → per-story build loop) instead of
+  // running it as a single Coop/Solo turn. Ordinary sends omit the flag.
+  | { type: 'sendPrompt'; text: string; attachments?: Attachment[]; prd?: boolean }
   | { type: 'cancelResponse' }
+  // Advance a PRD build to the next story (marks the cursor story done, runs the next).
+  | { type: 'continueStoryLoop' }
   | { type: 'clearSelection' }                                    // dismiss the pinned selection chip
   | { type: 'editMessage'; nodeId: string; text: string }        // branches
   | { type: 'rerunMessage'; nodeId: string }                      // sibling response

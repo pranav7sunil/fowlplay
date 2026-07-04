@@ -398,6 +398,29 @@ a:hover { text-decoration: underline; }
 .fp-commit-sha { font-family: var(--fp-font); color: var(--fp-accent); font-weight: 700; }
 .fp-commit-msg { margin: 4px 0; }
 
+/* PRD plan block */
+.fp-plan {
+  border: 1px solid var(--fp-border-strong); border-radius: var(--fp-radius);
+  background: var(--fp-surface); box-shadow: var(--fp-shadow);
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
+}
+.fp-plan-head { display: flex; align-items: center; gap: 10px; }
+.fp-plan-title { font-weight: 700; flex: 1; }
+.fp-plan-count { font-size: calc(11px * var(--fp-scale)); color: var(--fp-fg-muted); font-family: var(--fp-font); }
+.fp-plan-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.fp-plan-story { display: flex; align-items: flex-start; gap: 9px; }
+.fp-plan-story.fp-plan-cursor .fp-plan-story-title { font-weight: 700; }
+.fp-plan-story-title { flex: 1; }
+.fp-plan-glyph { flex-shrink: 0; width: 16px; text-align: center; font-weight: 800; margin-top: 1px; }
+.fp-plan-pending { color: var(--fp-fg-subtle); }
+.fp-plan-awaiting { color: var(--fp-accent); }
+.fp-plan-done { color: var(--fp-ok); }
+.fp-plan-failed { color: var(--fp-block); }
+.fp-plan-building { align-self: center; margin-top: 6px; background: var(--fp-accent); animation: fp-pulse 1.2s ease-in-out infinite; }
+
+/* PRD-build armed chip (composer) */
+.fp-prd-chip { color: var(--fp-accent); border-color: var(--fp-accent); background: var(--fp-accent-soft); font-weight: 700; }
+
 /* Error block */
 .fp-error { border: 1px solid var(--fp-block); border-radius: var(--fp-radius); background: rgba(217, 48, 37, 0.08); padding: 12px 14px; color: var(--fp-block); display: flex; gap: 10px; align-items: flex-start; }
 

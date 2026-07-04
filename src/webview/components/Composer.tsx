@@ -35,6 +35,7 @@ function fmt(n: number): string {
 export function Composer({ streaming }: { streaming: boolean }) {
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [prdArmed, setPrdArmed] = useState(false);
   const [menuMode, setMenuMode] = useState<MenuMode>('closed');
   const [highlight, setHighlight] = useState(0);
   const [showStatus, setShowStatus] = useState(false);
@@ -69,9 +70,17 @@ export function Composer({ streaming }: { streaming: boolean }) {
     // A new prompt supersedes any pending model-mention picker (host discards
     // the held prompt too); drop the card so it can't answer a stale question.
     store.clearModelMentionChoice();
-    post({ type: 'sendPrompt', text: t, attachments: attachments.length ? attachments : undefined });
+    post({
+      type: 'sendPrompt',
+      text: t,
+      attachments: attachments.length ? attachments : undefined,
+      // The armed "PRD build" chip flags this one send for Foreman decomposition;
+      // it disarms immediately after so ordinary sends stay ordinary.
+      prd: prdArmed || undefined,
+    });
     setText('');
     setAttachments([]);
+    setPrdArmed(false);
     setMenuMode('closed');
     resetHeight();
   };
@@ -121,6 +130,13 @@ export function Composer({ streaming }: { streaming: boolean }) {
       case 'coop':
         post({ type: 'setHarnessMode', mode: 'coop' });
         clearAndClose();
+        break;
+      case 'prd':
+        // Arm the next send as a PRD build (Foreman → per-story loop). The chip
+        // renders above the composer; the send consumes and clears it.
+        setPrdArmed(true);
+        clearAndClose();
+        requestAnimationFrame(() => taRef.current?.focus());
         break;
       case 'diff':
         store.openReview();
@@ -338,8 +354,16 @@ export function Composer({ streaming }: { streaming: boolean }) {
           </span>
         </div>
       )}
-      {attachments.length > 0 && (
+      {(attachments.length > 0 || prdArmed) && (
         <div class="fp-attachments">
+          {prdArmed && (
+            <span class="fp-attach-chip fp-prd-chip" title="The next message is decomposed into stories and built one by one">
+              ⚑ PRD build
+              <button type="button" class="fp-btn-ghost" style={{ padding: 0 }} onClick={() => setPrdArmed(false)} aria-label="Disarm PRD build">
+                <IconX size={13} />
+              </button>
+            </span>
+          )}
           {attachments.map((a, i) => (
             <span class="fp-attach-chip" key={i}>
               {a.name}

@@ -54,8 +54,25 @@ import {
   ContextExceededError,
   runCoopPipeline,
   type ChangesetInspector,
+  type CoopResult,
   type RoleRunner,
 } from '../core/harness/coop';
+import {
+  FOREMAN_SYSTEM,
+  composeStoryPrompt,
+  parseForeman,
+  renderSpecMarkdown,
+  specRelPath,
+  type PrdPlan,
+  type PrdStory,
+} from '../core/harness/prd';
+import {
+  createCard,
+  joinSections,
+  numberedList,
+  section,
+  transition,
+} from '../core/harness/evidence';
 import {
   appendAssistant,
   appendUser,
@@ -187,6 +204,8 @@ export class SessionCore {
     attachments?: Attachment[];
     queue: { role: MentionRole; query: string; candidates: ModelMatch[] }[];
     assignments: string[];
+    /** Carried through the disambiguation so a held PRD prompt still decomposes on release. */
+    prd?: boolean;
   } | null = null;
 
   /**
@@ -240,7 +259,10 @@ export class SessionCore {
         await this.onReady();
         return;
       case 'sendPrompt':
-        await this.onSendPrompt(msg.text, msg.attachments);
+        await this.onSendPrompt(msg.text, msg.attachments, msg.prd);
+        return;
+      case 'continueStoryLoop':
+        await this.onContinueStoryLoop();
         return;
       case 'cancelResponse':
         this.abort?.abort();
@@ -469,7 +491,7 @@ export class SessionCore {
    * turn; otherwise the turn runs with the ORIGINAL full text (mentions are not
    * stripped from what the model sees — keeping history honest is harmless).
    */
-  private async onSendPrompt(text: string, attachments?: Attachment[]): Promise<void> {
+  private async onSendPrompt(text: string, attachments?: Attachment[], prd?: boolean): Promise<void> {
     const trimmed = text.trim();
     const atts = attachments ?? [];
     if (!trimmed && atts.length === 0) return;
@@ -501,7 +523,7 @@ export class SessionCore {
     if (queue.length > 0) {
       // Hold the whole prompt (selection stays pinned) until every ambiguity is
       // resolved; surface the first choice now.
-      this.heldMention = { text, attachments, queue, assignments };
+      this.heldMention = { text, attachments, queue, assignments, prd };
       const first = queue[0];
       this.deps.post({
         type: 'modelMentionChoice',
@@ -512,7 +534,7 @@ export class SessionCore {
       return;
     }
 
-    await this.finishMentions(text, attachments, assignments);
+    await this.finishMentions(text, attachments, assignments, prd);
   }
 
   /** Resolve one held ambiguity, then advance the queue or release the prompt. */
@@ -538,7 +560,7 @@ export class SessionCore {
       return;
     }
     this.heldMention = null;
-    await this.finishMentions(held.text, held.attachments, held.assignments);
+    await this.finishMentions(held.text, held.attachments, held.assignments, held.prd);
   }
 
   /** Apply a resolved mention to the conversation (role override or the model itself). */
@@ -558,7 +580,7 @@ export class SessionCore {
    * (directive-only message: no turn, just a confirmation toast) or run the turn
    * with the original full text.
    */
-  private async finishMentions(text: string, attachments: Attachment[] | undefined, assignments: string[]): Promise<void> {
+  private async finishMentions(text: string, attachments: Attachment[] | undefined, assignments: string[], prd?: boolean): Promise<void> {
     if (assignments.length > 0) {
       this.sendConversation();
       await this.persist();
@@ -570,10 +592,10 @@ export class SessionCore {
       this.toast('info', assignments.join(', '));
       return;
     }
-    await this.runPromptTurn(text, attachments);
+    await this.runPromptTurn(text, attachments, prd);
   }
 
-  private async runPromptTurn(text: string, attachments?: Attachment[]): Promise<void> {
+  private async runPromptTurn(text: string, attachments?: Attachment[], prd?: boolean): Promise<void> {
     const trimmed = text.trim();
     const atts = attachments ?? [];
     if (!trimmed && atts.length === 0) return;
@@ -615,7 +637,7 @@ export class SessionCore {
 
     const { conv, nodeId } = appendUser(this.conv, [{ type: 'text', text: displayText || '(see attachments)' }]);
     this.conv = conv;
-    await this.runAssistantTurn(nodeId, imageParts);
+    await this.runAssistantTurn(nodeId, imageParts, { prd });
   }
 
   private async onEditMessage(nodeId: string, text: string): Promise<void> {
@@ -638,8 +660,18 @@ export class SessionCore {
     }
   }
 
-  /** The shared turn engine: given a user node, produce an assistant response. */
-  private async runAssistantTurn(userNodeId: string, imageParts: WireUserPart[] = []): Promise<void> {
+  /**
+   * The shared turn engine: given a user node, produce an assistant response.
+   *
+   * `opts.prd` runs the PRD front-end (Foreman decomposition → write specs → build story 1);
+   * `opts.storyIndex` runs one story of an existing plan (used by `continueStoryLoop`).
+   * With neither, the turn runs an ordinary Coop or Solo response.
+   */
+  private async runAssistantTurn(
+    userNodeId: string,
+    imageParts: WireUserPart[] = [],
+    opts: { prd?: boolean; storyIndex?: number } = {},
+  ): Promise<void> {
     const settings = await this.ensureSettings();
     const resolved = await this.resolveModel();
     if (!resolved) {
@@ -672,7 +704,15 @@ export class SessionCore {
     let blocks: ContentBlock[] = [];
     let usage: TokenUsage = emptyUsage();
     try {
-      if (this.conv.harnessMode === 'coop') {
+      if (opts.prd) {
+        const out = await this.runPrd(userText, imageParts, baseWire, resolved, settings.harness, signal);
+        blocks = out.blocks;
+        usage = out.usage;
+      } else if (opts.storyIndex !== undefined) {
+        const out = await this.runStory(opts.storyIndex, baseWire, resolved, settings.harness, signal);
+        blocks = out.blocks;
+        usage = out.usage;
+      } else if (this.conv.harnessMode === 'coop') {
         const out = await this.runCoop(userText, imageParts, baseWire, resolved, settings.harness, signal);
         blocks = out.blocks;
         usage = out.usage;
@@ -762,10 +802,33 @@ export class SessionCore {
     harness: HarnessSettings,
     signal: AbortSignal,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
-    const settings = await this.ensureSettings();
     const cards: GateCard[] = [];
+    const result = await this.runCoopCore(userText, imageParts, baseWire, resolved, harness, signal, cards);
+
+    const blocks: ContentBlock[] = cards.map((card) => ({ type: 'gate', card }));
+    const text = this.coopOutcomeText(result);
+    if (text) blocks.push({ type: 'text', text });
+    return { blocks, usage: result.usage };
+  }
+
+  /**
+   * Wire up the Coop collaborators (per-role model runner, changeset inspector, Builder
+   * loop) and run the pipeline once for `userPrompt`. Emitted gate cards are pushed onto
+   * `cards` and streamed to the webview. Shared by ordinary Coop turns and per-story PRD
+   * builds — the caller maps the returned outcome to blocks / plan status.
+   */
+  private async runCoopCore(
+    userPrompt: string,
+    imageParts: WireUserPart[],
+    baseWire: WireMessage[],
+    resolved: ResolvedModel,
+    harness: HarnessSettings,
+    signal: AbortSignal,
+    cards: GateCard[],
+  ): Promise<CoopResult> {
+    const settings = await this.ensureSettings();
     const runner: RoleRunner = {
-      run: async ({ role, system, userPrompt, readOnly, signal: s }) => {
+      run: async ({ role, system, userPrompt: rolePrompt, readOnly, signal: s }) => {
         // Each role resolves its own model through the override chain, falling
         // back to the turn's conversation model.
         const rm = (await this.resolveModel(role)) ?? resolved;
@@ -775,7 +838,7 @@ export class SessionCore {
           apiKey: rm.apiKey,
           modelId: rm.modelId,
           system,
-          history: [{ role: 'user', content: [{ type: 'text', text: userPrompt }] }],
+          history: [{ role: 'user', content: [{ type: 'text', text: rolePrompt }] }],
           tools: readOnly ? this.readOnlyTools : this.allTools,
           toolHost: this.toolHost(),
           onEvent: () => {}, // role calls are summarized as gate cards, not streamed
@@ -839,8 +902,8 @@ export class SessionCore {
       return res.usage;
     };
 
-    const result = await runCoopPipeline({
-      userPrompt: userText,
+    return runCoopPipeline({
+      userPrompt,
       runner,
       inspector,
       buildStage,
@@ -853,30 +916,264 @@ export class SessionCore {
       diffBudgetFor: (role) => this.payloadBudget(settings, role),
       signal,
     });
+  }
 
-    const blocks: ContentBlock[] = cards.map((card) => ({ type: 'gate', card }));
+  /** The explanatory text block for a non-ready Coop outcome (empty for ready-for-review). */
+  private coopOutcomeText(result: CoopResult): string {
     switch (result.outcome) {
       case 'blocked':
-        blocks.push({ type: 'text', text: result.question ?? 'The request needs clarification before work can begin.' });
-        break;
+        return result.question ?? 'The request needs clarification before work can begin.';
       case 'qas-failed':
-        blocks.push({ type: 'text', text: 'The Inspector could not approve the changes within the retry budget. They remain staged for your review.' });
-        break;
+        return 'The Inspector could not approve the changes within the retry budget. They remain staged for your review.';
       case 'security-blocked':
-        blocks.push({ type: 'text', text: 'Sentry flagged a security concern. The changes remain staged — review carefully before applying.' });
-        break;
-      case 'context-exceeded': {
-        const label = result.context?.modelLabel ?? 'the selected model';
-        blocks.push({ type: 'text', text: contextExceededMessage(label, result.context?.windowTokens) });
-        break;
-      }
+        return 'Sentry flagged a security concern. The changes remain staged — review carefully before applying.';
+      case 'context-exceeded':
+        return contextExceededMessage(result.context?.modelLabel ?? 'the selected model', result.context?.windowTokens);
       case 'cancelled':
-        blocks.push({ type: 'text', text: 'Cancelled.' });
-        break;
+        return 'Cancelled.';
       case 'ready-for-review':
-        break;
+        return '';
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // PRD builds (Foreman decomposition → per-story build loop)
+  // -------------------------------------------------------------------------
+
+  /**
+   * A PRD turn: the Foreman decomposes the PRD into ordered stories (read-only, Scout's
+   * model), each story is written to disk as a spec, the plan is stored on the conversation,
+   * and story 1 is built immediately within this same turn. A decomposition failure (<2
+   * stories, or unparseable output) blocks the Foreman card and creates no plan.
+   */
+  private async runPrd(
+    userText: string,
+    imageParts: WireUserPart[],
+    baseWire: WireMessage[],
+    resolved: ResolvedModel,
+    harness: HarnessSettings,
+    signal: AbortSignal,
+  ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
+    const settings = await this.ensureSettings();
+    const usage: TokenUsage = emptyUsage();
+    const cards: GateCard[] = [];
+    const emit = (card: GateCard): GateCard => {
+      upsertCard(cards, card);
+      this.deps.post({ type: 'gateUpdate', card });
+      return card;
+    };
+    const gateBlocks = (): ContentBlock[] => cards.map((card) => ({ type: 'gate', card }));
+
+    // --- Foreman gate: decompose the PRD (Scout's model, read-only) ---
+    let foremanCard = emit(
+      createCard('gate-foreman-1', {
+        role: 'foreman',
+        title: 'Foreman — PRD decomposition',
+        evidence: 'Decomposing the PRD into ordered, independently-buildable stories…',
+        modelLabel: this.roleModelLabel(settings, 'scout'),
+      }),
+    );
+    if (signal.aborted) {
+      emit(transition(foremanCard, 'failed', { evidence: joinSections(foremanCard.evidence, '_Cancelled by user._') }));
+      return { blocks: [...gateBlocks(), { type: 'text', text: 'Cancelled.' }], usage };
+    }
+
+    const rm = (await this.resolveModel('scout')) ?? resolved;
+    const res = await runAgentLoop({
+      adapter: rm.adapter,
+      baseUrl: rm.baseUrl,
+      apiKey: rm.apiKey,
+      modelId: rm.modelId,
+      system: FOREMAN_SYSTEM,
+      history: [{ role: 'user', content: [{ type: 'text', text: userText }, ...imageParts] }],
+      tools: this.readOnlyTools,
+      toolHost: this.toolHost(),
+      onEvent: () => {},
+      maxRounds: 8,
+      signal,
+    });
+    addUsageInPlace(usage, res.usage);
+    const foremanUsage = res.usage;
+
+    if (signal.aborted) {
+      emit(transition(foremanCard, 'failed', { usage: foremanUsage, evidence: joinSections(foremanCard.evidence, '_Cancelled by user._') }));
+      return { blocks: [...gateBlocks(), { type: 'text', text: 'Cancelled.' }], usage };
+    }
+
+    const stories = parseForeman(joinText(res.blocks));
+    if (stories.length < 2) {
+      emit(
+        transition(foremanCard, 'blocked', {
+          usage: foremanUsage,
+          evidence: joinSections(
+            section('Could not decompose', 'The PRD did not yield at least two ordered, buildable stories.'),
+            section('What to do', 'Rephrase the PRD, split it into clearer deliverables, or send it as a normal request.'),
+          ),
+        }),
+      );
+      return {
+        blocks: [...gateBlocks(), { type: 'text', text: 'Could not decompose the PRD into stories — rephrase or split it, or send it as a normal request.' }],
+        usage,
+      };
+    }
+
+    // --- Build the plan + write each spec to disk (direct meta-artifacts) ---
+    const total = stories.length;
+    const plan: PrdPlan = { stories: [], cursor: 0 };
+    for (let i = 0; i < total; i += 1) {
+      const s = stories[i];
+      const specPath = specRelPath(this.conv.id, i + 1, s.title);
+      const story: PrdStory = { title: s.title, summary: s.summary, criteria: s.criteria, specPath, status: 'pending' };
+      plan.stories.push(story);
+      await this.writeSpec(story, i + 1, total);
+    }
+    this.conv = { ...this.conv, prdPlan: plan };
+
+    emit(
+      transition(foremanCard, 'passed', {
+        usage: foremanUsage,
+        evidence: joinSections(
+          section(`Decomposed into ${total} stories`, numberedList(plan.stories.map((s) => s.title))),
+          section('Next', 'Building story 1 now; you review between stories.'),
+        ),
+      }),
+    );
+
+    // --- Build story 1 immediately, within this same turn ---
+    const story1 = await this.runStory(0, baseWire, resolved, harness, signal);
+    addUsageInPlace(usage, story1.usage);
+
+    // Blocks: Foreman gate, the plan marker (renders live), then story 1's cards + outcome.
+    return { blocks: [...gateBlocks(), { type: 'plan' }, ...story1.blocks], usage };
+  }
+
+  /**
+   * Run the Coop pipeline for one story of the current plan, mapping the outcome to the
+   * story's status and the explanatory blocks. Updates the story's spec file on disk after
+   * each transition (best-effort; rebuilt from plan data if it went missing).
+   */
+  private async runStory(
+    storyIndex: number,
+    baseWire: WireMessage[],
+    resolved: ResolvedModel,
+    harness: HarnessSettings,
+    signal: AbortSignal,
+  ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
+    const plan = this.conv.prdPlan;
+    const story = plan?.stories[storyIndex];
+    if (!plan || !story) {
+      return { blocks: [{ type: 'text', text: 'No story to build — the plan is missing.' }], usage: emptyUsage() };
+    }
+
+    const total = plan.stories.length;
+    this.setStoryStatus(storyIndex, 'building');
+    await this.writeSpec(this.conv.prdPlan!.stories[storyIndex], storyIndex + 1, total);
+
+    const specMarkdown = renderSpecMarkdown(this.conv.prdPlan!.stories[storyIndex], storyIndex + 1, total);
+    const userPrompt = composeStoryPrompt(specMarkdown, storyIndex + 1, total);
+
+    const cards: GateCard[] = [];
+    const result = await this.runCoopCore(userPrompt, [], baseWire, resolved, harness, signal, cards);
+
+    const status: PrdStory['status'] =
+      result.outcome === 'ready-for-review' ? 'awaiting-review' : result.outcome === 'cancelled' ? 'pending' : 'failed';
+    this.setStoryStatus(storyIndex, status);
+    await this.writeSpec(this.conv.prdPlan!.stories[storyIndex], storyIndex + 1, total);
+
+    const blocks: ContentBlock[] = cards.map((card) => ({ type: 'gate', card }));
+    const text = this.coopOutcomeText(result);
+    if (text) blocks.push({ type: 'text', text });
     return { blocks, usage: result.usage };
+  }
+
+  /**
+   * Advance a PRD build to the next story. Ignored while a turn is streaming. Marks the
+   * cursor story done (a failed story continued past is also marked done — the human decided
+   * to move on; the `(skipped review)` nuance is recorded only in the spec file). If no
+   * stories remain, appends a completion summary; otherwise appends a synthetic user node
+   * and runs the next story as a fresh turn (so rewind/branching stay coherent).
+   */
+  private async onContinueStoryLoop(): Promise<void> {
+    if (this.abort) return; // a turn is in flight — ignore
+    const plan = this.conv.prdPlan;
+    if (!plan) return;
+    const i = plan.cursor;
+    const current = plan.stories[i];
+    if (!current) return;
+    if (current.status === 'building') return; // defensive — a turn should be in flight
+
+    // A pending cursor story was cancelled (or never started): Continue means
+    // RETRY it, not mark it done and skip past work that never happened.
+    if (current.status === 'pending') {
+      const { conv, nodeId } = appendUser(this.conv, [
+        { type: 'text', text: `Resume story ${i + 1}: ${current.title}` },
+      ]);
+      this.conv = conv;
+      await this.runAssistantTurn(nodeId, [], { storyIndex: i });
+      return;
+    }
+
+    const skippedReview = current.status === 'failed';
+    const stories = plan.stories.map((s, idx) => (idx === i ? { ...s, status: 'done' as const } : s));
+    const nextCursor = i + 1;
+    this.conv = { ...this.conv, prdPlan: { stories, cursor: nextCursor } };
+    // Record the skipped-review nuance in the spec file only (state machine stays simple).
+    await this.writeSpec(stories[i], i + 1, stories.length, skippedReview ? 'skipped review' : undefined);
+
+    if (nextCursor >= stories.length) {
+      // Plan complete — summarize the final statuses in a short assistant block.
+      const summary = this.renderPlanSummary(stories);
+      const { conv } = appendAssistant(this.conv, [{ type: 'text', text: summary }], {
+        parentId: this.conv.currentLeafId ?? undefined,
+        model: this.conv.model ?? undefined,
+      });
+      this.conv = conv;
+      await this.persist();
+      this.sendConversation();
+      return;
+    }
+
+    // Run the next story as a new turn, parented on a synthetic "Continue" user node.
+    const next = stories[nextCursor];
+    const { conv, nodeId } = appendUser(this.conv, [
+      { type: 'text', text: `Continue to story ${nextCursor + 1}: ${next.title}` },
+    ]);
+    this.conv = conv;
+    await this.runAssistantTurn(nodeId, [], { storyIndex: nextCursor });
+  }
+
+  /** Set a story's status immutably on the conversation's plan (no-op if the plan is gone). */
+  private setStoryStatus(index: number, status: PrdStory['status']): void {
+    const plan = this.conv.prdPlan;
+    if (!plan || !plan.stories[index]) return;
+    const stories = plan.stories.map((s, idx) => (idx === index ? { ...s, status } : s));
+    this.conv = { ...this.conv, prdPlan: { ...plan, stories } };
+  }
+
+  /**
+   * Write (or rewrite) a story's spec file. A direct meta-artifact — NOT staged through the
+   * overlay. Best-effort: swallows write errors so a spec-write hiccup never fails a build.
+   */
+  private async writeSpec(story: PrdStory, index: number, total: number, note?: string): Promise<void> {
+    try {
+      await this.deps.io.write(story.specPath, renderSpecMarkdown(story, index, total, undefined, note));
+    } catch {
+      /* spec files are best-effort meta-artifacts */
+    }
+  }
+
+  /** A one-line-per-story completion summary for a finished PRD build. */
+  private renderPlanSummary(stories: PrdStory[]): string {
+    const glyph: Record<PrdStory['status'], string> = {
+      pending: '○',
+      building: '…',
+      'awaiting-review': '◉',
+      done: '✓',
+      failed: '✕',
+    };
+    const done = stories.filter((s) => s.status === 'done').length;
+    const lines = stories.map((s, i) => `${i + 1}. ${glyph[s.status]} ${s.title}`);
+    return `PRD build complete — ${done} of ${stories.length} stories done.\n\n${lines.join('\n')}`;
   }
 
   private finalizeAssistant(nodeId: string, blocks: ContentBlock[], usage: TokenUsage): void {
@@ -1503,6 +1800,13 @@ function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
     outputTokens: a.outputTokens + b.outputTokens,
     cachedTokens: a.cachedTokens + b.cachedTokens,
   };
+}
+
+/** Accumulate `b` into `a` in place (for summing usage across sub-calls in one turn). */
+function addUsageInPlace(a: TokenUsage, b: TokenUsage): void {
+  a.inputTokens += b.inputTokens;
+  a.outputTokens += b.outputTokens;
+  a.cachedTokens += b.cachedTokens;
 }
 
 function firstText(blocks: ContentBlock[]): string | null {

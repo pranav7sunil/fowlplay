@@ -165,14 +165,32 @@ function textEvents(text: string): StreamEvent[] {
   return [{ type: 'text', delta: text }, USAGE, { type: 'done', stopReason: 'end' }];
 }
 
-/** Adapter that stages `path`/`content` on a build turn and approves every role gate. */
-function scriptedAdapter(path = 'foo.txt', content = 'hello\nworld\n'): { adapter: ProviderAdapter; requests: ChatRequest[] } {
+/** A 2-story Foreman decomposition, returned when `foreman: 'two'`. */
+const TWO_STORY_JSON = JSON.stringify({
+  stories: [
+    { title: 'First story', summary: 'the first slice', criteria: ['story one works'] },
+    { title: 'Second story', summary: 'the second slice', criteria: ['story two works'] },
+  ],
+});
+
+/**
+ * Adapter that stages `path`/`content` on a build turn and approves every role gate. When a
+ * FOREMAN system prompt arrives it returns a decomposition: two stories (`foreman: 'two'`,
+ * the default) or unparseable text (`foreman: 'garbage'`) to exercise the failure path.
+ */
+function scriptedAdapter(
+  path = 'foo.txt',
+  content = 'hello\nworld\n',
+  foreman: 'two' | 'garbage' = 'two',
+): { adapter: ProviderAdapter; requests: ChatRequest[] } {
   const requests: ChatRequest[] = [];
   const adapter: ProviderAdapter = {
     chat(request: ChatRequest) {
       requests.push(request);
       let events: StreamEvent[];
-      if (request.system.includes('SCOUT')) {
+      if (request.system.includes('FOREMAN')) {
+        events = textEvents(foreman === 'garbage' ? 'I cannot break this down, sorry.' : TWO_STORY_JSON);
+      } else if (request.system.includes('SCOUT')) {
         events = textEvents(JSON.stringify({ criteria: ['File is created'], plan: ['create file'], ambiguous: false, question: '' }));
       } else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) {
         events = textEvents(JSON.stringify({ verdict: 'approve', findings: [], evidence: 'looks fine' }));
@@ -193,10 +211,10 @@ function scriptedAdapter(path = 'foo.txt', content = 'hello\nworld\n'): { adapte
 // Harness
 // ---------------------------------------------------------------------------
 
-function makeSession(opts: { mode?: HarnessMode; path?: string; content?: string } = {}) {
+function makeSession(opts: { mode?: HarnessMode; path?: string; content?: string; foreman?: 'two' | 'garbage' } = {}) {
   const io = new FakeIo();
   const posted: HostToWebview[] = [];
-  const { adapter, requests } = scriptedAdapter(opts.path, opts.content);
+  const { adapter, requests } = scriptedAdapter(opts.path, opts.content, opts.foreman);
   const settings = new FakeSettings(opts.mode ?? 'solo');
   // Count broadcast triggers so tests can assert which mutations notify siblings.
   const changed = { count: 0 };
@@ -1166,5 +1184,274 @@ describe('conversation-level model directive persists (JSON round-trip)', () => 
     expect(saved).toBeDefined();
     const roundTripped: Conversation = JSON.parse(JSON.stringify(saved));
     expect(roundTripped.roleModelOverrides?.builder).toEqual({ providerId: 'p1', modelId: 'm-builder' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PRD builds (Foreman decomposition → per-story build loop)
+// ---------------------------------------------------------------------------
+
+/** Roles of the distinct gate cards emitted so far, in first-seen order. */
+function gateRoles(posted: HostToWebview[]): string[] {
+  const gates = posted.filter(
+    (m): m is Extract<HostToWebview, { type: 'gateUpdate' }> => m.type === 'gateUpdate',
+  );
+  const order: string[] = [];
+  for (const g of gates) if (!order.includes(g.card.id)) order.push(g.card.id);
+  return order.map((id) => gates.find((g) => g.card.id === id)!.card.role);
+}
+
+/** The synthetic user nodes ("Continue to story N: …") on the current conversation. */
+function continueNodes(conv: Conversation): string[] {
+  return Object.values(conv.nodes)
+    .filter((n) => n.role === 'user')
+    .map((n) => n.blocks.map((b) => (b.type === 'text' ? b.text : '')).join(''))
+    .filter((t) => t.startsWith('Continue to story'));
+}
+
+describe('PRD build turn', () => {
+  it('decomposes the PRD, writes a spec per story, sets the plan, and builds story 1 to awaiting-review', async () => {
+    const { session, posted, io } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'Build the whole thing per this PRD…', prd: true });
+
+    // Two spec files were written directly to disk (not staged).
+    const specs = [...io.files.keys()].filter((p) => p.startsWith('.fowlplay/specs/'));
+    expect(specs).toHaveLength(2);
+    expect(io.files.get(specs[0])).toContain('First story');
+    expect(io.files.get(specs[1])).toContain('Second story');
+
+    // The plan rode onto the conversation with two stories, cursor at 0.
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.stories).toHaveLength(2);
+    expect(conv.prdPlan?.cursor).toBe(0);
+    expect(conv.prdPlan?.stories[0].status).toBe('awaiting-review'); // story 1 built to review
+    expect(conv.prdPlan?.stories[1].status).toBe('pending');
+
+    // Foreman + full pipeline cards were emitted; a plan block marker sits in the node.
+    const roles = gateRoles(posted);
+    expect(roles).toEqual(['foreman', 'scout', 'stop-the-line', 'builder', 'inspector', 'sentry', 'hitl']);
+    const leaf = assistantLeaf(conv)!;
+    expect(leaf.blocks.some((b) => b.type === 'plan')).toBe(true);
+    expect(leaf.blocks.some((b) => b.type === 'gate' && b.card.role === 'foreman')).toBe(true);
+    // Story 1 staged a change → a changes block was appended.
+    expect(leaf.blocks.some((b) => b.type === 'changes')).toBe(true);
+  });
+
+  it('blocks the Foreman card and creates no plan when decomposition fails', async () => {
+    const { session, posted, io } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n', foreman: 'garbage' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'a vague half-idea', prd: true });
+
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan).toBeUndefined(); // no plan
+    // No spec files written.
+    expect([...io.files.keys()].some((p) => p.startsWith('.fowlplay/specs/'))).toBe(false);
+
+    // The Foreman card is blocked; no downstream role cards ran.
+    const roles = gateRoles(posted);
+    expect(roles).toEqual(['foreman']);
+    const foreman = posted
+      .filter((m): m is Extract<HostToWebview, { type: 'gateUpdate' }> => m.type === 'gateUpdate')
+      .map((m) => m.card)
+      .filter((c) => c.role === 'foreman')
+      .pop();
+    expect(foreman?.status).toBe('blocked');
+    const leaf = assistantLeaf(conv)!;
+    expect(leaf.blocks.some((b) => b.type === 'text' && b.text.toLowerCase().includes('could not decompose'))).toBe(true);
+    expect(leaf.blocks.some((b) => b.type === 'plan')).toBe(false);
+  });
+
+  it('continueStoryLoop marks story 1 done, appends a synthetic user node, and builds story 2', async () => {
+    const { session, posted } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+
+    const before = posted.length;
+    await session.handle({ type: 'continueStoryLoop' });
+
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.cursor).toBe(1);
+    expect(conv.prdPlan?.stories[0].status).toBe('done');
+    expect(conv.prdPlan?.stories[1].status).toBe('awaiting-review'); // story 2 built to review
+    // A synthetic "Continue to story 2" user node was appended and a turn ran.
+    expect(continueNodes(conv)).toEqual(['Continue to story 2: Second story']);
+    expect(posted.slice(before).some((m) => m.type === 'turnStarted')).toBe(true);
+    // The second story's pipeline cards ran again (a fresh set of gate ids).
+    expect(posted.slice(before).some((m) => m.type === 'gateUpdate' && m.card.role === 'scout')).toBe(true);
+  });
+
+  it('a second continue completes the plan with a summary block and no further story turn', async () => {
+    const { session, posted } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+    await session.handle({ type: 'continueStoryLoop' }); // story 1 → done, build story 2
+
+    const before = posted.length;
+    await session.handle({ type: 'continueStoryLoop' }); // story 2 → done, plan complete
+
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.cursor).toBe(2);
+    expect(conv.prdPlan?.stories.every((s) => s.status === 'done')).toBe(true);
+    // No new story turn ran; a completion summary was appended instead.
+    expect(posted.slice(before).some((m) => m.type === 'turnStarted')).toBe(false);
+    const leaf = assistantLeaf(conv)!;
+    expect(leaf.blocks.some((b) => b.type === 'text' && b.text.includes('PRD build complete'))).toBe(true);
+  });
+
+  it('resets a story cancelled mid-pipeline to pending (retryable)', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    let unblock: () => void = () => {};
+    const blocker = new Promise<void>((res) => {
+      unblock = res;
+    });
+    // Block the Builder loop of story 1 so the pipeline hangs after the plan is set (story
+    // 'building'); cancel while blocked, then release. The pipeline's post-build abort check
+    // yields a cancelled outcome → the story must reset to 'pending', never left 'building'.
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        let events: StreamEvent[];
+        let block = false;
+        if (request.system.includes('FOREMAN')) events = textEvents(TWO_STORY_JSON);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+        else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+          if (!hasToolResult) block = true; // the Builder's first (edit) round hangs
+        }
+        return (async function* () {
+          if (block) await blocker;
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+    // Flush until the Builder card is emitted (the loop is now blocked).
+    for (let i = 0; i < 100; i += 1) {
+      if (posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'builder')) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    await session.handle({ type: 'cancelResponse' });
+    unblock();
+    await turn;
+
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan).toBeDefined();
+    expect(conv.prdPlan?.stories[0].status).toBe('pending'); // cancelled → retryable, not building
+
+    // Continue on the pending cursor story must RETRY it — not mark it done and
+    // skip past work that never happened. The adapter no longer blocks, so the
+    // rerun completes to awaiting-review with the cursor still on story 1.
+    const beforeResume = posted.length;
+    await session.handle({ type: 'continueStoryLoop' });
+    const after = lastConversation(posted)!;
+    expect(after.prdPlan?.cursor).toBe(0);
+    expect(after.prdPlan?.stories[0].status).toBe('awaiting-review');
+    expect(after.prdPlan?.stories[1].status).toBe('pending');
+    // The retry ran as a real turn parented on a synthetic "Resume story" node.
+    expect(posted.slice(beforeResume).some((m) => m.type === 'turnStarted')).toBe(true);
+    expect(
+      Object.values(after.nodes).some(
+        (n) => n.role === 'user' && n.blocks.some((b) => b.type === 'text' && b.text.startsWith('Resume story 1:')),
+      ),
+    ).toBe(true);
+  });
+
+  it('ignores continueStoryLoop while a turn is streaming', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    let unblock: () => void = () => {};
+    const blocker = new Promise<void>((res) => {
+      unblock = res;
+    });
+    // Block the Sentry role call so the story-1 pipeline hangs mid-turn (plan already set,
+    // abort controller live) — the moment continueStoryLoop must be ignored.
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        let events: StreamEvent[];
+        let block = false;
+        if (request.system.includes('FOREMAN')) events = textEvents(TWO_STORY_JSON);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+        else if (request.system.includes('SENTRY')) {
+          events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+          block = true;
+        } else if (request.system.includes('INSPECTOR')) {
+          events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        } else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        }
+        return (async function* () {
+          if (block) await blocker;
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+
+    // Flush until the Sentry card has been emitted (the pipeline is now blocked on it).
+    for (let i = 0; i < 100; i += 1) {
+      if (posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'sentry')) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'sentry')).toBe(true);
+
+    // A turn is in flight → continueStoryLoop is ignored (posts nothing, advances nothing).
+    const before = posted.length;
+    await session.handle({ type: 'continueStoryLoop' });
+    expect(posted.length).toBe(before);
+
+    unblock();
+    await turn;
+    // The turn finished normally; the plan advanced only through the pipeline, not a stray continue.
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.cursor).toBe(0);
+    expect(continueNodes(conv)).toEqual([]);
+  });
+});
+
+describe('PRD plan history round-trip', () => {
+  it('keeps prdPlan through a JSON save/load', async () => {
+    const { session } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+
+    const saved = session.conversation;
+    expect(saved.prdPlan).toBeDefined();
+    const roundTripped: Conversation = JSON.parse(JSON.stringify(saved));
+    expect(roundTripped.prdPlan?.stories).toHaveLength(2);
+    expect(roundTripped.prdPlan?.stories[0].specPath).toBe(saved.prdPlan!.stories[0].specPath);
+    expect(roundTripped.prdPlan?.stories[0].status).toBe('awaiting-review');
+    expect(roundTripped.prdPlan?.cursor).toBe(0);
   });
 });

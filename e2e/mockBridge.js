@@ -43,6 +43,12 @@
       if (msg && msg.type === 'resolveModelMention') {
         /* no-op ack — protocol stays mirrored */
       }
+      // A PRD send (sendPrompt with prd:true) is treated as a normal send here; the
+      // `prd` flag is accepted so the protocol stays mirrored. continueStoryLoop is
+      // acked as a no-op — no scripted scenario drives the per-story loop.
+      if (msg && msg.type === 'continueStoryLoop') {
+        /* no-op ack — protocol stays mirrored */
+      }
     },
     onMessage(handler) {
       handlers.push(handler);
