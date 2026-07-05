@@ -137,6 +137,34 @@ describe('parseModelMentions — role directives', () => {
   it('chained directives are still directive-only messages', () => {
     expect(isDirectiveOnly('qwen to orchestrate and build, gemma to review and audit')).toBe(true);
   });
+
+  it('copula phrasing: "<name> should be the <role-person>"', () => {
+    expect(
+      parseModelMentions('implement @prd.md . Qwen should be the orchestrator and gemma should be the builder'),
+    ).toEqual([
+      { role: 'scout', query: 'Qwen' },
+      { role: 'builder', query: 'gemma' },
+    ]);
+    expect(parseModelMentions('gemma is the reviewer and auditor')).toEqual([
+      { role: 'inspector', query: 'gemma' },
+      { role: 'sentry', query: 'gemma' },
+    ]);
+    expect(parseModelMentions('glm as builder, qwen as orchestrator')).toEqual([
+      { role: 'builder', query: 'glm' },
+      { role: 'scout', query: 'qwen' },
+    ]);
+  });
+
+  it('"make <name> the <role-person>" and "<role-person>: <name>"', () => {
+    expect(parseModelMentions('make gemma the reviewer')).toEqual([{ role: 'inspector', query: 'gemma' }]);
+    expect(parseModelMentions('builder: gemma')).toEqual([{ role: 'builder', query: 'gemma' }]);
+  });
+
+  it('copula guards: pronouns/articles never become model names, prose never triggers', () => {
+    expect(parseModelMentions('it should be the builder that runs')).toEqual([]);
+    expect(parseModelMentions('we should build the builder with care')).toEqual([]);
+    expect(parseModelMentions('the app should be the best')).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------

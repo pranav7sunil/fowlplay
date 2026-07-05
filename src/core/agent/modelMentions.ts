@@ -57,6 +57,18 @@ const NOUN_TO_ROLE: Record<string, CoopRole> = {
 };
 
 /**
+ * Role-person nouns for copula/predicate phrasing: "<name> should be the
+ * builder", "<name> is the reviewer", "make <name> the auditor", "builder: <name>".
+ * `foreman` maps to scout because the Foreman shares the Scout's model resolution.
+ */
+const PERSON_TO_ROLE: Record<string, CoopRole> = {
+  builder: 'builder', implementer: 'builder', developer: 'builder',
+  orchestrator: 'scout', planner: 'scout', scout: 'scout', foreman: 'scout',
+  reviewer: 'inspector', inspector: 'inspector', qa: 'inspector',
+  auditor: 'sentry', sentry: 'sentry',
+};
+
+/**
  * Structural connectives that must never be captured as part of a model name.
  * Combined with the verb/noun vocabulary, these bound the `<name>` capture so a
  * directive cannot swallow the next clause ("qwen to orchestrate and glm to
@@ -64,10 +76,21 @@ const NOUN_TO_ROLE: Record<string, CoopRole> = {
  */
 const CONNECTIVES = ['to', 'with', 'for', 'and', 'or', 'use', 'let', 'switch', 'everything', 'all', 'every', 'please'];
 
+/**
+ * Copula/modal glue for predicate phrasing, plus pronouns/articles that must
+ * never be mistaken for a model name ("it should be the builder" must not
+ * produce a mention with query "it").
+ */
+const COPULA_WORDS = ['should', 'shall', 'will', 'can', 'must', 'be', 'is', 'as', 'make', 'the', 'our', 'my', 'a', 'an'];
+const NAME_STOPWORDS = ['it', 'this', 'that', 'these', 'those', 'he', 'she', 'they', 'we', 'i', 'you', 'who', 'which', 'what', 'there', 'model', 'models'];
+
 const KEYWORDS = new Set<string>([
   ...CONNECTIVES,
+  ...COPULA_WORDS,
+  ...NAME_STOPWORDS,
   ...Object.keys(VERB_TO_ROLE),
   ...Object.keys(NOUN_TO_ROLE),
+  ...Object.keys(PERSON_TO_ROLE),
 ]);
 
 function isKeyword(token: string): boolean {
@@ -84,6 +107,7 @@ function alternation(tokens: string[]): string {
 
 const VERB_ALT = alternation(Object.keys(VERB_TO_ROLE));
 const NOUN_ALT = alternation(Object.keys(NOUN_TO_ROLE));
+const PERSON_ALT = alternation(Object.keys(PERSON_TO_ROLE));
 const KW_ALT = alternation([...KEYWORDS]);
 
 // Conjunction chains: "orchestrate and build", "review, audit and security".
@@ -94,6 +118,9 @@ const KW_ALT = alternation([...KEYWORDS]);
 const CHAIN_JOIN = `(?:[ \\t]*,[ \\t]*(?:and[ \\t]+)?|[ \\t]+and[ \\t]+)`;
 const VERB_CHAIN = `(${VERB_ALT})((?:${CHAIN_JOIN}(?:${VERB_ALT})\\b)*)`;
 const NOUN_CHAIN = `(${NOUN_ALT})((?:${CHAIN_JOIN}(?:${NOUN_ALT})\\b)*)`;
+const PERSON_CHAIN = `(${PERSON_ALT})((?:${CHAIN_JOIN}(?:the[ \\t]+)?(?:${PERSON_ALT})\\b)*)`;
+// Copula glue: "should be the", "will be our", "is the", "as", "as the" …
+const COPULA = `(?:(?:should|shall|will|can|must)[ \\t]+(?:be[ \\t]+)?|is[ \\t]+|as[ \\t]+)(?:the[ \\t]+|our[ \\t]+|my[ \\t]+|a[ \\t]+|an[ \\t]+)?`;
 
 /** Expand a matched chain (first token + joined tail) into its role list, deduped in order. */
 function chainRoles(table: Record<string, CoopRole>, first: string, tail: string): CoopRole[] {
@@ -153,6 +180,22 @@ const PATTERNS: Pattern[] = [
   {
     re: new RegExp(`\\blet[ \\t]+${NAME}[ \\t]+${VERB_CHAIN}`, 'gi'),
     make: (m) => chainMentions(nameQuery(m[1]), chainRoles(VERB_TO_ROLE, m[2], m[3])),
+  },
+  // <name> should/will/is/as [be] [the] <role-person>[ and <role-person>…]
+  // ("gemma should be the builder", "qwen is the orchestrator", "glm as reviewer")
+  {
+    re: new RegExp(`${NAME}[ \\t]+${COPULA}${PERSON_CHAIN}`, 'gi'),
+    make: (m) => chainMentions(nameQuery(m[1]), chainRoles(PERSON_TO_ROLE, m[2], m[3])),
+  },
+  // make <name> [the] <role-person>[ and <role-person>…]   ("make gemma the reviewer")
+  {
+    re: new RegExp(`\\bmake[ \\t]+${NAME}[ \\t]+(?:the[ \\t]+)?${PERSON_CHAIN}`, 'gi'),
+    make: (m) => chainMentions(nameQuery(m[1]), chainRoles(PERSON_TO_ROLE, m[2], m[3])),
+  },
+  // <role-person>: <name>   ("builder: gemma")
+  {
+    re: new RegExp(`\\b(${PERSON_ALT})[ \\t]*:[ \\t]*${NAME}`, 'gi'),
+    make: (m) => chainMentions(nameQuery(m[2]), chainRoles(PERSON_TO_ROLE, m[1], '')),
   },
   // <name> for <role-noun>[ and <role-noun>…]   ("qwen for review and security")
   {
