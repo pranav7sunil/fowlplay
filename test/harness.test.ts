@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { GateCard, HarnessSettings, TokenUsage } from '../src/shared/types';
 import {
   ContextExceededError,
+  RunawayError,
   runCoopPipeline,
   type ChangesetInspector,
   type CoopResult,
@@ -547,6 +548,43 @@ describe('runCoopPipeline — context-exceeded', () => {
     expect(result.cards.find((c) => c.role === 'builder')?.status).toBe('failed');
     expect(result.cards.some((c) => c.role === 'inspector')).toBe(false);
     expect(result.cards.some((c) => c.role === 'sentry')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Runaway outcome (Builder's own call streamed past the safety cap)
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — runaway builder', () => {
+  it('fails the Builder card with the runaway evidence and returns the runaway outcome', async () => {
+    const { runner } = scriptedRunner({ scout: [scoutOk(['C1'])] });
+    const message =
+      'Runaway generation halted after ~180k tokens (cap ~8k). Retry the step — consider a larger context window or a different model.';
+    const buildStage = vi.fn(async () => {
+      throw new RunawayError({ role: 'builder', message });
+    });
+
+    const result = await runCoopPipeline({
+      userPrompt: 'implement the thing',
+      runner,
+      inspector: fakeInspector(),
+      buildStage,
+      settings: settings(),
+      onGate: () => {},
+    });
+
+    expect(result.outcome).toBe('runaway');
+
+    // The in-flight Builder card is marked failed and carries the runaway evidence.
+    const builder = result.cards.find((c) => c.role === 'builder');
+    expect(builder?.status).toBe('failed');
+    expect(builder?.evidence).toContain('Runaway generation halted');
+    expect(builder?.evidence).toContain('180k');
+
+    // Nothing after the Builder ran.
+    expect(result.cards.some((c) => c.role === 'inspector')).toBe(false);
+    expect(result.cards.some((c) => c.role === 'sentry')).toBe(false);
+    expect(result.cards.some((c) => c.role === 'hitl')).toBe(false);
   });
 });
 

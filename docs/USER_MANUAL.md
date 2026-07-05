@@ -220,6 +220,25 @@ Each stage emits an **evidence gate card** in the chat so you can see what was c
 why it passed. QA and Security gates can't be bypassed. Coop is what makes local models
 reliable: their output is verified before it reaches you.
 
+### Guardrails: token caps and runaway protection
+
+Local servers (LM Studio, llama.cpp, …) default to *unlimited* output, so a model that
+falls into an endless "thinking" loop can silently exhaust its whole context window. FowlPlay
+prevents that on two levels:
+
+- **Every model call is capped.** FowlPlay always sends a `max_tokens` limit — the response
+  reserve for the model's known context window (a quarter of it, at least 1.5k), or a fixed
+  **8192-token** safety net when the window is unknown. No single response can grow unbounded.
+- **A client-side failsafe halts runaways.** If a server ignores the cap and keeps streaming
+  past ~1.5× the limit, FowlPlay aborts that call locally and marks the step **failed** with
+  evidence like *"Runaway generation halted after ~180k tokens (cap ~8k). Retry the step —
+  consider a larger context window or a different model."* In Coop/PRD the Builder's gate card
+  fails; in Solo you get an error block. Retry, and pick a bigger window or a different model
+  if it recurs.
+
+While any response streams you can stop it at once with **Escape** (or the composer's stop
+button) — and, during a PRD build, the **Stop** button on the pinned PRD bar.
+
 ### PRD builds — long-horizon work
 
 A whole PRD (product requirements doc) is too big to build in one changeset. Run **`/prd`**
@@ -243,14 +262,19 @@ review between each.
    - If a story **failed** its checks, you get two buttons: **Retry story** re-runs that same
      story from scratch (worth a try after you've tweaked its spec, or just to give it
      another pass), and **Skip story** moves on anyway — your call, and the skip is noted in
-     that story's spec file.
+     that story's spec file. Each story — including a retry — runs from its **spec alone in a
+     fresh context window**, not the running chat history, so a retry is a genuine clean
+     restart and no earlier story's transcript pollutes it. Earlier stories' work is already
+     on disk (staged or applied), and the Builder is told to read those files rather than
+     assume.
    - If a story was **cancelled** mid-build (it shows as pending), **Resume story N** re-runs
      it — nothing is skipped that never happened.
 6. A **pinned PRD bar** sits just above the composer for the whole build: it shows
    "N of M done · story K …" and repeats the current story's action buttons, so you can
    retry, skip, or continue without scrolling back up to the plan block after a story has
-   streamed its gate cards. While a story is building it reads "building story K…" with no
-   buttons.
+   streamed its gate cards. While a story is building it reads "building story K…" and shows
+   a **Stop** button — so catching a bad build, stopping it, and retrying is one flow in one
+   place.
 7. When the last story is done, a short **completion summary** lists every story's final
    status.
 

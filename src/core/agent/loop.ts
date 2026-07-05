@@ -18,10 +18,45 @@ import type {
   WireMessage,
   WireToolResult,
 } from '../providers/adapter';
+import { estimateTokens } from './contextBudget';
 import { dispatchToolCall, type ToolHost } from './tools';
 
 const DEFAULT_MAX_ROUNDS = 24;
 const SUMMARY_LIMIT = 400;
+
+/**
+ * Generous fixed output cap (tokens) applied when the model's context window is
+ * unknown, so a single response can never grow unbounded — LM Studio and other
+ * local servers default `max_tokens` to unlimited, which let a runaway thinking
+ * loop exhaust the whole window. No reasonable single role response exceeds this.
+ */
+export const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
+
+/**
+ * Client-side runaway failsafe: if a server ignores `max_tokens` and streams past
+ * this multiple of the effective cap, the call is aborted locally and surfaced as
+ * a {@link RunawayGenerationError} rather than being left to exhaust the window.
+ */
+const RUNAWAY_CAP_MULTIPLE = 1.5;
+
+/** Thrown by {@link runAgentLoop} when a single call's output blows past the cap. */
+export class RunawayGenerationError extends Error {
+  constructor(
+    public readonly estimatedTokens: number,
+    public readonly capTokens: number,
+  ) {
+    super(
+      `Runaway generation halted after ~${fmtK(estimatedTokens)} tokens (cap ~${fmtK(capTokens)}). ` +
+        `Retry the step — consider a larger context window or a different model.`,
+    );
+    this.name = 'RunawayGenerationError';
+  }
+}
+
+function fmtK(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
+  return String(n);
+}
 
 export interface LoopOptions {
   adapter: ProviderAdapter;
@@ -67,6 +102,22 @@ export async function runAgentLoop(opts: LoopOptions): Promise<LoopResult> {
     const callOrder: string[] = [];
     let stopReason: 'end' | 'tool_use' | 'cancelled' | 'error' = 'end';
 
+    // Effective output cap for the runaway failsafe: the supplied cap, or the
+    // fixed default when the caller passed none (unknown context window).
+    const effectiveCap = opts.maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+    const runawayLimit = Math.floor(effectiveCap * RUNAWAY_CAP_MULTIPLE);
+
+    // A per-call AbortController chained to the outer signal, so the runaway
+    // failsafe can abort THIS call locally without touching the turn's signal
+    // (which the caller may still need for cancellation semantics).
+    const callController = new AbortController();
+    const onOuterAbort = () => callController.abort();
+    if (opts.signal) {
+      if (opts.signal.aborted) callController.abort();
+      else opts.signal.addEventListener('abort', onOuterAbort);
+    }
+    let runawayTokens = 0;
+
     const stream = opts.adapter.chat({
       baseUrl: opts.baseUrl,
       apiKey: opts.apiKey,
@@ -75,51 +126,71 @@ export async function runAgentLoop(opts: LoopOptions): Promise<LoopResult> {
       system: opts.system,
       messages,
       tools: opts.tools,
-      signal: opts.signal,
+      signal: callController.signal,
     });
 
-    for await (const event of stream) {
-      opts.onEvent(event);
-      switch (event.type) {
-        case 'text':
-          text += event.delta;
-          break;
-        case 'thinking':
-          thinking += event.delta;
-          break;
-        case 'tool_call_start': {
-          let call = calls.get(event.id);
-          if (!call) {
-            call = { id: event.id, name: event.name, argsStr: '' };
-            calls.set(event.id, call);
-            callOrder.push(event.id);
-          } else if (event.name) {
-            call.name = event.name;
+    try {
+      for await (const event of stream) {
+        opts.onEvent(event);
+        switch (event.type) {
+          case 'text':
+            text += event.delta;
+            break;
+          case 'thinking':
+            thinking += event.delta;
+            break;
+          case 'tool_call_start': {
+            let call = calls.get(event.id);
+            if (!call) {
+              call = { id: event.id, name: event.name, argsStr: '' };
+              calls.set(event.id, call);
+              callOrder.push(event.id);
+            } else if (event.name) {
+              call.name = event.name;
+            }
+            break;
           }
-          break;
+          case 'tool_call_args': {
+            const call = calls.get(event.id);
+            if (call) call.argsStr += event.delta;
+            break;
+          }
+          case 'tool_call_end':
+            break;
+          case 'usage':
+            usage.inputTokens += event.usage.inputTokens;
+            usage.outputTokens += event.usage.outputTokens;
+            usage.cachedTokens += event.usage.cachedTokens;
+            break;
+          case 'done':
+            stopReason = event.stopReason;
+            break;
+          case 'error':
+            // The error text is forwarded via onEvent; the following `done`
+            // event will carry stopReason 'error'.
+            break;
+          default:
+            break;
         }
-        case 'tool_call_args': {
-          const call = calls.get(event.id);
-          if (call) call.argsStr += event.delta;
-          break;
+
+        // Runaway failsafe: the server ignored max_tokens and the streamed
+        // text+thinking has blown past 1.5× the cap. Abort THIS call and throw a
+        // distinct error so the caller can fail the step with actionable evidence.
+        if (event.type === 'text' || event.type === 'thinking') {
+          const est = estimateTokens(text) + estimateTokens(thinking);
+          if (est > runawayLimit) {
+            runawayTokens = est;
+            callController.abort();
+            break;
+          }
         }
-        case 'tool_call_end':
-          break;
-        case 'usage':
-          usage.inputTokens += event.usage.inputTokens;
-          usage.outputTokens += event.usage.outputTokens;
-          usage.cachedTokens += event.usage.cachedTokens;
-          break;
-        case 'done':
-          stopReason = event.stopReason;
-          break;
-        case 'error':
-          // The error text is forwarded via onEvent; the following `done`
-          // event will carry stopReason 'error'.
-          break;
-        default:
-          break;
       }
+    } finally {
+      if (opts.signal) opts.signal.removeEventListener('abort', onOuterAbort);
+    }
+
+    if (runawayTokens > 0) {
+      throw new RunawayGenerationError(runawayTokens, effectiveCap);
     }
 
     // Render assistant text/thinking blocks (in reading order).

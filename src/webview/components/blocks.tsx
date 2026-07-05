@@ -373,7 +373,18 @@ export function PlanBar() {
         </span>
       </span>
       <span class="fp-plan-bar-actions">
-        <PlanActionButtons plan={plan} streaming={streaming} />
+        {streaming ? (
+          <button
+            type="button"
+            class="fp-btn fp-btn-sm fp-btn-secondary"
+            onClick={() => post({ type: 'cancelResponse' })}
+            title="Stop the current story build"
+          >
+            <IconX size={15} /> Stop
+          </button>
+        ) : (
+          <PlanActionButtons plan={plan} streaming={streaming} />
+        )}
       </span>
     </div>
   );

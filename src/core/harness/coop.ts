@@ -59,6 +59,12 @@ export interface RoleRunner {
     /** Inspector/Sentry get read-only tools; Scout too (it must not edit). */
     readOnly: boolean;
     signal?: AbortSignal;
+    /**
+     * Throttled live progress: an estimate of the role's streamed output tokens
+     * so far, so the pipeline can show a climbing count on the role's RUNNING
+     * gate card. Optional — omitted by fakes and callers that don't stream.
+     */
+    onProgress?: (estOutputTokens: number) => void;
   }): Promise<{ text: string; usage: TokenUsage }>;
 }
 
@@ -89,7 +95,11 @@ export interface CoopPipelineOptions {
    * through `inspector`. Returns the Builder's token usage so it is counted toward the
    * conversation totals (the Builder is usually the dominant cost in a Coop turn).
    */
-  buildStage: (instructions: string, signal?: AbortSignal) => Promise<TokenUsage>;
+  buildStage: (
+    instructions: string,
+    signal?: AbortSignal,
+    onProgress?: (estOutputTokens: number) => void,
+  ) => Promise<TokenUsage>;
   settings: HarnessSettings;
   /** Called on every card transition (create + each status change). */
   onGate: (card: GateCard) => void;
@@ -117,6 +127,7 @@ export type CoopOutcome =
   | 'qas-failed'
   | 'security-blocked'
   | 'context-exceeded'
+  | 'runaway'
   | 'cancelled';
 
 /** Detail behind a `context-exceeded` outcome, for the caller's user-facing message. */
@@ -140,6 +151,21 @@ export class ContextExceededError extends Error {
   constructor(public readonly info: ContextExceededInfo) {
     super('Context window exceeded');
     this.name = 'ContextExceededError';
+  }
+}
+
+/**
+ * Thrown from `buildStage` (via the extension) when the Builder's own call was
+ * halted by the client-side runaway failsafe — it streamed past the safety cap
+ * without stopping. The pipeline catches it, fails the in-flight Builder card
+ * with the runaway evidence, and returns the `runaway` outcome. Mirrors the
+ * {@link ContextExceededError} pattern so the harness stays decoupled from the
+ * agentic loop (the extension translates the loop-level error into this one).
+ */
+export class RunawayError extends Error {
+  constructor(public readonly info: { role: CoopRole; message: string }) {
+    super(info.message);
+    this.name = 'RunawayError';
   }
 }
 
@@ -184,6 +210,16 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
   const aborted = () => Boolean(signal?.aborted);
 
   /**
+   * Live progress on a still-RUNNING role card: re-emit it with a climbing
+   * output-token estimate so the user sees generation accumulating (the card
+   * renders `usage.outputTokens` as a ↓ count). No-op once the card has settled.
+   */
+  const bumpCard = (card: GateCard, estOutputTokens: number): void => {
+    if (card.status !== 'running' || estOutputTokens <= 0) return;
+    emit({ ...card, usage: { inputTokens: 0, outputTokens: estOutputTokens, cachedTokens: 0 } });
+  };
+
+  /**
    * Run a read-only review role (Inspector/Sentry) over the diff, splitting it
    * into budget-sized chunks when a budget is supplied and the diff overflows.
    * Each chunk is reviewed sequentially (abort-aware); the verdicts are then
@@ -196,6 +232,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
     system: string,
     buildPrompt: (chunk: string) => string,
     diff: string,
+    onProgress?: (estOutputTokens: number) => void,
   ): Promise<{ verdict: ParsedVerdict; usage: TokenUsage; note: string; aborted: boolean }> => {
     const budget = diffBudgetFor?.(role);
     const fit =
@@ -215,6 +252,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
         userPrompt: buildPrompt(fit.chunks[0] ?? diff),
         readOnly: true,
         signal,
+        onProgress,
       });
       spend(run.usage);
       const note = fit.truncated
@@ -236,7 +274,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
         };
       }
       const prompt = `(Reviewing part ${i + 1} of ${n} of the changeset — judge only what is present in this part.)\n\n${buildPrompt(fit.chunks[i])}`;
-      const run = await runner.run({ role, system, userPrompt: prompt, readOnly: true, signal });
+      const run = await runner.run({ role, system, userPrompt: prompt, readOnly: true, signal, onProgress });
       spend(run.usage);
       verdicts.push(parseVerdict(run.text));
     }
@@ -293,6 +331,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
     userPrompt: composeScoutPrompt(contextDigest, userPrompt),
     readOnly: true,
     signal,
+    onProgress: (t) => bumpCard(scoutCard, t),
   });
   addUsage(scoutRun.usage);
   if (aborted()) return cancel(scoutCard);
@@ -377,7 +416,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
 
     let builderUsage: TokenUsage;
     try {
-      builderUsage = await buildStage(instructions, signal);
+      builderUsage = await buildStage(instructions, signal, (t) => bumpCard(builderCard, t));
     } catch (err) {
       if (err instanceof ContextExceededError) {
         // Mark the in-flight Builder card, then emit the Context limit gate.
@@ -388,6 +427,18 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
           }),
         );
         return contextExceeded(err.info);
+      }
+      if (err instanceof RunawayError) {
+        // The Builder's own call ran away (server ignored max_tokens). Fail the
+        // in-flight card with the runaway evidence and end the pipeline; the
+        // outcome maps a story to `failed` so the human can retry from clean context.
+        emit(
+          transition(builderCard, 'failed', {
+            attempt,
+            evidence: joinSections(builderCard.evidence, section('Runaway generation halted', err.info.message)),
+          }),
+        );
+        return { outcome: 'runaway', cards, usage };
       }
       throw err;
     }
@@ -425,6 +476,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
       INSPECTOR_SYSTEM,
       (chunk) => composeInspectorPrompt(scout.criteria, chunk),
       diff,
+      (t) => bumpCard(inspectorCard, t),
     );
     addUsage(inspectorReview.usage);
     if (inspectorReview.aborted) return cancel(inspectorCard);
@@ -491,6 +543,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
     SENTRY_SYSTEM,
     (chunk) => composeSentryPrompt(chunk),
     inspector.unifiedDiff(),
+    (t) => bumpCard(sentryCard, t),
   );
   addUsage(sentryReview.usage);
   if (sentryReview.aborted) return cancel(sentryCard);

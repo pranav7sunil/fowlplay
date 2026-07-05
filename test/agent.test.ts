@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ProviderAdapter, WireMessage } from '../src/core/providers/adapter';
+import type { ChatRequest, ProviderAdapter, WireMessage } from '../src/core/providers/adapter';
 import { applyFindReplace } from '../src/core/agent/edits';
 import { gcHistory } from '../src/core/agent/contextGc';
-import { runAgentLoop } from '../src/core/agent/loop';
+import { runAgentLoop, RunawayGenerationError } from '../src/core/agent/loop';
 import { buildToolSpecs, dispatchToolCall, type ToolHost } from '../src/core/agent/tools';
 import type { StreamEvent } from '../src/shared/types';
 
@@ -315,6 +315,64 @@ describe('runAgentLoop', () => {
     expect(chatSpy).toHaveBeenCalledTimes(1);
     expect(result.wireHistory).toHaveLength(1);
     expect(result.blocks).toEqual([{ type: 'text', text: 'hi' }]);
+  });
+
+  it('forwards maxTokens to the adapter request', async () => {
+    // A recording adapter that captures the ChatRequest and returns a trivial turn.
+    let seen: ChatRequest | undefined;
+    const adapter: ProviderAdapter = {
+      async *chat(request: ChatRequest) {
+        seen = request;
+        yield { type: 'text', delta: 'ok' } as StreamEvent;
+        yield { type: 'done', stopReason: 'end' } as StreamEvent;
+      },
+    };
+    await runAgentLoop({
+      adapter,
+      baseUrl: 'http://x',
+      modelId: 'm',
+      maxTokens: 2048,
+      system: '',
+      history: [],
+      tools: [],
+      toolHost: makeHost({}),
+      onEvent: () => {},
+    });
+    expect(seen?.maxTokens).toBe(2048);
+  });
+
+  it('aborts and throws a distinct RunawayGenerationError past 1.5× the cap', async () => {
+    // A server that ignores max_tokens and streams unbounded text.
+    let aborted = false;
+    const adapter: ProviderAdapter = {
+      async *chat(request: ChatRequest) {
+        request.signal?.addEventListener('abort', () => {
+          aborted = true;
+        });
+        for (let i = 0; i < 10000; i += 1) {
+          yield { type: 'text', delta: 'x'.repeat(20) } as StreamEvent; // 20 chars = 5 tokens
+        }
+        yield { type: 'done', stopReason: 'end' } as StreamEvent;
+      },
+    };
+
+    // cap 200 → runaway limit floor(200 * 1.5) = 300 tokens (~1200 chars).
+    await expect(
+      runAgentLoop({
+        adapter,
+        baseUrl: 'http://x',
+        modelId: 'm',
+        maxTokens: 200,
+        system: '',
+        history: [{ role: 'user', content: [{ type: 'text', text: 'go' }] }],
+        tools: [],
+        toolHost: makeHost({}),
+        onEvent: () => {},
+      }),
+    ).rejects.toThrowError(RunawayGenerationError);
+
+    // The failsafe aborted the underlying call locally.
+    expect(aborted).toBe(true);
   });
 });
 

@@ -41,7 +41,7 @@ import type { Attachment, HostToWebview, WebviewToHost } from '../shared/protoco
 
 import { createAdapter as coreCreateAdapter, type ProviderAdapter, type WireAssistantPart, type WireMessage, type WireUserPart } from '../core/providers/adapter';
 import { fetchModels as coreFetchModels, type FetchModelsConfig } from '../core/providers/registry';
-import { runAgentLoop } from '../core/agent/loop';
+import { runAgentLoop, DEFAULT_MAX_OUTPUT_TOKENS, RunawayGenerationError } from '../core/agent/loop';
 import { buildToolSpecs, type DirEntry, type GrepMatch, type GrepOptions, type StageOp, type ToolHost } from '../core/agent/tools';
 import { BUNDLED_SKILLS, formatSkillCatalog, parseSkill } from '../core/agent/skills';
 import { gcHistory } from '../core/agent/contextGc';
@@ -53,6 +53,7 @@ import { detectDrift, rebase as coreRebase } from '../core/staging/rebase';
 import { renderHunkDiff } from '../core/diff/compute';
 import {
   ContextExceededError,
+  RunawayError,
   runCoopPipeline,
   type ChangesetInspector,
   type CoopResult,
@@ -740,11 +741,11 @@ export class SessionCore {
     let usage: TokenUsage = emptyUsage();
     try {
       if (opts.prd) {
-        const out = await this.runPrd(userText, imageParts, baseWire, resolved, settings.harness, signal, contextDigest);
+        const out = await this.runPrd(userText, imageParts, resolved, settings.harness, signal, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else if (opts.storyIndex !== undefined) {
-        const out = await this.runStory(opts.storyIndex, baseWire, resolved, settings.harness, signal, contextDigest);
+        const out = await this.runStory(opts.storyIndex, resolved, settings.harness, signal, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else if (this.conv.harnessMode === 'coop') {
@@ -815,6 +816,7 @@ export class SessionCore {
       baseUrl: resolved.baseUrl,
       apiKey: resolved.apiKey,
       modelId: resolved.modelId,
+      maxTokens: this.maxTokensFor(settings),
       system: this.systemWithSkills(SOLO_SYSTEM),
       history: sent,
       tools: this.toolsWithSkills(),
@@ -865,7 +867,7 @@ export class SessionCore {
   ): Promise<CoopResult> {
     const settings = await this.ensureSettings();
     const runner: RoleRunner = {
-      run: async ({ role, system, userPrompt: rolePrompt, readOnly, signal: s }) => {
+      run: async ({ role, system, userPrompt: rolePrompt, readOnly, signal: s, onProgress }) => {
         // Each role resolves its own model through the override chain, falling
         // back to the turn's conversation model.
         const rm = (await this.resolveModel(role)) ?? resolved;
@@ -874,11 +876,14 @@ export class SessionCore {
           baseUrl: rm.baseUrl,
           apiKey: rm.apiKey,
           modelId: rm.modelId,
+          maxTokens: this.maxTokensFor(settings, role),
           system,
           history: [{ role: 'user', content: [{ type: 'text', text: rolePrompt }] }],
           tools: readOnly ? this.readOnlyTools : this.allTools,
           toolHost: this.toolHost(),
-          onEvent: () => {}, // role calls are summarized as gate cards, not streamed
+          // Role calls aren't streamed to the transcript, but we tally their
+          // output so the RUNNING gate card shows a climbing token count.
+          onEvent: this.progressOnEvent(() => {}, onProgress),
           maxRounds: 8,
           signal: s,
         });
@@ -894,7 +899,11 @@ export class SessionCore {
       },
     };
 
-    const buildStage = async (instructions: string, s?: AbortSignal): Promise<TokenUsage> => {
+    const buildStage = async (
+      instructions: string,
+      s?: AbortSignal,
+      onProgress?: (estOutputTokens: number) => void,
+    ): Promise<TokenUsage> => {
       // The Builder stage uses the `builder` role's resolution.
       const rm = (await this.resolveModel('builder')) ?? resolved;
       const base: WireMessage[] = [
@@ -922,18 +931,29 @@ export class SessionCore {
         }
       }
 
-      const res = await runAgentLoop({
-        adapter: rm.adapter,
-        baseUrl: rm.baseUrl,
-        apiKey: rm.apiKey,
-        modelId: rm.modelId,
-        system: this.systemWithSkills(SOLO_SYSTEM),
-        history,
-        tools: this.toolsWithSkills(),
-        toolHost: this.toolHost(),
-        onEvent: (e) => this.deps.post({ type: 'stream', event: e }),
-        signal: s,
-      });
+      let res;
+      try {
+        res = await runAgentLoop({
+          adapter: rm.adapter,
+          baseUrl: rm.baseUrl,
+          apiKey: rm.apiKey,
+          modelId: rm.modelId,
+          maxTokens: this.maxTokensFor(settings, 'builder'),
+          system: this.systemWithSkills(SOLO_SYSTEM),
+          history,
+          tools: this.toolsWithSkills(),
+          toolHost: this.toolHost(),
+          onEvent: this.progressOnEvent((e) => this.deps.post({ type: 'stream', event: e }), onProgress),
+          signal: s,
+        });
+      } catch (err) {
+        // Translate the loop-level runaway into the harness's RunawayError so the
+        // pipeline (which stays decoupled from the loop) can fail the Builder card.
+        if (err instanceof RunawayGenerationError) {
+          throw new RunawayError({ role: 'builder', message: err.message });
+        }
+        throw err;
+      }
       // Return the Builder's usage so the pipeline counts it — it is usually the
       // dominant cost of a Coop turn.
       return res.usage;
@@ -967,6 +987,8 @@ export class SessionCore {
         return 'Sentry flagged a security concern. The changes remain staged — review carefully before applying.';
       case 'context-exceeded':
         return contextExceededMessage(result.context?.modelLabel ?? 'the selected model', result.context?.windowTokens);
+      case 'runaway':
+        return 'Generation ran away and was halted before it exhausted the context window. The changes (if any) remain staged — retry the step, and consider a larger context window or a different model.';
       case 'cancelled':
         return 'Cancelled.';
       case 'ready-for-review':
@@ -987,7 +1009,6 @@ export class SessionCore {
   private async runPrd(
     userText: string,
     imageParts: WireUserPart[],
-    baseWire: WireMessage[],
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
@@ -1023,6 +1044,7 @@ export class SessionCore {
       baseUrl: rm.baseUrl,
       apiKey: rm.apiKey,
       modelId: rm.modelId,
+      maxTokens: this.maxTokensFor(settings, 'scout'),
       system: FOREMAN_SYSTEM,
       history: [{ role: 'user', content: [{ type: 'text', text: composeForemanPrompt(contextDigest, userText) }, ...imageParts] }],
       tools: this.readOnlyTools,
@@ -1079,7 +1101,7 @@ export class SessionCore {
     );
 
     // --- Build story 1 immediately, within this same turn ---
-    const story1 = await this.runStory(0, baseWire, resolved, harness, signal, contextDigest);
+    const story1 = await this.runStory(0, resolved, harness, signal, contextDigest);
     addUsageInPlace(usage, story1.usage);
 
     // Blocks: Foreman gate, the plan marker (renders live), then story 1's cards + outcome.
@@ -1093,7 +1115,6 @@ export class SessionCore {
    */
   private async runStory(
     storyIndex: number,
-    baseWire: WireMessage[],
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
@@ -1112,8 +1133,13 @@ export class SessionCore {
     const specMarkdown = renderSpecMarkdown(this.conv.prdPlan!.stories[storyIndex], storyIndex + 1, total);
     const userPrompt = composeStoryPrompt(specMarkdown, storyIndex + 1, total);
 
+    // Stories run from the spec alone — NOT the conversation's wire history. The
+    // spec prompt is self-contained (and tells the Builder that earlier stories
+    // are already on disk to read), so each story gets a fresh window and a
+    // "Retry story" is mechanically a clean-context restart. The Scout still
+    // receives the cheap contextDigest for user clarifications.
     const cards: GateCard[] = [];
-    const result = await this.runCoopCore(userPrompt, [], baseWire, resolved, harness, signal, cards, contextDigest);
+    const result = await this.runCoopCore(userPrompt, [], [], resolved, harness, signal, cards, contextDigest);
 
     const status: PrdStory['status'] =
       result.outcome === 'ready-for-review' ? 'awaiting-review' : result.outcome === 'cancelled' ? 'pending' : 'failed';
@@ -1813,16 +1839,64 @@ export class SessionCore {
   }
 
   /**
-   * The payload token budget for a role's model: the context window minus a
-   * reserve for the system prompt, instructions, and response headroom
-   * (`max(1500, 25% of window)`). Returns `undefined` when the window is unknown
-   * — no hard budget, preserving today's behavior for such providers.
+   * The response token reserve for a role's model: `max(1500, 25% of window)`.
+   * This is both the headroom kept out of the payload budget AND the `max_tokens`
+   * a single response is capped at. Returns `undefined` when the window is unknown
+   * (the caller falls back to {@link DEFAULT_MAX_OUTPUT_TOKENS} for the cap).
+   */
+  private responseCapFor(settings: FowlPlaySettings, role?: CoopRole): number | undefined {
+    const window = this.roleWindow(settings, role);
+    if (window === undefined) return undefined;
+    return Math.max(1500, Math.floor(window * 0.25));
+  }
+
+  /**
+   * The `max_tokens` to send for a role's model call: the response reserve, or a
+   * generous fixed default when the window is unknown — never unlimited, so a
+   * single response can't exhaust the window (e.g. LM Studio's default).
+   */
+  private maxTokensFor(settings: FowlPlaySettings, role?: CoopRole): number {
+    return this.responseCapFor(settings, role) ?? DEFAULT_MAX_OUTPUT_TOKENS;
+  }
+
+  /**
+   * The payload token budget for a role's model: the context window minus the
+   * response reserve. Returns `undefined` when the window is unknown — no hard
+   * budget, preserving today's behavior for such providers.
    */
   private payloadBudget(settings: FowlPlaySettings, role?: CoopRole): number | undefined {
     const window = this.roleWindow(settings, role);
     if (window === undefined) return undefined;
-    const reserve = Math.max(1500, Math.floor(window * 0.25));
+    const reserve = this.responseCapFor(settings, role)!;
     return Math.max(0, window - reserve);
+  }
+
+  /**
+   * Wrap a base `onEvent` so it tallies streamed text+thinking and reports a
+   * throttled (~1.5s, only when it grew) estimate of output tokens via
+   * `onProgress` — used to show a climbing token count on a running gate card.
+   * Returns the base handler unchanged when no progress sink is supplied.
+   */
+  private progressOnEvent(
+    base: (e: StreamEvent) => void,
+    onProgress?: (estOutputTokens: number) => void,
+  ): (e: StreamEvent) => void {
+    if (!onProgress) return base;
+    let chars = 0;
+    let lastReport = 0;
+    let lastValue = -1;
+    return (e: StreamEvent) => {
+      base(e);
+      if (e.type !== 'text' && e.type !== 'thinking') return;
+      chars += e.delta.length;
+      const est = Math.ceil(chars / 4); // matches estimateTokens(chars-of-text)
+      const now = this.clock();
+      if (now - lastReport >= 1500 && est !== lastValue) {
+        lastReport = now;
+        lastValue = est;
+        onProgress(est);
+      }
+    };
   }
 
   /** Display label for an explicit ModelRef (used in mention confirmations). */
