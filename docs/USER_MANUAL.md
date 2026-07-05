@@ -398,6 +398,14 @@ underneath your staged edits. Click **Rebase** to merge onto the new state.
 work), or switch to a stronger model mid-conversation from the status line — your
 conversation and staged edits carry over.
 
+**Stray tokens like `<|channel|>` or `<think>` in a reply.** These are chat-template control
+markers leaking into the response because the local server is using a wrong or missing chat
+template for the model (common with community GGUF/QAT builds on LM Studio and llama.cpp).
+FowlPlay auto-cleans them: recognized markers are stripped and reasoning-channel text is
+folded into the collapsible thinking block. For the best results, still fix the server side —
+select the model's correct prompt template (or update to a build that ships one) so reasoning
+is delivered on its own channel.
+
 ---
 
 <div align="center">

@@ -192,6 +192,63 @@ describe('OpenAiCompletionsAdapter', () => {
     expect(asst.tool_calls).toBeUndefined();
   });
 
+  it('sanitizes leaked channel markers in content into ordered thinking + text events', async () => {
+    // A misconfigured local server leaks Harmony channel markers into `content`.
+    // The adapter routes them through the StreamSanitizer: reasoning-channel text
+    // becomes 'thinking', markers are stripped, and visible text stays 'text'.
+    const chunks = [
+      'data: {"choices":[{"delta":{"content":"Here goes <|channel|>"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"analysis let me think"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"<|end|>the answer is 42"}}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(chunks)));
+    const adapter = createAdapter('openai-completions');
+    const events = await collect(adapter.chat({ ...baseReq, baseUrl: 'http://x/v1' }));
+
+    const text = events
+      .filter((e) => e.type === 'text')
+      .map((e) => (e as { delta: string }).delta)
+      .join('');
+    const thinking = events
+      .filter((e) => e.type === 'thinking')
+      .map((e) => (e as { delta: string }).delta)
+      .join('');
+
+    expect(text).toBe('Here goes the answer is 42');
+    expect(thinking).toBe(' let me think');
+    // No raw marker text survives into any emitted delta.
+    expect(text + thinking).not.toContain('<|');
+
+    // Ordering: the thinking event sits between the two text events.
+    const kinds = events.filter((e) => e.type === 'text' || e.type === 'thinking').map((e) => e.type);
+    expect(kinds).toEqual(['text', 'thinking', 'text']);
+    expect(events.at(-1)).toEqual({ type: 'done', stopReason: 'end' });
+  });
+
+  it('leaves reasoning_content mapping to thinking (bypasses the sanitizer)', async () => {
+    // The separate reasoning_content channel is already clean and keeps mapping
+    // to 'thinking' verbatim, even when it contains marker-looking text.
+    const chunks = [
+      'data: {"choices":[{"delta":{"reasoning_content":"pondering <|not touched|>"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"visible"}}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ];
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(chunks)));
+    const adapter = createAdapter('openai-completions');
+    const events = await collect(adapter.chat({ ...baseReq, baseUrl: 'http://x/v1' }));
+
+    expect(events.find((e) => e.type === 'thinking')).toEqual({
+      type: 'thinking',
+      delta: 'pondering <|not touched|>',
+    });
+    expect(
+      events.filter((e) => e.type === 'text').map((e) => (e as { delta: string }).delta).join(''),
+    ).toBe('visible');
+  });
+
   it('emits an error event with a body snippet on non-2xx', async () => {
     vi.stubGlobal(
       'fetch',
