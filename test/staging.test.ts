@@ -201,7 +201,8 @@ describe('rebase / drift detection', () => {
     await o.stageModify('a.ts', 'a\nB\nc');
     disk.files['a.ts'] = 'a\nb\nc\nd'; // appended after the edited region
     const res = await rebase(o, disk);
-    expect(res.ok).toBe(true);
+    expect(res.conflictedPaths).toHaveLength(0);
+    expect(res.rebasedPaths).toContain('a.ts');
     expect(res.merged['a.ts']).toBe('a\nB\nc\nd');
     // Overlay restaged against the new disk base.
     expect(o.ops()[0]).toMatchObject({ kind: 'modify', base: 'a\nb\nc\nd', staged: 'a\nB\nc\nd' });
@@ -213,7 +214,7 @@ describe('rebase / drift detection', () => {
     await o.stageModify('a.ts', 'a\nB\nc');
     disk.files['a.ts'] = 'header1\nheader2\na\nb\nc'; // shifted by 2 lines
     const res = await rebase(o, disk);
-    expect(res.ok).toBe(true);
+    expect(res.conflictedPaths).toHaveLength(0);
     expect(res.merged['a.ts']).toBe('header1\nheader2\na\nB\nc');
   });
 
@@ -223,8 +224,8 @@ describe('rebase / drift detection', () => {
     await o.stageModify('a.ts', 'a\nB\nc');
     disk.files['a.ts'] = 'totally\ndifferent\nfile\nbody'; // context gone
     const res = await rebase(o, disk);
-    expect(res.ok).toBe(false);
     expect(res.conflictedPaths).toContain('a.ts');
+    expect(res.rebasedPaths).not.toContain('a.ts');
   });
 
   it('R1: conflicts (not false-clean) when context is destroyed but a stray copy of the removed line survives', async () => {
@@ -237,7 +238,6 @@ describe('rebase / drift detection', () => {
     disk.files['a.ts'] = 'TARGET\nP\nQ\nR';
     const res = await rebase(o, disk);
     // Must be a conflict — must NOT silently rewrite the unrelated top line.
-    expect(res.ok).toBe(false);
     expect(res.conflictedPaths).toContain('a.ts');
     expect(res.merged['a.ts']).toBeUndefined();
   });
@@ -249,8 +249,41 @@ describe('rebase / drift detection', () => {
     // Unrelated lines prepended; the edit's real context (A/B/C/D) survives.
     disk.files['a.ts'] = 'H1\nH2\nA\nB\nTARGET\nC\nD';
     const res = await rebase(o, disk);
-    expect(res.ok).toBe(true);
+    expect(res.conflictedPaths).toHaveLength(0);
     expect(res.merged['a.ts']).toBe('H1\nH2\nA\nB\nCHANGED\nC\nD');
+  });
+
+  it('a staged create conflicts once the file appears on disk (model-merge path)', async () => {
+    const disk = new MockDisk();
+    const o = new StagingOverlay(disk);
+    await o.stageCreate('new.ts', 'staged content');
+    expect((await detectDrift(o, disk)).needed).toBe(false);
+    disk.files['new.ts'] = 'someone else created this'; // file appeared
+    const res = await rebase(o, disk);
+    // A create-onto-existing cannot be merged mechanically — it is a conflict for
+    // the caller to route to the model; the overlay op is left untouched.
+    expect(res.conflictedPaths).toContain('new.ts');
+    expect(res.rebasedPaths).toHaveLength(0);
+    expect(res.changedDeletes).toHaveLength(0);
+    expect(o.ops()[0]).toMatchObject({ kind: 'create', path: 'new.ts', staged: 'staged content' });
+  });
+
+  it('a staged delete of a changed file stays a delete, re-based onto new disk', async () => {
+    const disk = new MockDisk({ 'a.ts': 'original' });
+    const o = new StagingOverlay(disk);
+    await o.stageDelete('a.ts');
+    expect((await detectDrift(o, disk)).needed).toBe(false);
+    disk.files['a.ts'] = 'changed externally'; // the file we meant to delete changed
+    const res = await rebase(o, disk);
+    // Deleting a changed file is still a delete — kept as a delete, base re-based,
+    // reported as a changed-delete (NOT a model conflict).
+    expect(res.changedDeletes).toContain('a.ts');
+    expect(res.conflictedPaths).toHaveLength(0);
+    expect(o.ops()[0]).toEqual({ kind: 'delete', path: 'a.ts', base: 'changed externally' });
+    // The drift is cleared: the delete now bases on current disk.
+    expect((await detectDrift(o, disk)).needed).toBe(false);
+    // read still reflects the delete intent.
+    expect(await o.read('a.ts')).toBeNull();
   });
 });
 

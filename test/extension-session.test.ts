@@ -2251,3 +2251,241 @@ describe('deterministic file references in prompts', () => {
     expect(posted.some((m) => m.type === 'toast' && m.level === 'info' && m.message.startsWith('Included'))).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Rebase button — every conflict path ends in a visible outcome (never silent)
+// ---------------------------------------------------------------------------
+
+/** One edit spec turned into a single-tool-call build turn. */
+type RebaseEdit = { path: string; find?: string; replace?: string; create?: string; delete?: boolean };
+
+/**
+ * Adapter that stages `edit` on a build turn, finishes once tool results arrive,
+ * and — on a conflict-merge call (the "You merge code" system prompt) — returns
+ * `mergeReply` (a string, or a function so a test can vary/throw). This exercises
+ * the model-assisted conflict resolution deterministically.
+ */
+function rebaseAdapter(edit: RebaseEdit, mergeReply: string | (() => string)): ProviderAdapter {
+  return {
+    chat(req: ChatRequest) {
+      let events: StreamEvent[];
+      if (req.system.includes('You merge code')) {
+        const t = typeof mergeReply === 'function' ? mergeReply() : mergeReply;
+        events = [{ type: 'text', delta: t }, { type: 'done', stopReason: 'end' }];
+      } else {
+        const hasToolResult = req.messages.some((m) => m.role === 'tool');
+        events = hasToolResult
+          ? textEvents('done')
+          : [
+              { type: 'tool_call_start', id: 't1', name: 'edit_files' },
+              { type: 'tool_call_args', id: 't1', delta: JSON.stringify({ edits: [edit] }) },
+              { type: 'tool_call_end', id: 't1' },
+              USAGE,
+              { type: 'done', stopReason: 'tool_use' },
+            ];
+      }
+      return (async function* () {
+        for (const e of events) yield e;
+      })();
+    },
+  };
+}
+
+function makeRebaseSession(edit: RebaseEdit, opts: { mergeReply?: string | (() => string); noModel?: boolean } = {}) {
+  const io = new FakeIo();
+  const posted: HostToWebview[] = [];
+  const adapter = rebaseAdapter(edit, opts.mergeReply ?? '');
+  const settings = new FakeSettings('solo');
+  const deps: SessionDeps = {
+    io,
+    secrets: new FakeSecrets(),
+    settings,
+    history: new FakeHistory(),
+    git: fakeGit,
+    post: (m) => posted.push(m),
+    createAdapter: () => adapter,
+    fetchModels: async () => [{ id: 'm1' }],
+    clock: () => Date.now(),
+  };
+  const session = createSessionCore(deps);
+  // A helper to strip the model AFTER staging (so the turn can still run first):
+  // clearing providers makes the conversation model unresolvable.
+  const dropModel = () => {
+    settings.providers = [];
+  };
+  return { session, posted, io, settings, dropModel };
+}
+
+const lastRebaseState = (posted: HostToWebview[]) =>
+  [...posted].reverse().find((m): m is Extract<HostToWebview, { type: 'rebaseState' }> => m.type === 'rebaseState');
+const rebaseToasts = (posted: HostToWebview[]) =>
+  posted.filter((m): m is Extract<HostToWebview, { type: 'toast' }> => m.type === 'toast');
+
+describe('rebase button — happy path', () => {
+  it('cleanly rebases a drifted modify, clears the banner, re-posts the changeset, and toasts success', async () => {
+    const { session, posted, io } = makeRebaseSession({ path: 'foo.txt', find: 'b', replace: 'B' });
+    io.files.set('foo.txt', 'a\nb\nc\n');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'edit foo' });
+
+    // Drift: an unrelated trailing line appears on disk after staging.
+    io.files.set('foo.txt', 'a\nb\nc\nd\n');
+    await session.handle({ type: 'applyToDisk' }); // drift path posts rebaseState needed
+    expect(lastRebaseState(posted)!.state.needed).toBe(true);
+
+    const before = posted.length;
+    await session.handle({ type: 'rebase' });
+
+    // Banner cleared, changeset re-posted, and a visible success toast.
+    expect(lastRebaseState(posted)!.state.needed).toBe(false);
+    expect(posted.slice(before).some((m) => m.type === 'changeset')).toBe(true);
+    const t = rebaseToasts(posted.slice(before));
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ level: 'info' });
+    expect(t[0].message).toMatch(/Rebased 1 file/);
+
+    // Applying now writes the merged content (staged edit replayed onto new disk).
+    await session.handle({ type: 'applyToDisk' });
+    expect(io.files.get('foo.txt')).toBe('a\nB\nc\nd\n');
+  });
+});
+
+describe('rebase button — staged DELETE of a changed file', () => {
+  it('keeps the delete (does NOT resurrect the file), clears the banner, and names the changed file', async () => {
+    const { session, posted, io } = makeRebaseSession({ path: 'foo.txt', delete: true }, { mergeReply: 'a\nMERGED\nc\n' });
+    io.files.set('foo.txt', 'a\nb\nc\n');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'delete foo' });
+
+    io.files.set('foo.txt', 'a\nCHANGED\nc\n'); // the file we meant to delete changed
+    await session.handle({ type: 'applyToDisk' });
+    const before = posted.length;
+    await session.handle({ type: 'rebase' });
+
+    expect(lastRebaseState(posted)!.state.needed).toBe(false);
+    const t = rebaseToasts(posted.slice(before));
+    expect(t).toHaveLength(1);
+    expect(t[0].message).toMatch(/will still be deleted: foo\.txt/);
+
+    // Applying honors the DELETE — the file is removed, NOT rewritten with model output.
+    await session.handle({ type: 'applyToDisk' });
+    expect(io.files.has('foo.txt')).toBe(false);
+  });
+
+  it('is not a silent no-op even when a model is present and returns empty', async () => {
+    const { session, posted, io } = makeRebaseSession({ path: 'foo.txt', delete: true }, { mergeReply: '' });
+    io.files.set('foo.txt', 'a\nb\nc\n');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'delete foo' });
+
+    io.files.set('foo.txt', 'a\nCHANGED\nc\n');
+    await session.handle({ type: 'applyToDisk' });
+    const before = posted.length;
+    await session.handle({ type: 'rebase' });
+
+    // The delete never routes to the model, so an empty reply is irrelevant: the
+    // banner clears and a toast fires.
+    expect(lastRebaseState(posted)!.state.needed).toBe(false);
+    expect(rebaseToasts(posted.slice(before))).toHaveLength(1);
+    await session.handle({ type: 'applyToDisk' });
+    expect(io.files.has('foo.txt')).toBe(false);
+  });
+});
+
+describe('rebase button — staged CREATE whose path appeared on disk', () => {
+  it('model merge succeeds: banner clears, applies merged content, toasts auto-merge with the model', async () => {
+    const { session, posted, io } = makeRebaseSession({ path: 'new.txt', create: 'created\n' }, { mergeReply: 'merged-create\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'create new' });
+
+    io.files.set('new.txt', 'appeared\n'); // the file now exists → create conflict
+    await session.handle({ type: 'applyToDisk' });
+    const before = posted.length;
+    await session.handle({ type: 'rebase' });
+
+    expect(lastRebaseState(posted)!.state.needed).toBe(false);
+    const t = rebaseToasts(posted.slice(before));
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ level: 'info' });
+    expect(t[0].message).toMatch(/auto-merged with m1/);
+
+    await session.handle({ type: 'applyToDisk' });
+    expect(io.files.get('new.txt')).toBe('merged-create');
+  });
+
+  it('model returns empty: keeps the conflict, banner persists, and warns with the path', async () => {
+    const { session, posted, io } = makeRebaseSession({ path: 'new.txt', create: 'created\n' }, { mergeReply: '' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'create new' });
+
+    io.files.set('new.txt', 'appeared\n');
+    await session.handle({ type: 'applyToDisk' });
+    const before = posted.length;
+    await session.handle({ type: 'rebase' });
+
+    expect(lastRebaseState(posted)!.state.needed).toBe(true);
+    const t = rebaseToasts(posted.slice(before));
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ level: 'warn' });
+    expect(t[0].message).toMatch(/could not be resolved: new\.txt/);
+  });
+
+  it('no model configured: keeps the conflict, banner persists, and warns', async () => {
+    const { session, posted, io, dropModel } = makeRebaseSession({ path: 'new.txt', create: 'created\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'create new' });
+
+    io.files.set('new.txt', 'appeared\n');
+    await session.handle({ type: 'applyToDisk' });
+    dropModel(); // remove the provider so resolveConflictsWithModel finds no model
+    const before = posted.length;
+    await session.handle({ type: 'rebase' });
+
+    expect(lastRebaseState(posted)!.state.needed).toBe(true);
+    const t = rebaseToasts(posted.slice(before));
+    expect(t.some((x) => x.level === 'warn' && /could not be resolved: new\.txt/.test(x.message))).toBe(true);
+  });
+});
+
+describe('rebase button — drifted MODIFY whose hunks cannot apply', () => {
+  it('model merge succeeds: banner clears and toasts auto-merge', async () => {
+    const { session, posted, io } = makeRebaseSession(
+      { path: 'foo.txt', find: 'TARGET', replace: 'CHANGED' },
+      { mergeReply: 'A\nB\nresolved\n' },
+    );
+    io.files.set('foo.txt', 'A\nB\nTARGET\nC\nD\n');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'edit foo' });
+
+    io.files.set('foo.txt', 'totally\ndifferent\nbody\n'); // context gone → conflict
+    await session.handle({ type: 'applyToDisk' });
+    const before = posted.length;
+    await session.handle({ type: 'rebase' });
+
+    expect(lastRebaseState(posted)!.state.needed).toBe(false);
+    expect(rebaseToasts(posted.slice(before))[0].message).toMatch(/auto-merged with m1/);
+    await session.handle({ type: 'applyToDisk' });
+    expect(io.files.get('foo.txt')).toBe('A\nB\nresolved'); // stripFences trims trailing newline
+  });
+
+  it('model returns empty: not silent — banner persists with a warn toast naming the file', async () => {
+    const { session, posted, io } = makeRebaseSession(
+      { path: 'foo.txt', find: 'TARGET', replace: 'CHANGED' },
+      { mergeReply: '   ' },
+    );
+    io.files.set('foo.txt', 'A\nB\nTARGET\nC\nD\n');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'edit foo' });
+
+    io.files.set('foo.txt', 'totally\ndifferent\nbody\n');
+    await session.handle({ type: 'applyToDisk' });
+    const before = posted.length;
+    await session.handle({ type: 'rebase' });
+
+    expect(lastRebaseState(posted)!.state.needed).toBe(true);
+    const t = rebaseToasts(posted.slice(before));
+    expect(t).toHaveLength(1);
+    expect(t[0]).toMatchObject({ level: 'warn' });
+    expect(t[0].message).toMatch(/could not be resolved: foo\.txt/);
+  });
+});
