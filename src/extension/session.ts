@@ -1554,33 +1554,92 @@ export class SessionCore {
     }
   }
 
+  /**
+   * Reconcile staged edits with drifted disk content. Every invocation ends in a
+   * VISIBLE outcome — a success / partial / failure toast — in addition to always
+   * re-posting the rebase banner state and the refreshed changeset. The banner
+   * disappearing is never the only signal.
+   */
   private async onRebase(): Promise<void> {
     const result = await coreRebase(this.overlay, this.deps.io);
+
+    let merge: { resolved: string[]; unresolved: string[]; modelLabel?: string } = { resolved: [], unresolved: [] };
     if (result.conflictedPaths.length > 0) {
-      await this.resolveConflictsWithModel(result.conflictedPaths);
+      merge = await this.resolveConflictsWithModel(result.conflictedPaths);
     }
+
     this.changeset = new ChangeSet(this.overlay, 'changeset');
     const drift = await detectDrift(this.overlay, this.deps.io);
     this.deps.post({ type: 'rebaseState', state: drift });
     this.sendChangeset();
+
+    this.reportRebaseOutcome(result, merge);
   }
 
-  /** Best-effort model-assisted merge for files the 3-way rebase could not merge. */
-  private async resolveConflictsWithModel(paths: string[]): Promise<void> {
-    const resolved = await this.resolveModel();
-    if (!resolved) {
-      this.toast('warn', `Could not auto-merge ${paths.length} file(s); no model available to resolve conflicts.`);
+  /** Turn a rebase pass into a single, human-legible toast (never silent). */
+  private reportRebaseOutcome(
+    result: { rebasedPaths: string[]; changedDeletes: string[] },
+    merge: { resolved: string[]; unresolved: string[]; modelLabel?: string },
+  ): void {
+    const parts: string[] = [];
+    const mechanical = result.rebasedPaths.length + result.changedDeletes.length;
+    if (mechanical > 0) parts.push(`Rebased ${mechanical} file(s)`);
+    if (merge.resolved.length > 0) {
+      const via = merge.modelLabel ? ` with ${merge.modelLabel}` : '';
+      parts.push(`${merge.resolved.length} conflict(s) auto-merged${via}`);
+    }
+    if (result.changedDeletes.length > 0) {
+      parts.push(`${result.changedDeletes.length} changed file(s) will still be deleted: ${result.changedDeletes.join(', ')}`);
+    }
+
+    if (merge.unresolved.length > 0) {
+      // At least one file is still in conflict — the banner persists. Say so, and
+      // name the files so the human can edit them or discard the change.
+      const prefix = parts.length > 0 ? `${parts.join('; ')}. ` : '';
+      this.toast(
+        'warn',
+        `${prefix}${merge.unresolved.length} conflict(s) could not be resolved: ${merge.unresolved.join(', ')} — edit the files or discard the change.`,
+      );
       return;
     }
+
+    if (parts.length === 0) {
+      // Nothing drifted (or nothing to do) — reassure rather than stay silent.
+      this.toast('info', 'Nothing to rebase — the staged edits are already up to date.');
+      return;
+    }
+    this.toast('info', `${parts.join('; ')}.`);
+  }
+
+  /**
+   * Model-assisted merge for files the 3-way rebase could not reconcile: a staged
+   * create whose path has since appeared on disk, or a drifted modify whose hunks
+   * no longer locate. Both become a `modify` against current disk (a create can
+   * never clear drift as a create — the file already exists). Deletes are NOT
+   * routed here; they are re-based as deletes in the core. Returns which paths were
+   * resolved vs left in conflict so the caller can report a precise outcome.
+   */
+  private async resolveConflictsWithModel(
+    paths: string[],
+  ): Promise<{ resolved: string[]; unresolved: string[]; modelLabel?: string }> {
+    const model = await this.resolveModel();
+    if (!model) {
+      // No model to merge with — every conflict is left for the human.
+      return { resolved: [], unresolved: [...paths] };
+    }
+    const settings = await this.ensureSettings();
+    const modelLabel = this.roleModelLabel(settings);
+    const resolved: string[] = [];
+    const unresolved: string[] = [];
     for (const path of paths) {
       const current = (await this.deps.io.read(path)) ?? '';
       const staged = (await this.overlay.read(path)) ?? '';
       try {
         const controller = new AbortController();
-        const stream = resolved.adapter.chat({
-          baseUrl: resolved.baseUrl,
-          apiKey: resolved.apiKey,
-          modelId: resolved.modelId,
+        const stream = model.adapter.chat({
+          baseUrl: model.baseUrl,
+          apiKey: model.apiKey,
+          modelId: model.modelId,
           system: 'You merge code. Given the current on-disk file and an intended edited version, produce a single merged file that preserves the intended change on top of the current content. Reply with ONLY the full merged file contents, no fences, no commentary.',
           messages: [
             {
@@ -1598,11 +1657,15 @@ export class SessionCore {
         const merged = stripFences(text);
         if (merged.trim()) {
           this.overlay.setOp({ kind: 'modify', path, base: current, staged: merged });
+          resolved.push(path);
+        } else {
+          unresolved.push(path); // empty response — leave the conflict for the human
         }
       } catch {
-        /* leave the conflict for the human */
+        unresolved.push(path); // merge call failed — leave the conflict for the human
       }
     }
+    return { resolved, unresolved, modelLabel };
   }
 
   // -------------------------------------------------------------------------

@@ -29,14 +29,36 @@ export async function detectDrift(overlay: StagingOverlay, disk: DiskReader): Pr
   return { needed: drifted.length > 0, conflictedPaths: drifted };
 }
 
+/** Outcome of a rebase pass, split by how each drifted file was reconciled. */
+export interface RebaseResult {
+  /** Drifted modifies whose base->staged hunks cleanly replayed onto new disk. */
+  rebasedPaths: string[];
+  /**
+   * Staged deletes whose target changed on disk. The delete intent is kept
+   * (deleting a changed file is still a delete) and its base is re-based to the
+   * new disk content, so the drift clears. Surfaced so the human knows the file
+   * changed before it is deleted.
+   */
+  changedDeletes: string[];
+  /**
+   * Files that could not be reconciled mechanically and need a model-assisted
+   * merge: a staged create whose path has since appeared on disk, or a drifted
+   * modify whose hunks no longer locate cleanly.
+   */
+  conflictedPaths: string[];
+  /** Merged content by path for the cleanly-rebased modifies (for callers/tests). */
+  merged: Record<string, string>;
+}
+
 /**
- * 3-way rebase. Cleanly-mergeable drifted files are restaged against the new
- * disk content as their base; unmergeable ones are returned as conflicts.
+ * 3-way rebase. Cleanly-mergeable drifted modifies are restaged against the new
+ * disk content as their base; staged deletes of a changed file are kept as
+ * deletes (re-based); creates-onto-existing and unmergeable modifies are returned
+ * as conflicts for the caller to route to the model.
  */
-export async function rebase(
-  overlay: StagingOverlay,
-  disk: DiskReader,
-): Promise<{ ok: boolean; conflictedPaths: string[]; merged: Record<string, string> }> {
+export async function rebase(overlay: StagingOverlay, disk: DiskReader): Promise<RebaseResult> {
+  const rebasedPaths: string[] = [];
+  const changedDeletes: string[] = [];
   const conflictedPaths: string[] = [];
   const merged: Record<string, string> = {};
 
@@ -52,8 +74,11 @@ export async function rebase(
     if (currentContent === op.base) continue; // no drift for this file
 
     if (op.kind === 'delete') {
-      // The file we intended to delete changed externally — surface for review.
-      conflictedPaths.push(op.path);
+      // The file we intended to delete changed externally. Deleting a changed
+      // file is still a delete: keep the intent and re-base onto the new disk
+      // content so the drift clears; surface it so the human is not surprised.
+      overlay.setOp({ kind: 'delete', path: op.path, base: currentContent });
+      changedDeletes.push(op.path);
       continue;
     }
 
@@ -65,10 +90,11 @@ export async function rebase(
       continue;
     }
     merged[op.path] = result;
+    rebasedPaths.push(op.path);
     overlay.setOp({ kind: 'modify', path: op.path, base: currentContent, staged: result });
   }
 
-  return { ok: conflictedPaths.length === 0, conflictedPaths, merged };
+  return { rebasedPaths, changedDeletes, conflictedPaths, merged };
 }
 
 // ---------------------------------------------------------------------------
