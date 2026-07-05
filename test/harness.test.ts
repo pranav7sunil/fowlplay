@@ -250,6 +250,56 @@ describe('runCoopPipeline — contextDigest', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Story-mode inspector scope policing
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — storyMode inspector scope', () => {
+  it('adds the out-of-scope findings instruction to the Inspector prompt in story mode', async () => {
+    const { runner, calls } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      inspector: [approve],
+      sentry: [approve],
+    });
+
+    await runCoopPipeline({
+      userPrompt: 'build story 1',
+      runner,
+      inspector: fakeInspector(),
+      buildStage: vi.fn(async () => BUILDER_USAGE),
+      settings: settings(),
+      onGate: () => {},
+      storyMode: true,
+    });
+
+    const inspectorPrompt = calls.find((c) => c.role === 'inspector')!.userPrompt;
+    expect(inspectorPrompt).toContain('ONE STORY OF A LARGER PRD');
+    expect(inspectorPrompt).toContain('out of scope for this story');
+  });
+
+  it('leaves the Inspector prompt unchanged for a normal (non-story) coop turn', async () => {
+    const { runner, calls } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      inspector: [approve],
+      sentry: [approve],
+    });
+
+    await runCoopPipeline({
+      userPrompt: 'build a feature',
+      runner,
+      inspector: fakeInspector(),
+      buildStage: vi.fn(async () => BUILDER_USAGE),
+      settings: settings(),
+      onGate: () => {},
+      // storyMode omitted → false
+    });
+
+    const inspectorPrompt = calls.find((c) => c.role === 'inspector')!.userPrompt;
+    expect(inspectorPrompt).not.toContain('ONE STORY OF A LARGER PRD');
+    expect(inspectorPrompt).not.toContain('out of scope for this story');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Ambiguous scout → blocked
 // ---------------------------------------------------------------------------
 

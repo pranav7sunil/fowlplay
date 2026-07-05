@@ -118,6 +118,12 @@ export interface CoopPipelineOptions {
    * preserves the exact single-call path — the extension supplies this.
    */
   diffBudgetFor?: (role: CoopRole) => number | undefined;
+  /**
+   * True when this pipeline run is building ONE story of a decomposed PRD. It tightens the
+   * Inspector's prompt so work reaching clearly beyond this story's criteria is a finding
+   * (route-back), not praised bonus work. Non-story Coop turns leave it false — unchanged.
+   */
+  storyMode?: boolean;
   signal?: AbortSignal;
 }
 
@@ -184,7 +190,7 @@ export interface CoopResult {
 // ---------------------------------------------------------------------------
 
 export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopResult> {
-  const { userPrompt, contextDigest, runner, inspector, buildStage, settings, onGate, modelLabelFor, diffBudgetFor, signal } = opts;
+  const { userPrompt, contextDigest, runner, inspector, buildStage, settings, onGate, modelLabelFor, diffBudgetFor, storyMode, signal } = opts;
   const labelFor = (role: CoopRole): string | undefined => modelLabelFor?.(role);
 
   const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
@@ -474,7 +480,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
     const inspectorReview = await runReview(
       'inspector',
       INSPECTOR_SYSTEM,
-      (chunk) => composeInspectorPrompt(scout.criteria, chunk),
+      (chunk) => composeInspectorPrompt(scout.criteria, chunk, storyMode),
       diff,
       (t) => bumpCard(inspectorCard, t),
     );

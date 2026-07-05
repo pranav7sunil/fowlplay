@@ -277,6 +277,14 @@ export interface PrdPlan {
   stories: PrdStory[];
   /** Index of the story the human is currently building / reviewing. */
   cursor: number;
+  /**
+   * Workspace-relative path of the PRD document this plan was decomposed from, when the PRD
+   * arrived via a file mention (exactly one markdown file included on the `prd: true` send).
+   * Undefined for a pasted-raw PRD. During story builds it drives a scope guard: reading this
+   * file through a read tool returns a stub, so a story's Builder can't re-open the whole PRD
+   * and implement everything. Plain JSON — persists with the conversation.
+   */
+  sourcePath?: string;
 }
 
 // ---------------------------------------------------------------------------

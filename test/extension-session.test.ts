@@ -167,6 +167,17 @@ function textEvents(text: string): StreamEvent[] {
   return [{ type: 'text', delta: text }, USAGE, { type: 'done', stopReason: 'end' }];
 }
 
+/** A single `open_files` tool call over `paths`, then a stop for tool use. */
+function openFilesEvents(paths: string[]): StreamEvent[] {
+  return [
+    { type: 'tool_call_start', id: 'o1', name: 'open_files' },
+    { type: 'tool_call_args', id: 'o1', delta: JSON.stringify({ paths }) },
+    { type: 'tool_call_end', id: 'o1' },
+    USAGE,
+    { type: 'done', stopReason: 'tool_use' },
+  ];
+}
+
 /** A 2-story Foreman decomposition, returned when `foreman: 'two'`. */
 const TWO_STORY_JSON = JSON.stringify({
   stories: [
@@ -2064,6 +2075,302 @@ describe('retryStory', () => {
 
     unblock();
     await turn;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PRD story scope guard (plan.sourcePath → stub reads of the PRD in story builds)
+// ---------------------------------------------------------------------------
+
+describe('PRD story scope guard', () => {
+  const PRD_BODY = 'PRD-BODY-MARKER: build the whole app in one go';
+
+  /**
+   * A coop session seeded with `prd.md`. The Builder (solo-style) opens `prd.md` on its first
+   * round, then finishes — so the tool result reveals whether the read hit the real PRD or the
+   * scope stub. Foreman/Scout/Inspector/Sentry are scripted normally.
+   */
+  function makeGuardSession() {
+    const io = new FakeIo();
+    io.files.set('prd.md', PRD_BODY);
+    const posted: HostToWebview[] = [];
+    const requests: ChatRequest[] = [];
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        requests.push(request);
+        let events: StreamEvent[];
+        if (request.system.includes('FOREMAN')) events = textEvents(TWO_STORY_JSON);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+        else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('read the spec — done') : openFilesEvents(['prd.md']);
+        }
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    return { session: createSessionCore(deps), posted, requests, io };
+  }
+
+  it('records sourcePath and stubs the PRD for the story Builder, while the Foreman sees it in full', async () => {
+    const { session, posted, requests } = makeGuardSession();
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'implement @prd.md', prd: true });
+
+    // The single included markdown file was recorded as the plan's source document.
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.sourcePath).toBe('prd.md');
+
+    // The Foreman received the full PRD body inlined into its prompt (not the stub).
+    const foreman = requests.find((r) => r.system.includes('FOREMAN'))!;
+    expect(userWireText(foreman)).toContain('PRD-BODY-MARKER');
+
+    // The story-1 Builder's open_files read of prd.md returned the scope stub — NOT the PRD.
+    const builderCont = requests.find(
+      (r) => !isRolePrompt(r.system) && r.messages.some((m) => m.role === 'tool'),
+    )!;
+    expect(builderCont).toBeDefined();
+    const toolText = allWireText(builderCont);
+    expect(toolText).toContain('decomposed into stories');
+    expect(toolText).not.toContain('PRD-BODY-MARKER');
+  });
+
+  it('a normal (non-story) coop turn reads the real file content — the guard is story-only', async () => {
+    const { session, requests } = makeGuardSession();
+    await session.handle({ type: 'ready' });
+    // No `prd` flag and no plan → the Builder opens prd.md through an ordinary tool call.
+    await session.handle({ type: 'sendPrompt', text: 'open the requirements file and summarize it' });
+
+    const builderCont = requests.find(
+      (r) => !isRolePrompt(r.system) && r.messages.some((m) => m.role === 'tool'),
+    )!;
+    expect(builderCont).toBeDefined();
+    // Real content reaches the model, not the stub.
+    expect(allWireText(builderCont)).toContain('PRD-BODY-MARKER');
+  });
+
+  it('keeps sourcePath through a JSON save/load', async () => {
+    const { session } = makeGuardSession();
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'implement @prd.md', prd: true });
+
+    const saved = session.conversation;
+    const roundTripped: Conversation = JSON.parse(JSON.stringify(saved));
+    expect(roundTripped.prdPlan?.sourcePath).toBe('prd.md');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Human reconciliation — Mark done
+// ---------------------------------------------------------------------------
+
+describe('markStoryDone', () => {
+  it('marks the cursor story done and advances without building the next; completes on the last', async () => {
+    const { session, posted, io } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+    // After the PRD turn: story 0 awaiting-review, story 1 pending, cursor 0.
+
+    // Mark the cursor story done → cursor advances to the (still pending) story 1, and NO
+    // new story build runs (unlike Continue — next story).
+    const before = posted.length;
+    await session.handle({ type: 'markStoryDone' });
+    let conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.cursor).toBe(1);
+    expect(conv.prdPlan?.stories[0].status).toBe('done');
+    expect(conv.prdPlan?.stories[1].status).toBe('pending'); // not built
+    expect(posted.slice(before).some((m) => m.type === 'turnStarted')).toBe(false);
+    // The spec file records the human reconciliation.
+    const spec0 = [...io.files.keys()].filter((p) => p.startsWith('.fowlplay/specs/'))[0];
+    expect(io.files.get(spec0)).toContain('marked done by user');
+
+    // Mark the now-cursor pending story done → the plan completes with a summary block.
+    const before2 = posted.length;
+    await session.handle({ type: 'markStoryDone' });
+    conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.cursor).toBe(2);
+    expect(conv.prdPlan?.stories.every((s) => s.status === 'done')).toBe(true);
+    expect(posted.slice(before2).some((m) => m.type === 'turnStarted')).toBe(false);
+    const leaf = assistantLeaf(conv)!;
+    expect(leaf.blocks.some((b) => b.type === 'text' && b.text.includes('PRD build complete'))).toBe(true);
+  });
+
+  it('ignores markStoryDone while a turn is streaming', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    let unblock: () => void = () => {};
+    const blocker = new Promise<void>((res) => {
+      unblock = res;
+    });
+    // Hang the story-1 Sentry call so a turn is in flight when markStoryDone arrives.
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        let events: StreamEvent[];
+        let block = false;
+        if (request.system.includes('FOREMAN')) events = textEvents(TWO_STORY_JSON);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+        else if (request.system.includes('SENTRY')) {
+          events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+          block = true;
+        } else if (request.system.includes('INSPECTOR')) {
+          events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        } else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        }
+        return (async function* () {
+          if (block) await blocker;
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+    for (let i = 0; i < 100; i += 1) {
+      if (posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'sentry')) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'sentry')).toBe(true);
+
+    const before = posted.length;
+    await session.handle({ type: 'markStoryDone' });
+    expect(posted.length).toBe(before); // ignored while a turn is in flight
+
+    unblock();
+    await turn;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Honest cancel text — a story cancelled with staged changes says so
+// ---------------------------------------------------------------------------
+
+/**
+ * A PRD session whose story-1 pipeline hangs on `blockRole` (a role system-prompt substring),
+ * so a cancel lands mid-story. `blockRole: 'INSPECTOR'` cancels AFTER the Builder staged its
+ * edit (overlay non-empty); `blockRole: 'SCOUT'` cancels BEFORE the Builder runs (overlay empty).
+ */
+function makeCancelStorySession(blockRole: 'INSPECTOR' | 'SCOUT') {
+  const io = new FakeIo();
+  const posted: HostToWebview[] = [];
+  let unblock: () => void = () => {};
+  const blocker = new Promise<void>((res) => {
+    unblock = res;
+  });
+  const adapter: ProviderAdapter = {
+    chat(request: ChatRequest) {
+      let events: StreamEvent[];
+      let block = false;
+      if (request.system.includes('FOREMAN')) events = textEvents(TWO_STORY_JSON);
+      else if (request.system.includes('SCOUT')) {
+        events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+        if (blockRole === 'SCOUT') block = true;
+      } else if (request.system.includes('INSPECTOR')) {
+        events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        if (blockRole === 'INSPECTOR') block = true;
+      } else if (request.system.includes('SENTRY')) {
+        events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+      } else {
+        const hasToolResult = request.messages.some((m) => m.role === 'tool');
+        events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+      }
+      return (async function* () {
+        if (block) await blocker;
+        for (const e of events) yield e;
+      })();
+    },
+  };
+  const deps: SessionDeps = {
+    io,
+    secrets: new FakeSecrets(),
+    settings: new FakeSettings('coop'),
+    history: new FakeHistory(),
+    git: fakeGit,
+    post: (m) => posted.push(m),
+    createAdapter: () => adapter,
+    fetchModels: async () => [{ id: 'm1' }],
+    clock: () => Date.now(),
+  };
+  return { session: createSessionCore(deps), posted, unblock: () => unblock() };
+}
+
+describe('cancelled story outcome text', () => {
+  it('says the staged changes remain when the story is cancelled after the Builder staged work', async () => {
+    const { session, posted, unblock } = makeCancelStorySession('INSPECTOR');
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+    // Wait until the Inspector card is emitted — the Builder has already staged foo.txt.
+    for (let i = 0; i < 100; i += 1) {
+      if (posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'inspector')) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    await session.handle({ type: 'cancelResponse' });
+    unblock();
+    await turn;
+
+    const conv = lastConversation(posted)!;
+    const leaf = assistantLeaf(conv)!;
+    const text = leaf.blocks
+      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    expect(text).toContain("this story's staged changes are still in the changeset");
+    expect(text).toContain('Mark done');
+    // A changes block is present (the staged edit survived the cancel).
+    expect(leaf.blocks.some((b) => b.type === 'changes')).toBe(true);
+  });
+
+  it('a plain cancel with no staged changes keeps the bare "Cancelled." text', async () => {
+    const { session, posted, unblock } = makeCancelStorySession('SCOUT');
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+    // Wait until the story-1 Scout card is emitted (the Builder has NOT run → nothing staged).
+    for (let i = 0; i < 100; i += 1) {
+      if (posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'scout')) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    await session.handle({ type: 'cancelResponse' });
+    unblock();
+    await turn;
+
+    const conv = lastConversation(posted)!;
+    const leaf = assistantLeaf(conv)!;
+    const text = leaf.blocks
+      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    expect(text).toContain('Cancelled.');
+    expect(text).not.toContain('staged changes are still in the changeset');
+    // No changes block — nothing was staged.
+    expect(leaf.blocks.some((b) => b.type === 'changes')).toBe(false);
   });
 });
 

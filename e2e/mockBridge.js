@@ -58,6 +58,11 @@
       if (msg && msg.type === 'retryStory') {
         /* no-op ack — protocol stays mirrored */
       }
+      // markStoryDone (human marks the cursor story done + advances) is likewise
+      // acked as a no-op — no scripted scenario drives the per-story loop.
+      if (msg && msg.type === 'markStoryDone') {
+        /* no-op ack — protocol stays mirrored */
+      }
       // Composer `@` autocomplete: serve a small static file list, filtered by the
       // query (case-insensitive substring) exactly as the real host would.
       if (msg && msg.type === 'listFiles') {

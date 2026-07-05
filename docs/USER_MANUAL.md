@@ -265,10 +265,20 @@ review between each.
      that story's spec file. Each story — including a retry — runs from its **spec alone in a
      fresh context window**, not the running chat history, so a retry is a genuine clean
      restart and no earlier story's transcript pollutes it. Earlier stories' work is already
-     on disk (staged or applied), and the Builder is told to read those files rather than
-     assume.
+     on disk (staged or applied) and **may be read** to integrate correctly — but the story's
+     spec is its **entire scope**. The Builder is told not to open the PRD or implement other
+     stories, and (when the PRD came in as a file) reading the PRD document back during a story
+     build returns a short "this is out of scope" stub instead of its text. The Inspector, for
+     its part, treats work that clearly reaches beyond the story's criteria as a **finding**
+     (route-back), not bonus work — so one story can't quietly build the whole product.
    - If a story was **cancelled** mid-build (it shows as pending), **Resume story N** re-runs
-     it — nothing is skipped that never happened.
+     it — nothing is skipped that never happened. If the cancelled build had already **staged
+     changes**, the outcome says so: those changes stay in the changeset, so you can either
+     Resume (re-run from the spec) or review/apply what's staged and press **Mark done**.
+   - **Mark done** (offered on a pending or failed cursor story) is the human reconciliation
+     for a story that reality outran: it marks the story done and advances the cursor **without**
+     building anything, for when the staged changes already satisfy it. The spec file notes it
+     was *marked done by user*.
 6. A **pinned PRD bar** sits just above the composer for the whole build: it shows
    "N of M done · story K …" and repeats the current story's action buttons, so you can
    retry, skip, or continue without scrolling back up to the plan block after a story has
