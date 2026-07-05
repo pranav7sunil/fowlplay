@@ -498,8 +498,14 @@ export class SessionCore {
 
     // A new prompt supersedes any prompt still held behind an unanswered
     // disambiguation — otherwise answering the stale picker later would
-    // release (and run) the abandoned message.
-    this.heldMention = null;
+    // release (and run) the abandoned message. Never silently: the held
+    // message's unresolved (and even applied) assignments die with it, so the
+    // user must know their directive did not take effect.
+    if (this.heldMention) {
+      const dropped = this.heldMention.queue.map((q) => `"${q.query}"`).join(', ');
+      this.heldMention = null;
+      this.toast('warn', `Dropped the unanswered model choice for ${dropped} — that directive was not applied.`);
+    }
 
     const settings = await this.ensureSettings();
     const mentions = parseModelMentions(text);
