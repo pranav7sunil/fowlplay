@@ -417,6 +417,21 @@ a:hover { text-decoration: underline; }
 .fp-plan-done { color: var(--fp-ok); }
 .fp-plan-failed { color: var(--fp-block); }
 .fp-plan-building { align-self: center; margin-top: 6px; background: var(--fp-accent); animation: fp-pulse 1.2s ease-in-out infinite; }
+.fp-plan-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* Pinned PRD status bar (between the transcript and the composer) */
+.fp-plan-bar {
+  display: flex; align-items: center; gap: 12px;
+  max-width: 820px; margin: 0 auto; width: 100%;
+  padding: 7px 24px; box-sizing: border-box;
+  border-top: 1px solid var(--fp-border);
+  background: var(--fp-surface);
+  font-size: calc(12px * var(--fp-scale));
+}
+.fp-plan-bar-label { display: inline-flex; align-items: center; gap: 8px; flex: 1; min-width: 0; color: var(--fp-fg-muted); }
+.fp-plan-bar-label > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp-plan-bar-building { color: var(--fp-accent); font-style: italic; }
+.fp-plan-bar-actions { display: inline-flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
 
 /* PRD-build armed chip (composer) */
 .fp-prd-chip { color: var(--fp-accent); border-color: var(--fp-accent); background: var(--fp-accent-soft); font-weight: 700; }

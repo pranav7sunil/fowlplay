@@ -53,6 +53,11 @@
       if (msg && msg.type === 'continueStoryLoop') {
         /* no-op ack — protocol stays mirrored */
       }
+      // retryStory (re-run the cursor story) is likewise acked as a no-op — no
+      // scripted scenario drives the per-story loop.
+      if (msg && msg.type === 'retryStory') {
+        /* no-op ack — protocol stays mirrored */
+      }
     },
     onMessage(handler) {
       handlers.push(handler);

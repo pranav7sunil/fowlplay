@@ -41,6 +41,7 @@ import {
   composeBuilderFix,
   composeBuilderInstructions,
   composeInspectorPrompt,
+  composeScoutPrompt,
   composeSentryPrompt,
   parseScout,
 } from './roles';
@@ -73,6 +74,13 @@ export interface ChangesetInspector {
 
 export interface CoopPipelineOptions {
   userPrompt: string;
+  /**
+   * A condensed digest of the conversation so far, prepended to the Scout's prompt so it can
+   * read the real goal (and any acceptance criteria the user already gave) before judging
+   * ambiguity. Undefined on turn one / empty history. Builder/Inspector/Sentry are unaffected
+   * — the Builder already inherits wire history.
+   */
+  contextDigest?: string;
   runner: RoleRunner;
   inspector: ChangesetInspector;
   /**
@@ -150,7 +158,7 @@ export interface CoopResult {
 // ---------------------------------------------------------------------------
 
 export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopResult> {
-  const { userPrompt, runner, inspector, buildStage, settings, onGate, modelLabelFor, diffBudgetFor, signal } = opts;
+  const { userPrompt, contextDigest, runner, inspector, buildStage, settings, onGate, modelLabelFor, diffBudgetFor, signal } = opts;
   const labelFor = (role: CoopRole): string | undefined => modelLabelFor?.(role);
 
   const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
@@ -282,7 +290,7 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
   const scoutRun = await runner.run({
     role: 'scout',
     system: SCOUT_SYSTEM,
-    userPrompt,
+    userPrompt: composeScoutPrompt(contextDigest, userPrompt),
     readOnly: true,
     signal,
   });
@@ -290,11 +298,14 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
   if (aborted()) return cancel(scoutCard);
 
   const scout = parseScout(scoutRun.text);
+  // An ambiguous (or empty-criteria) result is not a pass — the Scout card must
+  // read as blocked, matching the stop-the-line gate that follows it.
+  const scoutBlocked = scout.ambiguous || scout.criteria.length === 0;
   emit(
-    transition(scoutCard, 'passed', {
+    transition(scoutCard, scoutBlocked ? 'blocked' : 'passed', {
       usage: scoutRun.usage,
       acceptanceCriteria: scout.criteria,
-      evidence: scout.ambiguous
+      evidence: scoutBlocked
         ? joinSections(
             section('Assessment', 'Request is ambiguous — raising a clarifying question.'),
             section('Question', scout.question ?? ''),

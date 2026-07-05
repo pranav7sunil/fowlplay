@@ -353,16 +353,22 @@ await waitFor(page, () => {
 }, 'plan checklist lists all story titles');
 await waitFor(page, () => document.querySelector('.fp-plan-count')?.textContent === '1 of 3 done', 'plan shows "1 of 3 done"');
 ok((await page.locator('.fp-plan-story .fp-plan-glyph').count()) === 3, 'each story renders a status glyph');
-ok(await page.getByRole('button', { name: /Continue — next story/ }).isVisible().catch(() => false), 'awaiting-review cursor shows "Continue — next story"');
+ok(await page.getByRole('button', { name: /Continue — next story/ }).first().isVisible().catch(() => false), 'awaiting-review cursor shows "Continue — next story"');
 await page.screenshot({ path: join(SHOTS, 'prd-plan.png'), fullPage: false });
-await page.getByRole('button', { name: /Continue — next story/ }).click();
+await page.getByRole('button', { name: /Continue — next story/ }).first().click();
 ok((await sent(page, 'continueStoryLoop')).length >= 1, 'Continue button posts continueStoryLoop');
+// The pinned PRD bar mirrors the plan block's actions between transcript and composer.
+await waitFor(page, () => !!document.querySelector('.fp-plan-bar'), 'pinned PRD bar renders while a build is active');
 // Re-inject the same plan with the cursor story pending → "Resume story 2".
 await page.evaluate(() => window.__host.emit(window.__fixtures.prdConversation('pending')));
 await waitFor(page, () => !!document.querySelector('.fp-plan') && !!Array.from(document.querySelectorAll('button')).find((b) => /Resume story 2/.test(b.textContent || '')), 'pending cursor shows "Resume story 2"');
-// …and with the cursor story failed → "Continue anyway".
+// …and with the cursor story failed → "Retry story" (primary) + "Skip story" (secondary).
 await page.evaluate(() => window.__host.emit(window.__fixtures.prdConversation('failed')));
-await waitFor(page, () => !!Array.from(document.querySelectorAll('button')).find((b) => /Continue anyway/.test(b.textContent || '')), 'failed cursor shows "Continue anyway"');
+await waitFor(page, () => !!Array.from(document.querySelectorAll('button')).find((b) => /Retry story/.test(b.textContent || '')), 'failed cursor shows "Retry story"');
+await waitFor(page, () => !!Array.from(document.querySelectorAll('button')).find((b) => /Skip story/.test(b.textContent || '')), 'failed cursor shows "Skip story"');
+// Retry posts retryStory (one code path re-runs the cursor story).
+await page.getByRole('button', { name: /Retry story/ }).first().click();
+ok((await sent(page, 'retryStory')).length >= 1, 'Retry button posts retryStory');
 
 // ============================== PRD CHIP =====================================
 console.log('\n# prd chip');

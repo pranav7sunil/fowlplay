@@ -35,6 +35,8 @@ export type WebviewToHost =
   | { type: 'cancelResponse' }
   // Advance a PRD build to the next story (marks the cursor story done, runs the next).
   | { type: 'continueStoryLoop' }
+  // Re-run the cursor story of a PRD build (a failed — or pending — story).
+  | { type: 'retryStory' }
   | { type: 'clearSelection' }                                    // dismiss the pinned selection chip
   | { type: 'editMessage'; nodeId: string; text: string }        // branches
   | { type: 'rerunMessage'; nodeId: string }                      // sibling response

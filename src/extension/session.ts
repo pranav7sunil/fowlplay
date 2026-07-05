@@ -59,6 +59,7 @@ import {
 } from '../core/harness/coop';
 import {
   FOREMAN_SYSTEM,
+  composeForemanPrompt,
   composeStoryPrompt,
   parseForeman,
   renderSpecMarkdown,
@@ -263,6 +264,9 @@ export class SessionCore {
         return;
       case 'continueStoryLoop':
         await this.onContinueStoryLoop();
+        return;
+      case 'retryStory':
+        await this.rerunCursorStory('Retry');
         return;
       case 'cancelResponse':
         this.abort?.abort();
@@ -693,6 +697,9 @@ export class SessionCore {
     const userNode = this.conv.nodes[userNodeId];
     const userText = firstText(userNode?.blocks ?? []) ?? '';
     const baseWire = this.wireBaseFor(userNodeId);
+    // Condensed prior-conversation context for the planning roles (Scout/Foreman),
+    // so a terse follow-up or a clarification reply is judged against the real goal.
+    const contextDigest = this.digestFor(userNodeId);
 
     // Surface the user's message (and any new branch) before streaming begins,
     // so the prompt is visible for the whole turn and the streaming assistant
@@ -711,15 +718,15 @@ export class SessionCore {
     let usage: TokenUsage = emptyUsage();
     try {
       if (opts.prd) {
-        const out = await this.runPrd(userText, imageParts, baseWire, resolved, settings.harness, signal);
+        const out = await this.runPrd(userText, imageParts, baseWire, resolved, settings.harness, signal, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else if (opts.storyIndex !== undefined) {
-        const out = await this.runStory(opts.storyIndex, baseWire, resolved, settings.harness, signal);
+        const out = await this.runStory(opts.storyIndex, baseWire, resolved, settings.harness, signal, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else if (this.conv.harnessMode === 'coop') {
-        const out = await this.runCoop(userText, imageParts, baseWire, resolved, settings.harness, signal);
+        const out = await this.runCoop(userText, imageParts, baseWire, resolved, settings.harness, signal, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else {
@@ -807,9 +814,10 @@ export class SessionCore {
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
+    contextDigest?: string,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const cards: GateCard[] = [];
-    const result = await this.runCoopCore(userText, imageParts, baseWire, resolved, harness, signal, cards);
+    const result = await this.runCoopCore(userText, imageParts, baseWire, resolved, harness, signal, cards, contextDigest);
 
     const blocks: ContentBlock[] = cards.map((card) => ({ type: 'gate', card }));
     const text = this.coopOutcomeText(result);
@@ -831,6 +839,7 @@ export class SessionCore {
     harness: HarnessSettings,
     signal: AbortSignal,
     cards: GateCard[],
+    contextDigest?: string,
   ): Promise<CoopResult> {
     const settings = await this.ensureSettings();
     const runner: RoleRunner = {
@@ -910,6 +919,7 @@ export class SessionCore {
 
     return runCoopPipeline({
       userPrompt,
+      contextDigest,
       runner,
       inspector,
       buildStage,
@@ -959,6 +969,7 @@ export class SessionCore {
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
+    contextDigest?: string,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const settings = await this.ensureSettings();
     const usage: TokenUsage = emptyUsage();
@@ -991,7 +1002,7 @@ export class SessionCore {
       apiKey: rm.apiKey,
       modelId: rm.modelId,
       system: FOREMAN_SYSTEM,
-      history: [{ role: 'user', content: [{ type: 'text', text: userText }, ...imageParts] }],
+      history: [{ role: 'user', content: [{ type: 'text', text: composeForemanPrompt(contextDigest, userText) }, ...imageParts] }],
       tools: this.readOnlyTools,
       toolHost: this.toolHost(),
       onEvent: () => {},
@@ -1046,7 +1057,7 @@ export class SessionCore {
     );
 
     // --- Build story 1 immediately, within this same turn ---
-    const story1 = await this.runStory(0, baseWire, resolved, harness, signal);
+    const story1 = await this.runStory(0, baseWire, resolved, harness, signal, contextDigest);
     addUsageInPlace(usage, story1.usage);
 
     // Blocks: Foreman gate, the plan marker (renders live), then story 1's cards + outcome.
@@ -1064,6 +1075,7 @@ export class SessionCore {
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
+    contextDigest?: string,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const plan = this.conv.prdPlan;
     const story = plan?.stories[storyIndex];
@@ -1079,7 +1091,7 @@ export class SessionCore {
     const userPrompt = composeStoryPrompt(specMarkdown, storyIndex + 1, total);
 
     const cards: GateCard[] = [];
-    const result = await this.runCoopCore(userPrompt, [], baseWire, resolved, harness, signal, cards);
+    const result = await this.runCoopCore(userPrompt, [], baseWire, resolved, harness, signal, cards, contextDigest);
 
     const status: PrdStory['status'] =
       result.outcome === 'ready-for-review' ? 'awaiting-review' : result.outcome === 'cancelled' ? 'pending' : 'failed';
@@ -1111,11 +1123,7 @@ export class SessionCore {
     // A pending cursor story was cancelled (or never started): Continue means
     // RETRY it, not mark it done and skip past work that never happened.
     if (current.status === 'pending') {
-      const { conv, nodeId } = appendUser(this.conv, [
-        { type: 'text', text: `Resume story ${i + 1}: ${current.title}` },
-      ]);
-      this.conv = conv;
-      await this.runAssistantTurn(nodeId, [], { storyIndex: i });
+      await this.rerunCursorStory('Resume');
       return;
     }
 
@@ -1146,6 +1154,60 @@ export class SessionCore {
     ]);
     this.conv = conv;
     await this.runAssistantTurn(nodeId, [], { storyIndex: nextCursor });
+  }
+
+  /**
+   * Re-run the plan's cursor story as a fresh turn — the single code path behind both the
+   * `retryStory` message (a failed story) and the pending-resume branch of the Continue
+   * button (a cancelled/never-started story). Ignored while a turn is streaming; acts only
+   * when the cursor story is `failed` or `pending`. `verb` labels the synthetic user node
+   * ("Retry story N" / "Resume story N") so rewind/branching stay coherent.
+   */
+  private async rerunCursorStory(verb: 'Retry' | 'Resume'): Promise<void> {
+    if (this.abort) return; // a turn is in flight — ignore
+    const plan = this.conv.prdPlan;
+    if (!plan) return;
+    const i = plan.cursor;
+    const current = plan.stories[i];
+    if (!current) return;
+    if (current.status !== 'failed' && current.status !== 'pending') return;
+    const { conv, nodeId } = appendUser(this.conv, [
+      { type: 'text', text: `${verb} story ${i + 1}: ${current.title}` },
+    ]);
+    this.conv = conv;
+    await this.runAssistantTurn(nodeId, [], { storyIndex: i });
+  }
+
+  /**
+   * A condensed digest of the conversation preceding `userNodeId`, for the planning roles.
+   * Walks the active path up to (but excluding) the current user node, takes the last 6
+   * user/assistant nodes' TEXT blocks only (gate/tool/plan/commit blocks are skipped),
+   * truncates each message to ~600 chars, and joins them as `user:`/`assistant:` lines,
+   * capping the whole digest at ~2000 chars (oldest dropped first). Empty history → undefined.
+   */
+  private digestFor(userNodeId: string): string | undefined {
+    const MAX_PER = 600;
+    const MAX_TOTAL = 2000;
+    const parentId = this.conv.nodes[userNodeId]?.parentId ?? null;
+    if (!parentId) return undefined;
+
+    const relevant = this.chainTo(parentId).filter((n) => n.role === 'user' || n.role === 'assistant');
+    const entries: string[] = [];
+    for (const n of relevant.slice(-6)) {
+      const text = n.blocks
+        .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+        .map((b) => b.text.trim())
+        .filter(Boolean)
+        .join('\n');
+      if (!text) continue;
+      const clipped = text.length > MAX_PER ? `${text.slice(0, MAX_PER)} […]` : text;
+      entries.push(`${n.role}: ${clipped}`);
+    }
+    if (entries.length === 0) return undefined;
+
+    // Cap the whole digest, dropping the oldest entries first.
+    while (entries.length > 1 && entries.join('\n').length > MAX_TOTAL) entries.shift();
+    return entries.join('\n');
   }
 
   /** Set a story's status immutably on the conversation's plan (no-op if the plan is gone). */

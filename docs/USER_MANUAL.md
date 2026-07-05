@@ -218,9 +218,19 @@ review between each.
    status glyph each: ○ pending, spinner building, ◉ awaiting review, ✓ done, ✕ failed.
 5. Review story 1's diff as usual (apply, comment, revert, send feedback). When you're
    satisfied, press **Continue — next story** on the plan block. That marks the story done
-   and builds the next one as a fresh turn. If a story failed, the button reads **Continue
-   anyway** — moving on is your call, and the skip is noted in that story's spec file.
-6. When the last story is done, a short **completion summary** lists every story's final
+   and builds the next one as a fresh turn.
+   - If a story **failed** its checks, you get two buttons: **Retry story** re-runs that same
+     story from scratch (worth a try after you've tweaked its spec, or just to give it
+     another pass), and **Skip story** moves on anyway — your call, and the skip is noted in
+     that story's spec file.
+   - If a story was **cancelled** mid-build (it shows as pending), **Resume story N** re-runs
+     it — nothing is skipped that never happened.
+6. A **pinned PRD bar** sits just above the composer for the whole build: it shows
+   "N of M done · story K …" and repeats the current story's action buttons, so you can
+   retry, skip, or continue without scrolling back up to the plan block after a story has
+   streamed its gate cards. While a story is building it reads "building story K…" with no
+   buttons.
+7. When the last story is done, a short **completion summary** lists every story's final
    status.
 
 The plan lives on the conversation, so it survives save/reload and shows the live status
