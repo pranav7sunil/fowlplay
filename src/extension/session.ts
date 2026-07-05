@@ -88,6 +88,7 @@ import {
 } from '../core/conversation/tree';
 import { toJSON, toMarkdown } from '../core/conversation/serialize';
 import {
+  findUnparsedModelHints,
   isDirectiveOnly,
   matchModels,
   parseModelMentions,
@@ -521,6 +522,18 @@ export class SessionCore {
 
     const settings = await this.ensureSettings();
     const mentions = parseModelMentions(text);
+
+    // Near-miss guard: a token that names a configured model, sits outside every
+    // recognized directive span, in a message that uses role vocabulary, looks
+    // like a steering attempt the grammar didn't catch. Warn so it never fails
+    // silently (the message still runs / applies normally below).
+    for (const hint of findUnparsedModelHints(text, mentions, settings.providers)) {
+      this.toast(
+        'warn',
+        `"${hint}" looks like a model directive but didn't match a known phrasing — try "${hint} is the builder" or "builder: ${hint}"`,
+      );
+    }
+
     const assignments: string[] = [];
     const queue: { role: MentionRole; query: string; candidates: ModelMatch[] }[] = [];
 
