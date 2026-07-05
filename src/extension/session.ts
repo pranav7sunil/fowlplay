@@ -45,7 +45,8 @@ import { runAgentLoop } from '../core/agent/loop';
 import { buildToolSpecs, type DirEntry, type GrepMatch, type GrepOptions, type StageOp, type ToolHost } from '../core/agent/tools';
 import { BUNDLED_SKILLS, formatSkillCatalog, parseSkill } from '../core/agent/skills';
 import { gcHistory } from '../core/agent/contextGc';
-import { trimWireToBudget, wireTokens } from '../core/agent/contextBudget';
+import { estimateTokens, trimWireToBudget, wireTokens } from '../core/agent/contextBudget';
+import { capFileContent, expandFileMentions, extractFileMentions, fencedBlock } from '../core/agent/fileMentions';
 import { StagingOverlay, type DiskReader } from '../core/staging/overlay';
 import { ChangeSet } from '../core/staging/changeset';
 import { detectDrift, rebase as coreRebase } from '../core/staging/rebase';
@@ -172,6 +173,9 @@ keep edits precise and anchored. Batch multiple file opens or edits into a singl
 when you can. When you are done, briefly summarize what you changed.`;
 
 const READONLY_TOOL_NAMES = new Set(['open_files', 'list_dir', 'glob', 'grep']);
+
+/** Directories the composer's `@` file autocomplete never surfaces. */
+const FILE_LIST_EXCLUDE = new Set(['.git', 'node_modules', 'dist', '.fowlplay']);
 
 // ---------------------------------------------------------------------------
 // Session core
@@ -387,6 +391,9 @@ export class SessionCore {
         return;
       case 'fetchModels':
         await this.onFetchModels(msg.providerId);
+        return;
+      case 'listFiles':
+        await this.onListFiles(msg.query);
         return;
       default:
         return;
@@ -695,7 +702,22 @@ export class SessionCore {
     this.turnSkills = await this.discoverSkills();
 
     const userNode = this.conv.nodes[userNodeId];
-    const userText = firstText(userNode?.blocks ?? []) ?? '';
+    const rawUserText = firstText(userNode?.blocks ?? []) ?? '';
+    // Resolve deterministic file references into the WIRE user text (the stored
+    // node keeps the compact reference). Skipped on synthetic story-advance turns
+    // ("Continue/Retry/Resume story N"), which build from the spec, not user prose.
+    // The budget role mirrors who dominates each mode: Scout for a PRD's Foreman,
+    // Builder for a Coop turn, the conversation model for Solo.
+    const budgetRole: CoopRole | undefined = opts.storyIndex !== undefined
+      ? undefined
+      : opts.prd
+        ? 'scout'
+        : this.conv.harnessMode === 'coop'
+          ? 'builder'
+          : undefined;
+    const userText = opts.storyIndex !== undefined
+      ? rawUserText
+      : await this.expandWireFileMentions(rawUserText, settings, budgetRole);
     const baseWire = this.wireBaseFor(userNodeId);
     // Condensed prior-conversation context for the planning roles (Scout/Foreman),
     // so a terse follow-up or a clarification reply is judged against the real goal.
@@ -1589,9 +1611,73 @@ export class SessionCore {
     }
   }
 
+  /**
+   * Serve the composer's `@` autocomplete: glob the workspace, drop noise
+   * directories, filter by the query (case-insensitive substring), and return the
+   * top matches. Best-effort — a glob failure yields an empty list.
+   */
+  private async onListFiles(query?: string): Promise<void> {
+    let paths: string[] = [];
+    try {
+      paths = await this.deps.io.glob('**/*');
+    } catch {
+      paths = [];
+    }
+    const visible = paths
+      .filter((p) => !p.split('/').some((seg) => FILE_LIST_EXCLUDE.has(seg)))
+      .slice(0, 2000);
+    const q = (query ?? '').trim().toLowerCase();
+    const matched = q ? visible.filter((p) => p.toLowerCase().includes(q)) : visible;
+    this.deps.post({ type: 'fileList', paths: matched.slice(0, 50) });
+  }
+
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
+
+  /**
+   * Resolve deterministic file references in the wire user text and inline their
+   * content, so roles receive the referenced files directly rather than depending
+   * on a model choosing to call a tool. Explicit `@<path>` mentions that do not
+   * resolve get a warning toast; bare path-looking tokens that do not resolve are
+   * silently treated as prose. Each included file is capped to
+   * `min(24k chars, half the role's payload budget)`. A single success toast lists
+   * everything included. Returns the text unchanged when nothing resolves.
+   *
+   * Reads through the staging overlay so a staged edit of a file wins over disk,
+   * and runs at wire-composition time so edits/reruns re-read fresh content.
+   */
+  private async expandWireFileMentions(text: string, settings: FowlPlaySettings, budgetRole?: CoopRole): Promise<string> {
+    const { explicit, bare } = extractFileMentions(text);
+    if (explicit.length === 0 && bare.length === 0) return text;
+
+    const budget = this.payloadBudget(settings, budgetRole);
+    const cap = budget !== undefined ? Math.min(24_000, budget * 2) : 24_000;
+
+    const included: { path: string; content: string }[] = [];
+    const toastParts: string[] = [];
+    const includePath = async (path: string, missing: () => void): Promise<void> => {
+      const raw = await this.overlay.read(path);
+      if (raw === null) {
+        missing();
+        return;
+      }
+      const capped = capFileContent(raw, cap);
+      included.push({ path, content: capped.content });
+      toastParts.push(`${path} (~${fmtTokensK(estimateTokens(capped.content))} tokens)${capped.truncated ? ' — truncated' : ''}`);
+    };
+
+    for (const path of explicit) {
+      await includePath(path, () => this.toast('warn', `@${path} not found in the workspace`));
+    }
+    for (const path of bare) {
+      await includePath(path, () => {}); // bare non-matches are just prose
+    }
+
+    if (included.length === 0) return text;
+    this.toast('info', `Included ${toastParts.join(', ')}`);
+    return expandFileMentions(text, included);
+  }
 
   private toolHost(): ToolHost {
     const overlay = this.overlay;
@@ -1880,19 +1966,6 @@ function addUsageInPlace(a: TokenUsage, b: TokenUsage): void {
 function firstText(blocks: ContentBlock[]): string | null {
   for (const b of blocks) if (b.type === 'text' && b.text.trim()) return b.text;
   return null;
-}
-
-/**
- * Wrap arbitrary content in a fenced code block whose backtick run is longer
- * than any run inside the content, so selected text or a file that itself
- * contains ``` cannot break out of the fence (which would corrupt the pinned
- * context / open a prompt-injection seam).
- */
-function fencedBlock(info: string, content: string): string {
-  let longest = 0;
-  for (const m of content.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
-  const fence = '`'.repeat(Math.max(3, longest + 1));
-  return `${fence}${info}\n${content}\n${fence}`;
 }
 
 function joinText(blocks: ContentBlock[]): string {

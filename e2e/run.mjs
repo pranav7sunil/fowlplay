@@ -299,6 +299,32 @@ await composer().fill('/notacommand');
 await composer().press('Enter');
 ok((await sent(page, 'sendPrompt')).some((m) => m.text === '/notacommand'), 'unknown /command sends as a prompt');
 
+// ============================== FILE MENTION AUTOCOMPLETE ====================
+console.log('\n# file mention autocomplete');
+await open('chat');
+// Typing '@' opens the file popup (a new SlashMenu mode) listing workspace files.
+await composer().fill('@');
+await waitFor(page, () => !!document.querySelector('.fp-slash-menu'), '@ opens the file popup');
+await waitFor(page, () => document.body.innerText.includes('src/auth/authService.ts'), 'file popup lists workspace files');
+// Typing after '@' filters the list (substring, case-insensitive).
+await composer().fill('@errors');
+await waitFor(
+  page,
+  () => {
+    const names = Array.from(document.querySelectorAll('.fp-slash-name')).map((n) => n.textContent);
+    return names.includes('src/auth/errors.ts') && !names.includes('README.md');
+  },
+  '@errors filters the file list',
+);
+// Picking a file inserts `@<path> ` at the caret.
+await page.locator('.fp-slash-item', { hasText: 'src/auth/errors.ts' }).first().click();
+await waitFor(
+  page,
+  () => document.querySelector('.fp-composer-textarea')?.value === '@src/auth/errors.ts ',
+  'picking a file inserts @path into the composer',
+);
+await page.screenshot({ path: join(SHOTS, 'file-mention.png'), fullPage: false });
+
 // ============================== CONTEXT INDICATOR ============================
 console.log('\n# context indicator');
 await open('chat');

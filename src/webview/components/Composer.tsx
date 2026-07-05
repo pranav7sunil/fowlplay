@@ -7,7 +7,28 @@ import { filterCommands, type SlashCommand } from '../slashCommands';
 import { SlashMenu, type SlashItem } from './SlashMenu';
 import { IconPaperclip, IconArrowUp, IconStop, IconX } from './icons';
 
-type MenuMode = 'closed' | 'commands' | 'model' | 'export' | 'skills';
+type MenuMode = 'closed' | 'commands' | 'model' | 'export' | 'skills' | 'files';
+
+/**
+ * Locate an `@`-file token being typed at the caret. Returns the `@`'s index and the
+ * query typed after it, or null. The `@` must sit at a token start (string start or
+ * after whitespace / an open bracket) and the run up to the caret must be path-ish.
+ */
+function detectAtToken(value: string, caret: number): { at: number; query: string } | null {
+  for (let i = caret - 1; i >= 0; i -= 1) {
+    const ch = value[i];
+    if (ch === '@') {
+      const before = i === 0 ? '' : value[i - 1];
+      if (i === 0 || /[\s([{'"`]/.test(before)) {
+        const query = value.slice(i + 1, caret);
+        if (/^[\w./-]*$/.test(query)) return { at: i, query };
+      }
+      return null;
+    }
+    if (/\s/.test(ch)) return null; // hit whitespace before an @ → not in an @token
+  }
+  return null;
+}
 
 /** A rendered menu row plus the action to run when it is chosen. */
 interface MenuEntry extends SlashItem {
@@ -39,9 +60,12 @@ export function Composer({ streaming }: { streaming: boolean }) {
   const [menuMode, setMenuMode] = useState<MenuMode>('closed');
   const [highlight, setHighlight] = useState(0);
   const [showStatus, setShowStatus] = useState(false);
+  // The `@`-file token being typed (its position + query), driving the files popup.
+  const [atToken, setAtToken] = useState<{ at: number; query: string } | null>(null);
   const selection = useStore((s) => s.selectionContext);
   const settings = useStore((s) => s.settings);
   const conv = useStore((s) => s.conversation);
+  const fileList = useStore((s) => s.fileList);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -50,6 +74,38 @@ export function Composer({ streaming }: { streaming: boolean }) {
   useEffect(() => {
     if (selection) taRef.current?.focus();
   }, [selection]);
+
+  // While the `@`-file popup is open, (re)request the workspace file list for the
+  // current query, debounced so each keystroke does not round-trip to the host.
+  const fileQuery = atToken?.query ?? null;
+  useEffect(() => {
+    if (menuMode !== 'files') return;
+    const q = fileQuery ?? '';
+    const t = setTimeout(() => post({ type: 'listFiles', query: q || undefined }), 150);
+    return () => clearTimeout(t);
+  }, [menuMode, fileQuery]);
+
+  /** Insert `@<path> ` in place of the `@`-token being typed and hand focus back. */
+  const insertFileMention = (path: string) => {
+    const ta = taRef.current;
+    const at = atToken?.at ?? -1;
+    if (!ta || at < 0) return;
+    const caret = ta.selectionStart ?? text.length;
+    const before = text.slice(0, at);
+    const after = text.slice(caret);
+    const insertion = `@${path} `;
+    const next = `${before}${insertion}${after}`;
+    setText(next);
+    setMenuMode('closed');
+    setAtToken(null);
+    setHighlight(0);
+    requestAnimationFrame(() => {
+      ta.focus();
+      const pos = before.length + insertion.length;
+      ta.setSelectionRange(pos, pos);
+      grow();
+    });
+  };
 
   const grow = () => {
     const ta = taRef.current;
@@ -82,6 +138,7 @@ export function Composer({ streaming }: { streaming: boolean }) {
     setAttachments([]);
     setPrdArmed(false);
     setMenuMode('closed');
+    setAtToken(null);
     resetHeight();
   };
 
@@ -180,6 +237,17 @@ export function Composer({ streaming }: { streaming: boolean }) {
         run: () => runCommand(cmd),
       }));
     }
+    if (menuMode === 'files') {
+      const fq = (atToken?.query ?? '').toLowerCase();
+      const filtered = (fq ? fileList.filter((p) => p.toLowerCase().includes(fq)) : fileList).slice(0, 50);
+      if (filtered.length === 0) {
+        return [{ row: { key: 'none', title: fq ? 'No matching files' : 'No files' }, disabled: true, run: () => {} }];
+      }
+      return filtered.map((p) => ({
+        row: { key: p, title: p },
+        run: () => insertFileMention(p),
+      }));
+    }
     const q = text.trim().toLowerCase();
     if (menuMode === 'model') {
       const providers = settings?.providers ?? [];
@@ -273,9 +341,12 @@ export function Composer({ streaming }: { streaming: boolean }) {
         return;
       }
       if (e.key === 'Enter' || e.key === 'Tab') {
-        // Leading '/' but no command matched → close menu, treat as a prompt.
-        if (menuMode === 'commands' && menu.length === 0) {
+        // Leading '/' with no command, or '@' with no file match → close and treat
+        // the text as an ordinary prompt rather than trapping Enter on a dead menu.
+        const allDisabled = menu.length === 0 || menu.every((it) => it.disabled);
+        if ((menuMode === 'commands' || menuMode === 'files') && allDisabled) {
           setMenuMode('closed');
+          if (menuMode === 'files') setAtToken(null);
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             if (!streaming) send();
@@ -288,8 +359,9 @@ export function Composer({ streaming }: { streaming: boolean }) {
       }
       if (e.key === 'Escape') {
         e.preventDefault();
-        if (menuMode === 'commands') {
+        if (menuMode === 'commands' || menuMode === 'files') {
           setMenuMode('closed');
+          if (menuMode === 'files') setAtToken(null);
         } else {
           // Second-level → back to the command list.
           setMenuMode('commands');
@@ -312,12 +384,28 @@ export function Composer({ streaming }: { streaming: boolean }) {
   };
 
   const onInput = (e: Event) => {
-    const value = (e.target as HTMLTextAreaElement).value;
+    const ta = e.target as HTMLTextAreaElement;
+    const value = ta.value;
     setText(value);
     grow();
     setHighlight(0);
     if (menuMode === 'model' || menuMode === 'export' || menuMode === 'skills') return; // keep filtering the submenu
-    setMenuMode(value.startsWith('/') ? 'commands' : 'closed');
+    // '/' only opens commands at position 0; '@' opens the file picker wherever a
+    // token starts (start-of-line or after whitespace).
+    if (value.startsWith('/')) {
+      setMenuMode('commands');
+      setAtToken(null);
+      return;
+    }
+    const caret = ta.selectionStart ?? value.length;
+    const tok = detectAtToken(value, caret);
+    if (tok) {
+      setAtToken(tok);
+      setMenuMode('files');
+    } else {
+      setAtToken(null);
+      setMenuMode('closed');
+    }
   };
 
   const onFiles = (e: Event) => {

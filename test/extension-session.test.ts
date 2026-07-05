@@ -1688,3 +1688,190 @@ describe('retryStory', () => {
     await turn;
   });
 });
+
+// ---------------------------------------------------------------------------
+// Deterministic file references in prompts (@file + bare-path auto-include)
+// ---------------------------------------------------------------------------
+
+/** The system prompt of a request is a Coop role prompt (Scout/Inspector/Sentry/Foreman). */
+function isRolePrompt(sys: string): boolean {
+  return /(SCOUT|INSPECTOR|SENTRY|FOREMAN)/.test(sys);
+}
+
+describe('deterministic file references in prompts', () => {
+  it('inlines a bare file reference into the coop Scout and Builder prompts, and toasts once', async () => {
+    const { session, requests, io, posted } = makeSession({ mode: 'coop', path: 'x.txt', content: 'x\n' });
+    io.files.set('auraringprd.md', 'AURA-PRD-BODY: build the ring app');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'implement auraringprd.md' });
+
+    const scout = requests.find((r) => r.system.includes('SCOUT'));
+    expect(scout).toBeDefined();
+    const scoutText = userWireText(scout!);
+    expect(scoutText).toContain('Referenced file auraringprd.md:');
+    expect(scoutText).toContain('AURA-PRD-BODY: build the ring app');
+
+    // The Builder (solo-style system, not a role prompt) receives the content too.
+    const builder = requests.find((r) => !isRolePrompt(r.system));
+    expect(builder).toBeDefined();
+    expect(allWireText(builder!)).toContain('AURA-PRD-BODY');
+
+    // Exactly one success toast, listing the included file.
+    const included = posted.filter(
+      (m) => m.type === 'toast' && m.level === 'info' && m.message.startsWith('Included'),
+    );
+    expect(included).toHaveLength(1);
+    expect((included[0] as Extract<HostToWebview, { type: 'toast' }>).message).toContain('auraringprd.md');
+  });
+
+  it('keeps the stored user message compact — expansion is wire-only', async () => {
+    const { session, posted, io } = makeSession({ mode: 'coop', path: 'x.txt', content: 'x\n' });
+    io.files.set('auraringprd.md', 'AURA-PRD-BODY');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'implement auraringprd.md' });
+
+    const conv = lastConversation(posted)!;
+    const userNode = Object.values(conv.nodes).find((n) => n.role === 'user');
+    const stored = userNode?.blocks.map((b) => (b.type === 'text' ? b.text : '')).join('') ?? '';
+    expect(stored).toBe('implement auraringprd.md'); // no inlined body in the transcript
+    expect(stored).not.toContain('AURA-PRD-BODY');
+  });
+
+  it('a staged edit of the referenced file wins over the disk copy', async () => {
+    const io = new FakeIo();
+    io.files.set('spec.md', 'DISK-BODY');
+    const posted: HostToWebview[] = [];
+    const requests: ChatRequest[] = [];
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        requests.push(request);
+        let events: StreamEvent[];
+        if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['c'], plan: [], ambiguous: false }));
+        else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult
+            ? textEvents('done')
+            : [
+                { type: 'tool_call_start', id: 't1', name: 'edit_files' },
+                { type: 'tool_call_args', id: 't1', delta: JSON.stringify({ edits: [{ path: 'spec.md', find: 'DISK-BODY', replace: 'STAGED-BODY' }] }) },
+                { type: 'tool_call_end', id: 't1' },
+                USAGE,
+                { type: 'done', stopReason: 'tool_use' },
+              ];
+        }
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'edit the spec' }); // stages spec.md → STAGED-BODY
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'now summarize spec.md' }); // references the file
+
+    const scout = requests.slice(idx).find((r) => r.system.includes('SCOUT'));
+    expect(scout).toBeDefined();
+    const t = userWireText(scout!);
+    expect(t).toContain('STAGED-BODY');
+    expect(t).not.toContain('DISK-BODY'); // the staged overlay copy wins
+  });
+
+  it('warns on a missing @-mention but still runs the turn', async () => {
+    const { session, posted } = makeSession({ mode: 'solo', path: 'x.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'read @missing.md and continue' });
+
+    expect(
+      posted.some((m) => m.type === 'toast' && m.level === 'warn' && m.message === '@missing.md not found in the workspace'),
+    ).toBe(true);
+    // The prompt still ran as an ordinary turn.
+    expect(posted.some((m) => m.type === 'turnStarted')).toBe(true);
+  });
+
+  it("a PRD turn inlines the referenced file into the Foreman's prompt", async () => {
+    const { session, requests, io } = makeSession({ mode: 'coop', path: 'x.txt', content: 'x\n' });
+    io.files.set('auraringprd.md', 'AURA-PRD-BODY: the ring spec');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'implement auraringprd.md', prd: true });
+
+    const foreman = requests.find((r) => r.system.includes('FOREMAN'));
+    expect(foreman).toBeDefined();
+    const t = userWireText(foreman!);
+    expect(t).toContain('Referenced file auraringprd.md:');
+    expect(t).toContain('AURA-PRD-BODY: the ring spec');
+  });
+
+  it('does NOT expand file references on synthetic "Continue story" turns', async () => {
+    const io = new FakeIo();
+    io.files.set('notes.md', 'NOTES-BODY-SHOULD-NOT-INLINE');
+    const posted: HostToWebview[] = [];
+    const requests: ChatRequest[] = [];
+    // A decomposition whose second story TITLE contains a resolvable path — if the
+    // synthetic "Continue to story 2: …" node were expanded, notes.md would inline.
+    const twoStories = JSON.stringify({
+      stories: [
+        { title: 'First slice', summary: 's1', criteria: ['a'] },
+        { title: 'Configure notes.md', summary: 's2', criteria: ['b'] },
+      ],
+    });
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        requests.push(request);
+        let events: StreamEvent[];
+        if (request.system.includes('FOREMAN')) events = textEvents(twoStories);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['c'], plan: [], ambiguous: false }));
+        else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        }
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+
+    await session.handle({ type: 'ready' });
+    // Turn-1 PRD prompt references NO file, so no expansion happens on it either.
+    await session.handle({ type: 'sendPrompt', text: 'build the whole thing', prd: true });
+
+    const idx = requests.length;
+    await session.handle({ type: 'continueStoryLoop' }); // synthetic "Continue to story 2: Configure notes.md"
+
+    // The continue turn's requests carry the spec (title text) but NOT an inlined file.
+    for (const r of requests.slice(idx)) {
+      const text = allWireText(r);
+      expect(text).not.toContain('Referenced file notes.md:');
+      expect(text).not.toContain('NOTES-BODY-SHOULD-NOT-INLINE');
+    }
+    // No "Included …" toast fired for the synthetic advance.
+    expect(posted.some((m) => m.type === 'toast' && m.level === 'info' && m.message.startsWith('Included'))).toBe(false);
+  });
+});
