@@ -102,6 +102,41 @@ describe('parseModelMentions — role directives', () => {
       { role: 'builder', query: 'glm' },
     ]);
   });
+
+  it('chains "and"-joined verbs: one model, several roles', () => {
+    expect(parseModelMentions('qwen to orchestrate and build, gemma to review and audit')).toEqual([
+      { role: 'scout', query: 'qwen' },
+      { role: 'builder', query: 'qwen' },
+      { role: 'inspector', query: 'gemma' },
+      { role: 'sentry', query: 'gemma' },
+    ]);
+  });
+
+  it('chains in the "with" and "for" forms too', () => {
+    expect(parseModelMentions('review and audit with gemma')).toEqual([
+      { role: 'inspector', query: 'gemma' },
+      { role: 'sentry', query: 'gemma' },
+    ]);
+    expect(parseModelMentions('qwen for review and security')).toEqual([
+      { role: 'inspector', query: 'qwen' },
+      { role: 'sentry', query: 'qwen' },
+    ]);
+    expect(parseModelMentions('use fable to plan and audit')).toEqual([
+      { role: 'scout', query: 'fable' },
+      { role: 'sentry', query: 'fable' },
+    ]);
+  });
+
+  it('a chain stops at a non-verb: "and <name>" starts a new clause, not a chain', () => {
+    expect(parseModelMentions('qwen to build and glm to review')).toEqual([
+      { role: 'builder', query: 'qwen' },
+      { role: 'inspector', query: 'glm' },
+    ]);
+  });
+
+  it('chained directives are still directive-only messages', () => {
+    expect(isDirectiveOnly('qwen to orchestrate and build, gemma to review and audit')).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------
