@@ -138,6 +138,7 @@
     "lint": "tsc --noEmit",
     "test": "vitest run",
     "e2e": "node e2e/run.mjs",
+    "e2e:coop": "node esbuild.mjs && node e2e/coopJourney.mjs",
     "package": "npm run build && vsce package --no-dependencies"
   },
   "devDependencies": {

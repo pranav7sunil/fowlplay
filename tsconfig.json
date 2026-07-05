@@ -17,6 +17,6 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src/**/*", "test/**/*"],
+  "include": ["src/**/*", "test/**/*", "e2e/liveHost.ts"],
   "exclude": ["node_modules", "dist"]
 }

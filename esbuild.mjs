@@ -30,10 +30,31 @@ const webviewCtx = {
   logLevel: 'info',
 };
 
+/**
+ * Live e2e harness bundle (browser / IIFE). Runs the REAL SessionCore against
+ * in-memory ports + a scripted dual-model adapter, installed on window before the
+ * webview bundle loads. Built only for the `e2e:coop` journey — not part of the
+ * shipped extension.
+ */
+const liveHostCtx = {
+  entryPoints: ['e2e/liveHost.ts'],
+  bundle: true,
+  outfile: 'dist/liveHost.js',
+  platform: 'browser',
+  format: 'iife',
+  target: 'es2022',
+  sourcemap: true,
+  logLevel: 'info',
+};
+
 if (watch) {
   const [a, b] = await Promise.all([esbuild.context(extensionCtx), esbuild.context(webviewCtx)]);
   await Promise.all([a.watch(), b.watch()]);
   console.log('watching…');
 } else {
-  await Promise.all([esbuild.build(extensionCtx), esbuild.build(webviewCtx)]);
+  await Promise.all([
+    esbuild.build(extensionCtx),
+    esbuild.build(webviewCtx),
+    esbuild.build(liveHostCtx),
+  ]);
 }
