@@ -286,8 +286,10 @@ const STORY_STATUS_WORD: Record<PrdStoryStatus, string> = {
  * The actions offered for a plan's cursor story — the single source of truth shared by the
  * plan block and the pinned bar so their buttons can't drift. Empty while streaming or when
  * the cursor story is not actionable (building/done). A failed story offers Retry (primary) +
- * Skip (secondary); pending offers Resume; awaiting-review offers Continue. Retry and Resume
- * both post `retryStory` — one host code path re-runs the cursor story.
+ * Skip + Mark done (secondary); pending offers Resume + Mark done; awaiting-review offers
+ * Continue. Retry and Resume both post `retryStory` — one host code path re-runs the cursor
+ * story. "Mark done" (posts `markStoryDone`) lets the human reconcile a story reality outran —
+ * e.g. a cancelled build whose staged changes already satisfy it.
  */
 export function planActions(plan: PrdPlan, streaming: boolean): PlanAction[] {
   if (streaming) return [];
@@ -298,9 +300,13 @@ export function planActions(plan: PrdPlan, streaming: boolean): PlanAction[] {
       return [
         { label: 'Retry story', message: { type: 'retryStory' }, variant: 'primary' },
         { label: 'Skip story', message: { type: 'continueStoryLoop' }, variant: 'secondary' },
+        { label: 'Mark done', message: { type: 'markStoryDone' }, variant: 'secondary' },
       ];
     case 'pending':
-      return [{ label: `Resume story ${plan.cursor + 1}`, message: { type: 'retryStory' }, variant: 'primary' }];
+      return [
+        { label: `Resume story ${plan.cursor + 1}`, message: { type: 'retryStory' }, variant: 'primary' },
+        { label: 'Mark done', message: { type: 'markStoryDone' }, variant: 'secondary' },
+      ];
     case 'awaiting-review':
       return [{ label: 'Continue — next story', message: { type: 'continueStoryLoop' }, variant: 'primary' }];
     default:

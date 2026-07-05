@@ -306,6 +306,9 @@ export class SessionCore {
       case 'retryStory':
         await this.rerunCursorStory('Retry');
         return;
+      case 'markStoryDone':
+        await this.onMarkStoryDone();
+        return;
       case 'cancelResponse':
         this.abort?.abort();
         return;
@@ -808,9 +811,25 @@ export class SessionCore {
         : this.conv.harnessMode === 'coop'
           ? 'builder'
           : undefined;
-    const userText = opts.storyIndex !== undefined
-      ? rawUserText
-      : await this.expandWireFileMentions(rawUserText, settings, budgetRole);
+    let userText: string;
+    let includedMentionPaths: string[] = [];
+    if (opts.storyIndex !== undefined) {
+      userText = rawUserText;
+    } else {
+      const expanded = await this.expandWireFileMentions(rawUserText, settings, budgetRole);
+      userText = expanded.text;
+      includedMentionPaths = expanded.includedPaths;
+    }
+    // A PRD that arrived as exactly one included markdown file records its path on the plan,
+    // so story builds can guard reads of it (a Builder must not re-open the whole PRD). A
+    // pasted-raw PRD, or one with multiple/zero markdown mentions, leaves sourcePath undefined
+    // and the guard stays inert.
+    const prdSourcePath = opts.prd
+      ? ((): string | undefined => {
+          const md = includedMentionPaths.filter((p) => /\.md$/i.test(p));
+          return md.length === 1 ? md[0] : undefined;
+        })()
+      : undefined;
     const baseWire = this.wireBaseFor(userNodeId);
     // Condensed prior-conversation context for the planning roles (Scout/Foreman),
     // so a terse follow-up or a clarification reply is judged against the real goal.
@@ -830,7 +849,7 @@ export class SessionCore {
     let usage: TokenUsage = emptyUsage();
     try {
       if (opts.prd) {
-        const out = await this.runPrd(userText, imageParts, resolved, settings.harness, signal, epoch, assistantId, contextDigest);
+        const out = await this.runPrd(userText, imageParts, resolved, settings.harness, signal, epoch, assistantId, contextDigest, prdSourcePath);
         blocks = out.blocks;
         usage = out.usage;
       } else if (opts.storyIndex !== undefined) {
@@ -965,8 +984,13 @@ export class SessionCore {
     epoch: number,
     nodeId: string,
     contextDigest?: string,
+    storyMode = false,
   ): Promise<CoopResult> {
     const settings = await this.ensureSettings();
+    // During a story build, guard the PRD source document: reading it through any read tool
+    // returns a stub so the Builder can't re-open the whole PRD and implement everything. The
+    // guard is inert when the plan has no recorded sourcePath (pasted-raw PRD).
+    const guardPath = storyMode ? this.conv.prdPlan?.sourcePath : undefined;
     const runner: RoleRunner = {
       run: async ({ role, system, userPrompt: rolePrompt, readOnly, signal: s, onProgress }) => {
         // Each role resolves its own model through the override chain, falling
@@ -981,7 +1005,7 @@ export class SessionCore {
           system,
           history: [{ role: 'user', content: [{ type: 'text', text: rolePrompt }] }],
           tools: readOnly ? this.readOnlyTools : this.allTools,
-          toolHost: this.toolHost(),
+          toolHost: this.toolHost(guardPath),
           // Role calls aren't streamed to the transcript, but we tally their
           // output so the RUNNING gate card shows a climbing token count.
           onEvent: this.progressOnEvent(() => {}, onProgress),
@@ -1043,7 +1067,7 @@ export class SessionCore {
           system: this.systemWithSkills(SOLO_SYSTEM),
           history,
           tools: this.toolsWithSkills(),
-          toolHost: this.toolHost(),
+          toolHost: this.toolHost(guardPath),
           onEvent: this.progressOnEvent((e) => this.postForTurn(epoch, { type: 'stream', event: e }), onProgress),
           signal: s,
         });
@@ -1073,6 +1097,7 @@ export class SessionCore {
       },
       modelLabelFor: (role) => this.roleModelLabel(settings, role),
       diffBudgetFor: (role) => this.payloadBudget(settings, role),
+      storyMode,
       signal,
     });
   }
@@ -1116,6 +1141,7 @@ export class SessionCore {
     epoch: number,
     nodeId: string,
     contextDigest?: string,
+    sourcePath?: string,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const settings = await this.ensureSettings();
     const usage: TokenUsage = emptyUsage();
@@ -1183,7 +1209,7 @@ export class SessionCore {
 
     // --- Build the plan + write each spec to disk (direct meta-artifacts) ---
     const total = stories.length;
-    const plan: PrdPlan = { stories: [], cursor: 0 };
+    const plan: PrdPlan = { stories: [], cursor: 0, ...(sourcePath ? { sourcePath } : {}) };
     for (let i = 0; i < total; i += 1) {
       const s = stories[i];
       const specPath = specRelPath(this.conv.id, i + 1, s.title);
@@ -1244,7 +1270,7 @@ export class SessionCore {
     // "Retry story" is mechanically a clean-context restart. The Scout still
     // receives the cheap contextDigest for user clarifications.
     const cards: GateCard[] = [];
-    const result = await this.runCoopCore(userPrompt, [], [], resolved, harness, signal, cards, epoch, nodeId, contextDigest);
+    const result = await this.runCoopCore(userPrompt, [], [], resolved, harness, signal, cards, epoch, nodeId, contextDigest, true);
 
     const status: PrdStory['status'] =
       result.outcome === 'ready-for-review' ? 'awaiting-review' : result.outcome === 'cancelled' ? 'pending' : 'failed';
@@ -1252,7 +1278,13 @@ export class SessionCore {
     await this.writeSpec(this.conv.prdPlan!.stories[storyIndex], storyIndex + 1, total);
 
     const blocks: ContentBlock[] = cards.map((card) => ({ type: 'gate', card }));
-    const text = this.coopOutcomeText(result);
+    // A story cancelled AFTER the Builder staged work leaves those changes in the changeset —
+    // say so honestly (the generic "Cancelled." reads as if nothing happened, and the plan
+    // otherwise loops "Resume story N" forever over a changeset that is already complete).
+    const text =
+      result.outcome === 'cancelled' && !this.overlay.isEmpty()
+        ? "Cancelled — this story's staged changes are still in the changeset. Resume re-runs the story from its spec, or review/apply what's staged and Mark done."
+        : this.coopOutcomeText(result);
     if (text) blocks.push({ type: 'text', text });
     return { blocks, usage: result.usage };
   }
@@ -1281,11 +1313,58 @@ export class SessionCore {
     }
 
     const skippedReview = current.status === 'failed';
+    const nextCursor = await this.advancePastCursorStory(skippedReview ? 'skipped review' : undefined);
+    if (nextCursor === null) return; // plan complete — the summary was appended
+
+    // Run the next story as a new turn, parented on a synthetic "Continue" user node.
+    const next = this.conv.prdPlan!.stories[nextCursor];
+    const { conv, nodeId } = appendUser(this.conv, [
+      { type: 'text', text: `Continue to story ${nextCursor + 1}: ${next.title}` },
+    ]);
+    this.conv = conv;
+    await this.runAssistantTurn(nodeId, [], { storyIndex: nextCursor });
+  }
+
+  /**
+   * Human reconciliation: mark the cursor story done and advance the cursor without running
+   * the next story. Ignored while a turn is streaming; acts only when the cursor story is
+   * `pending`, `failed`, or `awaiting-review` — the states where a human decides the story is
+   * genuinely done (e.g. the Builder's staged changes already satisfy it). The spec file
+   * records the `marked done by user` nuance. When it completes the plan, the shared advance
+   * helper appends the completion summary; otherwise the advanced (pending) cursor is surfaced.
+   */
+  private async onMarkStoryDone(): Promise<void> {
+    if (this.abort) return; // a turn is in flight — ignore
+    const plan = this.conv.prdPlan;
+    if (!plan) return;
+    const current = plan.stories[plan.cursor];
+    if (!current) return;
+    if (current.status !== 'pending' && current.status !== 'failed' && current.status !== 'awaiting-review') return;
+
+    const nextCursor = await this.advancePastCursorStory('marked done by user');
+    if (nextCursor !== null) {
+      // Plan not complete — surface the advanced cursor so the plan bar reflects it.
+      await this.persist();
+      this.sendConversation();
+    }
+  }
+
+  /**
+   * The single "advance past the cursor story" code path, shared by Continue and Mark done:
+   * mark the cursor story done, bump the cursor, and record `note` in the just-finished
+   * story's spec file. When that completes the plan, append the completion-summary assistant
+   * block (persisting + syncing) and return `null`; otherwise return the new cursor index for
+   * the caller to act on (Continue runs it; Mark done leaves it pending). Preserves the plan's
+   * other fields (e.g. `sourcePath`).
+   */
+  private async advancePastCursorStory(note: string | undefined): Promise<number | null> {
+    const plan = this.conv.prdPlan;
+    if (!plan) return null;
+    const i = plan.cursor;
     const stories = plan.stories.map((s, idx) => (idx === i ? { ...s, status: 'done' as const } : s));
     const nextCursor = i + 1;
-    this.conv = { ...this.conv, prdPlan: { stories, cursor: nextCursor } };
-    // Record the skipped-review nuance in the spec file only (state machine stays simple).
-    await this.writeSpec(stories[i], i + 1, stories.length, skippedReview ? 'skipped review' : undefined);
+    this.conv = { ...this.conv, prdPlan: { ...plan, stories, cursor: nextCursor } };
+    await this.writeSpec(stories[i], i + 1, stories.length, note);
 
     if (nextCursor >= stories.length) {
       // Plan complete — summarize the final statuses in a short assistant block.
@@ -1297,16 +1376,9 @@ export class SessionCore {
       this.conv = conv;
       await this.persist();
       this.sendConversation();
-      return;
+      return null;
     }
-
-    // Run the next story as a new turn, parented on a synthetic "Continue" user node.
-    const next = stories[nextCursor];
-    const { conv, nodeId } = appendUser(this.conv, [
-      { type: 'text', text: `Continue to story ${nextCursor + 1}: ${next.title}` },
-    ]);
-    this.conv = conv;
-    await this.runAssistantTurn(nodeId, [], { storyIndex: nextCursor });
+    return nextCursor;
   }
 
   /**
@@ -1922,10 +1994,17 @@ export class SessionCore {
    *
    * Reads through the staging overlay so a staged edit of a file wins over disk,
    * and runs at wire-composition time so edits/reruns re-read fresh content.
+   *
+   * Returns the expanded text plus the workspace-relative paths actually inlined (so a caller
+   * — the PRD flow — can record which document a plan came from).
    */
-  private async expandWireFileMentions(text: string, settings: FowlPlaySettings, budgetRole?: CoopRole): Promise<string> {
+  private async expandWireFileMentions(
+    text: string,
+    settings: FowlPlaySettings,
+    budgetRole?: CoopRole,
+  ): Promise<{ text: string; includedPaths: string[] }> {
     const { explicit, bare } = extractFileMentions(text);
-    if (explicit.length === 0 && bare.length === 0) return text;
+    if (explicit.length === 0 && bare.length === 0) return { text, includedPaths: [] };
 
     const budget = this.payloadBudget(settings, budgetRole);
     const cap = budget !== undefined ? Math.min(24_000, budget * 2) : 24_000;
@@ -1950,17 +2029,27 @@ export class SessionCore {
       await includePath(path, () => {}); // bare non-matches are just prose
     }
 
-    if (included.length === 0) return text;
+    if (included.length === 0) return { text, includedPaths: [] };
     this.toast('info', `Included ${toastParts.join(', ')}`);
-    return expandFileMentions(text, included);
+    return { text: expandFileMentions(text, included), includedPaths: included.map((f) => f.path) };
   }
 
-  private toolHost(): ToolHost {
+  /**
+   * The model-facing tool host for a turn. `guardPath` (set only for story builds) makes any
+   * read of the PRD source document return a scope stub instead of its content — so a story's
+   * Builder can't open the whole PRD and implement everything. Because `open_files` reads each
+   * path through `readFile`, decorating it covers both single and multi-path reads (the stub
+   * substitutes for just that path's section).
+   */
+  private toolHost(guardPath?: string): ToolHost {
     const overlay = this.overlay;
     const io = this.deps.io;
     const skills = this.turnSkills;
+    const PRD_SCOPE_STUB =
+      "[This PRD has been decomposed into stories. Your current story's spec is your entire scope — implement only it.]";
     return {
       async readFile(path: string): Promise<string> {
+        if (guardPath && path === guardPath) return PRD_SCOPE_STUB;
         const content = await overlay.read(path);
         if (content === null) throw new Error(`file not found: ${path}`);
         return content;

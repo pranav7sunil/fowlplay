@@ -299,14 +299,33 @@ ${findings.map((f, i) => `${i + 1}. ${f}`).join('\n')}
 Address every finding above. Keep the diff minimal and do not reintroduce prior defects.`;
 }
 
-/** Prompt handed to the Inspector: criteria + the fresh unified diff, no Builder notes. */
-export function composeInspectorPrompt(criteria: readonly string[], unifiedDiff: string): string {
+/**
+ * Prompt handed to the Inspector: criteria + the fresh unified diff, no Builder notes. In
+ * `storyScope` mode (a single story of a decomposed PRD) the Inspector also polices scope in
+ * the OTHER direction: work reaching clearly beyond this story's criteria is a finding, not
+ * bonus work — so a Builder that implemented the whole PRD gets routed back, not approved.
+ */
+export function composeInspectorPrompt(
+  criteria: readonly string[],
+  unifiedDiff: string,
+  storyScope = false,
+): string {
   const diff = unifiedDiff.trim() || '(the changeset is empty — no diff was produced)';
+  const scope = storyScope
+    ? `
+
+SCOPE — THIS IS ONE STORY OF A LARGER PRD
+The diff must satisfy the criteria above and stay within them. Changes clearly BEYOND this
+story's acceptance criteria — implementing other stories' features, building the rest of the
+product, opening and acting on the whole PRD — are OUT OF SCOPE. Report each as a finding
+("out of scope for this story: <what>") and REJECT; extra work is not bonus work to praise,
+it enlarges the diff and pre-empts stories the human has not reviewed yet.`
+    : '';
   return `Validate the following changeset against the acceptance criteria. You have not
 been given the Builder's reasoning — judge only from the diff.
 
 ACCEPTANCE CRITERIA
-${criteriaBlock(criteria)}
+${criteriaBlock(criteria)}${scope}
 
 UNIFIED DIFF
 ${diff}`;

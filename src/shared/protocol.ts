@@ -38,6 +38,10 @@ export type WebviewToHost =
   | { type: 'continueStoryLoop' }
   // Re-run the cursor story of a PRD build (a failed — or pending — story).
   | { type: 'retryStory' }
+  // Human reconciliation: mark the cursor story done and advance the cursor without building
+  // the next story. Acts on a 'pending', 'failed', or 'awaiting-review' cursor story — e.g.
+  // when the Builder's staged changes already satisfy it. Ignored while streaming.
+  | { type: 'markStoryDone' }
   | { type: 'clearSelection' }                                    // dismiss the pinned selection chip
   | { type: 'editMessage'; nodeId: string; text: string }        // branches
   | { type: 'rerunMessage'; nodeId: string }                      // sibling response

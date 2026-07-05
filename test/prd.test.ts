@@ -166,9 +166,20 @@ describe('composeStoryPrompt', () => {
     const prompt = composeStoryPrompt(spec, 2, 5);
     expect(prompt).toContain('Story 2 of 5 decomposed from a PRD');
     expect(prompt).toContain('Implement ONLY this story');
-    expect(prompt).toContain('read the files rather than assuming');
     expect(prompt).toContain('# Add pagination');
     // The spec text follows the preamble.
     expect(prompt.indexOf('Story 2 of 5')).toBeLessThan(prompt.indexOf('# Add pagination'));
+  });
+
+  it('uses scope-tight wording: earlier work may be read, but do not open the PRD', () => {
+    const prompt = composeStoryPrompt('# Add pagination\n', 1, 3);
+    // The old "read the files rather than assuming" invitation is gone…
+    expect(prompt).not.toContain('rather than assuming');
+    // …replaced by scope-tight language: earlier work is readable, but the spec is the
+    // ENTIRE scope and the PRD document must not be opened.
+    expect(prompt).toContain('may be READ');
+    expect(prompt).toContain('ENTIRE scope');
+    expect(prompt).toMatch(/Do NOT open the PRD document/i);
+    expect(prompt).toMatch(/do NOT implement other stories/i);
   });
 });
