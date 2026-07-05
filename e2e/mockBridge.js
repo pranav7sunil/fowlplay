@@ -577,13 +577,13 @@
     steps.push(() => emit({ type: 'stream', event: { type: 'tool_call_start', id: 't1', name: 'search' } }));
     steps.push(() => emit({ type: 'stream', event: { type: 'tool_call_args', id: 't1', delta: '{"query":"function login"}' } }));
     steps.push(() => emit({ type: 'stream', event: { type: 'tool_call_end', id: 't1' } }));
-    steps.push(() => emit({ type: 'gateUpdate', card: { ...scoutGate, status: 'running' } }));
-    steps.push(() => emit({ type: 'gateUpdate', card: scoutGate }));
+    steps.push(() => emit({ type: 'gateUpdate', nodeId: 'a1', card: { ...scoutGate, status: 'running' } }));
+    steps.push(() => emit({ type: 'gateUpdate', nodeId: 'a1', card: scoutGate }));
     'Refactored `login()` to return a `Session` and added `AuthError`. Tests cover both paths.'.match(/.{1,10}/g).forEach((chunk) => {
       steps.push(() => emit({ type: 'stream', event: { type: 'text', delta: chunk } }));
     });
-    steps.push(() => emit({ type: 'gateUpdate', card: inspectorGate }));
-    steps.push(() => emit({ type: 'gateUpdate', card: sentryGate }));
+    steps.push(() => emit({ type: 'gateUpdate', nodeId: 'a1', card: inspectorGate }));
+    steps.push(() => emit({ type: 'gateUpdate', nodeId: 'a1', card: sentryGate }));
     steps.push(() => emit({ type: 'stream', event: { type: 'usage', usage: { inputTokens: 8450, outputTokens: 1120, cachedTokens: 6000 } } }));
     steps.push(() => emit({ type: 'stream', event: { type: 'done', stopReason: 'end' } }));
     // Real host order: turnFinished fires BEFORE the authoritative conversation

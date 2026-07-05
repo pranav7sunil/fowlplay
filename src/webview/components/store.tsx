@@ -159,7 +159,7 @@ class Store {
         this.applyStream(msg.event);
         break;
       case 'gateUpdate':
-        this.upsertGate(msg.card);
+        this.upsertGate(msg.nodeId, msg.card);
         break;
       case 'turnFinished':
         this.finishTurn(msg.nodeId, msg.usage);
@@ -330,15 +330,18 @@ class Store {
     return -1;
   }
 
-  private upsertGate(card: import('../../shared/types').GateCard) {
-    const id = this.state.streamNodeId ?? this.state.conversation?.currentLeafId ?? null;
+  private upsertGate(nodeId: string, card: import('../../shared/types').GateCard) {
+    // Route strictly by the authoritative nodeId: apply the card to that node if
+    // it exists in the CURRENT conversation, otherwise drop the update silently.
+    // A late card from a superseded turn (whose node isn't in the conversation we
+    // switched to) must never graft onto whatever node is newest.
     const conv = this.cloneConversation();
-    if (!conv || !id || !conv.nodes[id]) return;
-    const node: MessageNode = { ...conv.nodes[id], blocks: [...conv.nodes[id].blocks] };
+    if (!conv || !conv.nodes[nodeId]) return;
+    const node: MessageNode = { ...conv.nodes[nodeId], blocks: [...conv.nodes[nodeId].blocks] };
     const idx = node.blocks.findIndex((b) => b.type === 'gate' && b.card.id === card.id);
     if (idx >= 0) node.blocks[idx] = { type: 'gate', card };
     else node.blocks.push({ type: 'gate', card });
-    conv.nodes[id] = node;
+    conv.nodes[nodeId] = node;
     this.patch({ conversation: conv });
   }
 

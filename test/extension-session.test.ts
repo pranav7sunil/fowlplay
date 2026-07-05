@@ -683,6 +683,234 @@ describe('coop pipeline', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Zombie-turn supersession + late-post suppression
+// ---------------------------------------------------------------------------
+
+/**
+ * A coop adapter whose Builder edit round blocks on `blocker` (so a turn hangs
+ * mid-pipeline, its abort controller live), recording the Builder call's signal.
+ * Scout/Inspector/Sentry approve; the Builder finishes once unblocked.
+ */
+function makeBlockingCoop() {
+  let unblock: () => void = () => {};
+  const blocker = new Promise<void>((res) => {
+    unblock = res;
+  });
+  const state: { builderSignal?: AbortSignal } = {};
+  const io = new FakeIo();
+  const posted: HostToWebview[] = [];
+  const history = new FakeHistory();
+  const adapter: ProviderAdapter = {
+    chat(request: ChatRequest) {
+      let events: StreamEvent[];
+      let block = false;
+      if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+      else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+      else {
+        const hasToolResult = request.messages.some((m) => m.role === 'tool');
+        events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        if (!hasToolResult) {
+          block = true; // the Builder's first (edit) round hangs
+          state.builderSignal = request.signal;
+        }
+      }
+      return (async function* () {
+        if (block) await blocker;
+        for (const e of events) yield e;
+      })();
+    },
+  };
+  const deps: SessionDeps = {
+    io,
+    secrets: new FakeSecrets(),
+    settings: new FakeSettings('coop'),
+    history,
+    git: fakeGit,
+    post: (m) => posted.push(m),
+    createAdapter: () => adapter,
+    fetchModels: async () => [{ id: 'm1' }],
+    clock: () => Date.now(),
+  };
+  const session = createSessionCore(deps);
+  return { session, posted, io, history, state, unblock: () => unblock() };
+}
+
+/** Spin the microtask queue until `cond` holds (or a bounded number of ticks). */
+async function flushUntil(cond: () => boolean, ticks = 200): Promise<void> {
+  for (let i = 0; i < ticks; i += 1) {
+    if (cond()) return;
+    await new Promise((r) => setTimeout(r, 0));
+  }
+}
+
+describe('zombie-turn supersession', () => {
+  it('newConversation mid-turn aborts the old turn and suppresses its late posts', async () => {
+    const { session, posted, state, unblock } = makeBlockingCoop();
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'build a feature' });
+    await flushUntil(() => posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'builder'));
+    expect(posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'builder')).toBe(true);
+
+    // Switch to a fresh conversation while the Builder call is still blocked.
+    await session.handle({ type: 'newConversation' });
+    const freshConv = lastConversation(posted)!;
+    const boundary = posted.length;
+
+    // Release the old turn's builder call and let it fully unwind.
+    unblock();
+    await turn;
+
+    // No late gate/stream/turnFinished posts arrived after the newConversation boundary.
+    const late = posted.slice(boundary);
+    expect(late.some((m) => m.type === 'gateUpdate')).toBe(false);
+    expect(late.some((m) => m.type === 'stream')).toBe(false);
+    expect(late.some((m) => m.type === 'turnFinished')).toBe(false);
+
+    // this.conv is the fresh conversation, untouched by the old turn.
+    const finalConv = session.conversation;
+    expect(finalConv.id).toBe(freshConv.id);
+    expect(Object.keys(finalConv.nodes).length).toBe(0);
+    expect(finalConv.usageTotals.inputTokens).toBe(0);
+
+    // The old turn's model call was aborted.
+    expect(state.builderSignal?.aborted).toBe(true);
+
+    // The conversation switch cleared the webview's streaming flag.
+    expect(posted.some((m) => m.type === 'stream' && m.event.type === 'done' && m.event.stopReason === 'cancelled')).toBe(true);
+  });
+
+  it('openConversation mid-turn aborts the old turn and switches without grafting its cards', async () => {
+    const { session, posted, history, state, unblock } = makeBlockingCoop();
+    // Seed a second conversation to switch to.
+    const other: Conversation = {
+      id: 'other-conv',
+      title: 'Other',
+      nodes: {
+        n1: { id: 'n1', parentId: null, role: 'user', blocks: [{ type: 'text', text: 'hi' }], createdAt: 1 },
+      },
+      rootIds: ['n1'],
+      currentLeafId: 'n1',
+      model: { providerId: 'p1', modelId: 'm1' },
+      harnessMode: 'coop',
+      createdAt: 1,
+      updatedAt: 1,
+      usageTotals: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+    };
+    await history.save(other);
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'build a feature' });
+    await flushUntil(() => posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'builder'));
+
+    await session.handle({ type: 'openConversation', id: 'other-conv' });
+    const boundary = posted.length;
+
+    unblock();
+    await turn;
+
+    const late = posted.slice(boundary);
+    expect(late.some((m) => m.type === 'gateUpdate')).toBe(false);
+    expect(late.some((m) => m.type === 'stream')).toBe(false);
+    expect(late.some((m) => m.type === 'turnFinished')).toBe(false);
+
+    // The loaded conversation is intact — no gate blocks grafted onto its node.
+    const finalConv = session.conversation;
+    expect(finalConv.id).toBe('other-conv');
+    expect(Object.keys(finalConv.nodes)).toEqual(['n1']);
+    expect(finalConv.nodes.n1.blocks.some((b) => b.type === 'gate')).toBe(false);
+    expect(state.builderSignal?.aborted).toBe(true);
+  });
+
+  it('a second prompt mid-turn aborts the first, and only the second turn finalizes', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    let unblock: () => void = () => {};
+    const blocker = new Promise<void>((res) => {
+      unblock = res;
+    });
+    let calls = 0;
+    let firstSignal: AbortSignal | undefined;
+    // Solo mode: the FIRST model call (the first turn's edit round) blocks; every
+    // later call runs immediately so the second turn completes.
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        const n = (calls += 1);
+        const hasToolResult = request.messages.some((m) => m.role === 'tool');
+        const events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        const block = n === 1;
+        if (block) firstSignal = request.signal;
+        return (async function* () {
+          if (block) await blocker;
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('solo'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+    await session.handle({ type: 'ready' });
+
+    const turn1 = session.handle({ type: 'sendPrompt', text: 'FIRSTPROMPT do a thing' });
+    await flushUntil(() => firstSignal !== undefined);
+
+    const boundary = posted.length;
+    const turn2 = session.handle({ type: 'sendPrompt', text: 'SECONDPROMPT do another thing' });
+    unblock();
+    await Promise.all([turn1, turn2]);
+
+    // The first turn's model call was aborted by the superseding second turn.
+    expect(firstSignal?.aborted).toBe(true);
+
+    // Exactly one turn finalized (the second) — the first's turnFinished was dropped.
+    const finishes = posted.slice(boundary).filter((m) => m.type === 'turnFinished');
+    expect(finishes).toHaveLength(1);
+
+    // The final conversation carries the second prompt and a finalized assistant leaf.
+    const conv = session.conversation;
+    const userTexts = Object.values(conv.nodes)
+      .filter((nn) => nn.role === 'user')
+      .flatMap((nn) => nn.blocks.map((b) => (b.type === 'text' ? b.text : '')));
+    expect(userTexts.some((t) => t.includes('SECONDPROMPT'))).toBe(true);
+    const leaf = assistantLeaf(conv)!;
+    expect(leaf.role).toBe('assistant');
+    expect(leaf.blocks.some((b) => b.type === 'changes')).toBe(true);
+  });
+
+  it('cancelResponse of the CURRENT turn still finalizes with a cancelled state', async () => {
+    const { session, posted, unblock } = makeBlockingCoop();
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'build a feature' });
+    await flushUntil(() => posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'builder'));
+
+    // Cancel the current turn (epoch unchanged — this is not a supersession).
+    await session.handle({ type: 'cancelResponse' });
+    unblock();
+    await turn;
+
+    // The turn still finalized: a cancelled stream-done and a turnFinished were posted.
+    expect(posted.some((m) => m.type === 'stream' && m.event.type === 'done' && m.event.stopReason === 'cancelled')).toBe(true);
+    expect(posted.some((m) => m.type === 'turnFinished')).toBe(true);
+
+    // The assistant node exists on the (same) conversation with a cancelled outcome.
+    const conv = lastConversation(posted)!;
+    const leaf = assistantLeaf(conv)!;
+    expect(leaf.role).toBe('assistant');
+    expect(leaf.blocks.some((b) => b.type === 'text' && b.text.includes('Cancelled'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Hard context-window management
 // ---------------------------------------------------------------------------
 
