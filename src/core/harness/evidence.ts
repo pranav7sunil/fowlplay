@@ -32,6 +32,8 @@ export interface GateCardInit {
   attempt?: number;
   /** Display label of the model that ran this role. */
   modelLabel?: string;
+  /** Workspace-relative entry point the changeset can be previewed from, when one was found. */
+  previewPath?: string;
 }
 
 /**
@@ -51,6 +53,7 @@ export function createCard(id: string, init: GateCardInit): GateCard {
   if (init.findings) card.findings = init.findings;
   if (init.attempt !== undefined) card.attempt = init.attempt;
   if (init.modelLabel) card.modelLabel = init.modelLabel;
+  if (init.previewPath) card.previewPath = init.previewPath;
   return card;
 }
 

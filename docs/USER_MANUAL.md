@@ -299,6 +299,25 @@ Click **Review Changes** (or the title-bar pill) to open the GitHub-style diff v
 - **Send Feedback** — sends your comments and reverts back as a new prompt; the model
   revises the changeset without re-applying what you reverted. Repeat until it's right.
 
+### Previewing changes
+
+When a changeset contains a renderable artifact — an HTML page, an SVG, a Markdown
+document, or a multi-file static site — a **Preview** button appears next to *Review
+Changes* (also on the diff viewer header, the Human review gate card, and historical
+commit blocks). Click it to see the artifact rendered *before* anything touches disk:
+
+- Markdown renders inline in the panel.
+- HTML/SVG (and their sibling CSS/JS/image assets) load in an embedded browser frame.
+  The preview is served through the staging overlay — staged edits win, with untracked
+  files read from disk — so you are looking at exactly what the model produced.
+- **Refresh** reloads the frame; **Open in Browser** opens the page in your real browser
+  (handy over a remote/codespace, where the URL is port-forwarded for you). **Esc** or ✕
+  closes the preview.
+
+FowlPlay auto-detects the entry file (an `index.html` wins over other pages). Previews of
+*historical* commits are best-effort and read from disk, since the frozen snapshot doesn't
+retain full staged content.
+
 ---
 
 ## 9. Applying changes

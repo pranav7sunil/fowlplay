@@ -42,6 +42,7 @@ fowlplay/
 │   │   ├── staging/
 │   │   │   ├── overlay.ts    # virtual FS overlay; read-through; drift detection
 │   │   │   ├── changeset.ts  # edits → hunks; cumulative diff; revert; serialize
+│   │   │   ├── preview.ts    # artifact detection (best previewable entry file)
 │   │   │   └── rebase.ts     # 3-way rebase onto new disk state
 │   │   ├── agent/
 │   │   │   ├── loop.ts       # agentic loop: stream → tool calls → continue
@@ -62,11 +63,13 @@ fowlplay/
 │   │   ├── tabManager.ts     # webview panels; one session per tab
 │   │   ├── session.ts        # wires core loop ⇄ webview ⇄ workspace for one tab
 │   │   ├── workspaceIo.ts    # real FS + ripgrep-style search, .gitignore aware
+│   │   ├── previewServer.ts  # loopback overlay preview server (token-guarded)
+│   │   ├── previewHttp.ts    # pure request logic: path sanitizing + mime map
 │   │   ├── git.ts            # commit, co-author trailer, branch state via child git
 │   │   ├── secrets.ts        # SecretStorage for API keys
 │   │   └── historyStore.ts   # conversations in globalStorage (JSON files)
 │   └── webview/
-│       ├── index.tsx         # Preact root; view router (chat|diff|settings|history)
+│       ├── index.tsx         # Preact root; view router (chat|diff|preview|settings|history)
 │       ├── bridge.ts         # typed postMessage client; mockable for Playwright
 │       ├── theme.css         # ultramarine design tokens, light/dark/midnight
 │       └── components/      # Chat, Message, ThinkingBlock, ToolCallCard, GateCard,
@@ -105,6 +108,21 @@ fowlplay/
 6. **Persistence**: conversations + changesets serialized to JSON under
    `context.globalStorageUri`; keys in `context.secrets`; settings in
    `workspace.getConfiguration('fowlplay')` + a JSON blob for providers (sans keys).
+
+7. **Overlay preview server** (`previewServer.ts` + `previewHttp.ts`). Staged
+   artifacts (HTML/SVG pages and their sibling assets) are previewed *before* they
+   touch disk by serving them through the staging overlay. A tiny loopback
+   `node:http` server reads a `PreviewSource` (staged content wins; untracked paths
+   fall back to raw disk; staged deletes 404), so the "model never touches disk"
+   invariant holds. It binds `127.0.0.1` on an ephemeral port and mints one random
+   token per instance — every request must carry it as the first path segment
+   (`/<token>/…`) or it 404s, which keeps other local processes out. URLs go through
+   `vscode.env.asExternalUri` for remote/codespace port forwarding. Markdown entries
+   skip the server and render in the webview with the existing `Markdown` component.
+   Historical (frozen) previews are disk-backed best-effort — frozen hunks can't
+   reconstruct staged content, but the commit was applied to disk anyway. The
+   session talks to the server only through the `PreviewPort`/`PreviewSource` ports,
+   so it stays vscode-free and unit-testable.
 
 ## Build & test toolchain
 

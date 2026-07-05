@@ -16,6 +16,7 @@ import type {
   FileOp,
 } from '../../shared/types';
 import { applyHunksToBase, computeFileDiff, renderHunkDiff } from '../diff/compute';
+import { detectPreviewEntry } from './preview';
 import type { StagingOverlay } from './overlay';
 
 interface HunkState {
@@ -61,7 +62,8 @@ export class ChangeSet {
       deletions += f.deletions;
       totalChanges += f.hunks.length;
     }
-    return { id: this.id, files, totalChanges, additions, deletions };
+    const previewPath = detectPreviewEntry(this.overlay.ops()) ?? undefined;
+    return { id: this.id, files, totalChanges, additions, deletions, previewPath };
   }
 
   private applyState(h: DiffHunk): DiffHunk {
@@ -169,6 +171,7 @@ export class ChangeSet {
       filesChanged: v.files.length,
       additions: v.additions,
       deletions: v.deletions,
+      previewPath: v.previewPath,
     };
   }
 }

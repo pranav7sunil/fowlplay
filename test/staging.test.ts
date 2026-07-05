@@ -22,6 +22,24 @@ describe('StagingOverlay edge transitions', () => {
     expect(await o.read('a.ts')).toBe('staged');
   });
 
+  it('changeset view() and summary() expose the detected preview entry', async () => {
+    const disk = new MockDisk();
+    const o = new StagingOverlay(disk);
+    await o.stageCreate('src/main.ts', 'export {};');
+    await o.stageCreate('site/index.html', '<h1>hi</h1>');
+    const cs = new ChangeSet(o, 'cs');
+    expect(cs.view().previewPath).toBe('site/index.html');
+    expect(cs.summary().previewPath).toBe('site/index.html');
+  });
+
+  it('changeset previewPath is undefined when nothing is previewable', async () => {
+    const disk = new MockDisk();
+    const o = new StagingOverlay(disk);
+    await o.stageCreate('src/main.ts', 'export {};');
+    const cs = new ChangeSet(o, 'cs');
+    expect(cs.view().previewPath).toBeUndefined();
+  });
+
   it('modify captures base from disk on first touch', async () => {
     const disk = new MockDisk({ 'a.ts': 'original' });
     const o = new StagingOverlay(disk);

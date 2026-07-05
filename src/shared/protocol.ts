@@ -14,6 +14,7 @@ import type {
   GateCard,
   HarnessMode,
   ModelRef,
+  PreviewState,
   ProviderConfig,
   RebaseState,
   SelectionContext,
@@ -60,6 +61,10 @@ export type WebviewToHost =
   | { type: 'applyAndCommit'; message?: string; coAuthor: boolean }
   | { type: 'requestCommitMessage' }                              // auto-generate
   | { type: 'rebase' }
+  // preview
+  | { type: 'openPreview'; path?: string; changesetId?: string }  // omit path = auto-detect; changesetId = frozen/history (disk-backed, best effort)
+  | { type: 'closePreview' }
+  | { type: 'openPreviewExternal' }                               // open current preview URL in the OS browser
   // history
   | { type: 'listConversations'; query?: string }
   | { type: 'openConversation'; id: string }
@@ -103,6 +108,7 @@ export type HostToWebview =
   | { type: 'turnFinished'; nodeId: string; usage: TokenUsage }
   // diff review
   | { type: 'changeset'; view: ChangeSetView | null }
+  | { type: 'preview'; state: PreviewState | null }
   | { type: 'rebaseState'; state: RebaseState }
   | { type: 'commitMessage'; message: string }
   | { type: 'applied'; committed: boolean; sha?: string; error?: string }

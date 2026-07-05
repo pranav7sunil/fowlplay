@@ -8,6 +8,7 @@ import type {
   Conversation,
   ChangeSetView,
   CoopRole,
+  PreviewState,
   RebaseState,
   ConversationSummary,
   FowlPlaySettings,
@@ -21,7 +22,7 @@ import type {
 import type { HostToWebview, WebviewToHost } from '../../shared/protocol';
 import { getBridge } from '../bridge';
 
-export type View = 'chat' | 'diff' | 'settings' | 'history' | 'onboarding';
+export type View = 'chat' | 'diff' | 'preview' | 'settings' | 'history' | 'onboarding';
 
 export interface Toast {
   id: number;
@@ -46,6 +47,7 @@ export interface AppState {
   selectionContext: SelectionContext | null;
   changeset: ChangeSetView | null;
   diffReadOnly: boolean;
+  preview: PreviewState | null;
   rebase: RebaseState;
   commitMessage: string;
   historyItems: ConversationSummary[];
@@ -69,6 +71,7 @@ const initialState: AppState = {
   selectionContext: null,
   changeset: null,
   diffReadOnly: false,
+  preview: null,
   rebase: { needed: false, conflictedPaths: [] },
   commitMessage: '',
   historyItems: [],
@@ -112,6 +115,15 @@ class Store {
   openReview(changesetId?: string, readOnly = false) {
     this.patch({ view: 'diff', diffReadOnly: readOnly });
     getBridge().post({ type: 'openDiff', changesetId });
+  }
+
+  /**
+   * Ask the host to open a preview. The view switch happens only when the host
+   * answers with a `preview` message — the host may instead toast "nothing
+   * previewable", so we do NOT switch optimistically.
+   */
+  openPreview(path?: string, changesetId?: string) {
+    getBridge().post({ type: 'openPreview', path, changesetId });
   }
 
   /** Drop the mention picker without answering (the user moved on to a new prompt). */
@@ -171,6 +183,13 @@ class Store {
         // The changeset went away (e.g. applied/discarded) while reviewing it →
         // don't strand the user on an empty diff view.
         if (!msg.view && this.state.view === 'diff') this.patch({ view: 'chat' });
+        break;
+      case 'preview':
+        this.patch({ preview: msg.state });
+        // Host answered an openPreview → show the preview view.
+        if (msg.state && this.state.view !== 'preview') this.patch({ view: 'preview' });
+        // Preview closed while viewing it → return to chat.
+        if (!msg.state && this.state.view === 'preview') this.patch({ view: 'chat' });
         break;
       case 'rebaseState':
         this.patch({ rebase: msg.state });

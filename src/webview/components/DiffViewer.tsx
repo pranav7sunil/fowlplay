@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import type { ChangeSetView, FileDiff, DiffHunk, RebaseState } from '../../shared/types';
 import { Dropdown, Modal } from './common';
 import { post, store } from './store';
-import { IconX, IconChevronDown, IconFile, IconCheck, IconGit, IconAlert } from './icons';
+import { IconX, IconChevronDown, IconFile, IconCheck, IconGit, IconAlert, IconEye } from './icons';
 
 interface FlatHunk {
   file: FileDiff;
@@ -95,6 +95,15 @@ export function DiffViewer({
         <span class="fp-tokens" style={{ fontSize: '13px' }}>
           <span class="fp-add">+{view.additions}</span> <span class="fp-del">-{view.deletions}</span>
         </span>
+        {view.previewPath && (
+          <button
+            type="button"
+            class="fp-btn fp-btn-secondary fp-btn-sm"
+            onClick={() => store.openPreview(view.previewPath, readOnly ? view.id : undefined)}
+          >
+            <IconEye size={14} /> Preview
+          </button>
+        )}
         <button type="button" class="fp-icon-btn" onClick={close} aria-label="Close diff (Esc)"><IconX /></button>
       </div>
 

@@ -41,6 +41,8 @@ export const IconTrash = (p: P) => svg(<><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H
 export const IconCopy = (p: P) => svg(<><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></>, p);
 export const IconFile = (p: P) => svg(<><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></>, p);
 export const IconDiff = (p: P) => svg(<><path d="M12 3v18M5 8l-3 3 3 3M19 8l3 3-3 3" /></>, p);
+export const IconExternalLink = (p: P) => svg(<><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /><path d="M15 3h6v6" /><path d="M10 14L21 3" /></>, p);
+export const IconRefresh = (p: P) => svg(<><path d="M23 4v6h-6" /><path d="M1 20v-6h6" /><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" /></>, p);
 export const IconGit = (p: P) => svg(<><circle cx="12" cy="5" r="2" /><circle cx="6" cy="19" r="2" /><circle cx="18" cy="12" r="2" /><path d="M12 7v6a4 4 0 0 0 4 4M6 17V7" /></>, p);
 export const IconWrench = (p: P) => svg(<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z" />, p);
 export const IconShield = (p: P) => svg(<><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></>, p);

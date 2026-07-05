@@ -28,6 +28,8 @@ import {
   type DiskIo,
   type GitPort,
   type HistoryPort,
+  type PreviewPort,
+  type PreviewSource,
   type SecretsPort,
   type SessionDeps,
   type SettingsPort,
@@ -2487,5 +2489,150 @@ describe('rebase button — drifted MODIFY whose hunks cannot apply', () => {
     expect(t).toHaveLength(1);
     expect(t[0]).toMatchObject({ level: 'warn' });
     expect(t[0].message).toMatch(/could not be resolved: foo\.txt/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Preview (overlay-backed)
+// ---------------------------------------------------------------------------
+
+/** A PreviewPort fake that records opens/closes and captures the source it is handed. */
+class FakePreview implements PreviewPort {
+  opened: { source: PreviewSource; entry: string }[] = [];
+  closed = 0;
+  external: string[] = [];
+  async open(source: PreviewSource, entryPath: string): Promise<{ url: string }> {
+    this.opened.push({ source, entry: entryPath });
+    return { url: `http://preview.test/${entryPath}` };
+  }
+  close() {
+    this.closed += 1;
+  }
+  openExternal(url: string) {
+    this.external.push(url);
+  }
+}
+
+/**
+ * A session wired with a FakePreview. `edits` is the single edit_files tool call the
+ * (solo) build turn stages, so a test can seed the overlay with exactly the ops it needs.
+ */
+function makePreviewSession(edits: unknown[]) {
+  const io = new FakeIo();
+  const posted: HostToWebview[] = [];
+  const preview = new FakePreview();
+  const adapter: ProviderAdapter = {
+    chat(request: ChatRequest) {
+      const hasToolResult = request.messages.some((m) => m.role === 'tool');
+      const events: StreamEvent[] = hasToolResult
+        ? textEvents('done')
+        : [
+            { type: 'tool_call_start', id: 't1', name: 'edit_files' },
+            { type: 'tool_call_args', id: 't1', delta: JSON.stringify({ edits }) },
+            { type: 'tool_call_end', id: 't1' },
+            USAGE,
+            { type: 'done', stopReason: 'tool_use' },
+          ];
+      return (async function* () {
+        for (const e of events) yield e;
+      })();
+    },
+  };
+  const deps: SessionDeps = {
+    io,
+    secrets: new FakeSecrets(),
+    settings: new FakeSettings('solo'),
+    history: new FakeHistory(),
+    git: fakeGit,
+    preview,
+    post: (m) => posted.push(m),
+    createAdapter: () => adapter,
+    fetchModels: async () => [{ id: 'm1' }],
+    clock: () => Date.now(),
+  };
+  return { session: createSessionCore(deps), posted, io, preview };
+}
+
+function lastPreview(posted: HostToWebview[]) {
+  for (let i = posted.length - 1; i >= 0; i--) {
+    const m = posted[i];
+    if (m.type === 'preview') return m.state;
+  }
+  return undefined;
+}
+
+describe('preview', () => {
+  it('opens the overlay server for a staged page and reads staged/deleted/untracked correctly', async () => {
+    const { session, posted, io, preview } = makePreviewSession([
+      { path: 'index.html', create: '<h1>hi</h1>' },
+      { path: 'old.txt', delete: true },
+    ]);
+    io.files.set('old.txt', 'goodbye'); // exists on disk so the delete stages
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'build a page' });
+
+    await session.handle({ type: 'openPreview' });
+
+    // Port opened with the detected html entry.
+    expect(preview.opened).toHaveLength(1);
+    expect(preview.opened[0].entry).toBe('index.html');
+
+    // The webview got a page preview carrying the returned URL.
+    const state = lastPreview(posted);
+    expect(state).toEqual({ kind: 'page', url: 'http://preview.test/index.html', path: 'index.html' });
+
+    // The captured source reads through the overlay: staged content, staged delete, untracked.
+    const source = preview.opened[0].source;
+    expect(await source.staged('index.html')).toEqual({ content: '<h1>hi</h1>' });
+    expect(await source.staged('old.txt')).toEqual({ content: null }); // staged delete → must 404
+    expect(await source.staged('never-touched.css')).toBeNull(); // untracked → disk fallback
+  });
+
+  it('renders a staged Markdown entry in-webview without opening the server', async () => {
+    const { session, posted, preview } = makePreviewSession([{ path: 'notes.md', create: '# Notes\n' }]);
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'write notes' });
+
+    await session.handle({ type: 'openPreview' });
+
+    expect(preview.opened).toHaveLength(0); // no server for markdown
+    expect(lastPreview(posted)).toEqual({ kind: 'markdown', path: 'notes.md', content: '# Notes\n' });
+  });
+
+  it('warns and posts no preview when nothing is previewable', async () => {
+    const { session, posted, preview } = makePreviewSession([{ path: 'main.ts', create: 'export {};\n' }]);
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'write code' });
+
+    const before = posted.length;
+    await session.handle({ type: 'openPreview' });
+
+    expect(preview.opened).toHaveLength(0);
+    expect(posted.slice(before).some((m) => m.type === 'preview')).toBe(false);
+    expect(posted.slice(before).some((m) => m.type === 'toast' && m.level === 'warn')).toBe(true);
+  });
+
+  it('closePreview closes the port and posts a null preview', async () => {
+    const { session, posted, preview } = makePreviewSession([{ path: 'index.html', create: '<h1>hi</h1>' }]);
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'build a page' });
+    await session.handle({ type: 'openPreview' });
+
+    const before = posted.length;
+    await session.handle({ type: 'closePreview' });
+
+    expect(preview.closed).toBeGreaterThan(0);
+    expect(lastPreview(posted.slice(before))).toBeNull();
+  });
+
+  it('newConversation closes the preview', async () => {
+    const { session, preview } = makePreviewSession([{ path: 'index.html', create: '<h1>hi</h1>' }]);
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'build a page' });
+    await session.handle({ type: 'openPreview' });
+
+    const before = preview.closed;
+    await session.handle({ type: 'newConversation' });
+    expect(preview.closed).toBeGreaterThan(before);
   });
 });
