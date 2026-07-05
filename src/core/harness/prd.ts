@@ -206,7 +206,7 @@ function slug(title: string): string {
  * PRD, then the full spec markdown. `index`/`total` are 1-based.
  */
 export function composeStoryPrompt(specMarkdown: string, index: number, total: number): string {
-  return `Story ${index} of ${total} decomposed from a PRD. Implement ONLY this story; earlier stories are already staged/applied.
+  return `Story ${index} of ${total} decomposed from a PRD. Implement ONLY this story. Earlier stories' work is already staged or applied in the workspace — read the files rather than assuming.
 
 ${specMarkdown.trim()}`;
 }

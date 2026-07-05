@@ -395,6 +395,17 @@ await waitFor(page, () => !!Array.from(document.querySelectorAll('button')).find
 // Retry posts retryStory (one code path re-runs the cursor story).
 await page.getByRole('button', { name: /Retry story/ }).first().click();
 ok((await sent(page, 'retryStory')).length >= 1, 'Retry button posts retryStory');
+// While a story is streaming, the pinned PRD bar swaps its actions for a Stop
+// button that posts cancelResponse (catch→stop→retry in one place). turnStarted
+// (with no matching turnFinished) flips the store into the streaming state.
+await page.evaluate(() => window.__host.emit(window.__fixtures.prdConversation('awaiting-review')));
+await page.evaluate(() => window.__host.emit({ type: 'turnStarted', nodeId: 'a1' }));
+await waitFor(page, () => {
+  const bar = document.querySelector('.fp-plan-bar');
+  return !!bar && /Stop/.test(bar.textContent || '');
+}, 'PRD bar shows a Stop button while streaming');
+await page.locator('.fp-plan-bar').getByRole('button', { name: /Stop/ }).click();
+ok((await sent(page, 'cancelResponse')).length >= 1, 'PRD bar Stop posts cancelResponse');
 
 // ============================== PRD CHIP =====================================
 console.log('\n# prd chip');

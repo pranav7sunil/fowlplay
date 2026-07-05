@@ -801,6 +801,30 @@ describe('context-window management', () => {
 });
 
 // ---------------------------------------------------------------------------
+// max_tokens output cap (never unlimited)
+// ---------------------------------------------------------------------------
+
+describe('max_tokens output cap', () => {
+  it('sends the fixed 8192 default cap when the model context window is unknown', async () => {
+    const { session, requests } = makeSession({ path: 'foo.txt', content: 'x\n' }); // model has no window
+    await session.handle({ type: 'ready' });
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'create foo.txt' });
+    // Every call this turn carries the safety-net cap (no unlimited generation).
+    expect(requests[idx].maxTokens).toBe(8192);
+  });
+
+  it('caps at the response reserve (max(1500, 25% of window)) when the window is known', async () => {
+    // window 8000 → reserve max(1500, floor(0.25 * 8000)) = 2000.
+    const { session, requests } = makeWindowSession({ window: 8000, path: 'foo.txt', content: 'hi\n' });
+    await session.handle({ type: 'ready' });
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'create foo.txt' });
+    expect(requests[idx].maxTokens).toBe(2000);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Cross-surface settings sync
 // ---------------------------------------------------------------------------
 
@@ -1562,6 +1586,97 @@ describe('coop context digest', () => {
     expect(digest).toContain('[…]');
     // …and the digest is bounded (per-message ~600 chars, total ~2000).
     expect(digest.length).toBeLessThan(2200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fresh-context story runs (Builder starts from the spec, not the conversation)
+// ---------------------------------------------------------------------------
+
+describe('fresh-context story runs', () => {
+  it('a continued story build carries the spec but NOT the prior conversation wire', async () => {
+    const { session, requests } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'PRDPROMPTMARKER build the whole thing', prd: true });
+
+    const idx = requests.length;
+    await session.handle({ type: 'continueStoryLoop' }); // build story 2 from a fresh window
+
+    const storyBuilders = requests.slice(idx).filter((r) => !isRolePrompt(r.system));
+    expect(storyBuilders.length).toBeGreaterThan(0);
+    // The Builder sees the story's spec (its title)…
+    expect(storyBuilders.some((r) => allWireText(r).includes('Second story'))).toBe(true);
+    // …but never the earlier PRD conversation text.
+    for (const r of storyBuilders) {
+      expect(allWireText(r)).not.toContain('PRDPROMPTMARKER');
+    }
+  });
+
+  it('a normal (non-PRD) coop turn still carries prior conversation history to the Builder', async () => {
+    const { session, requests } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'FIRSTMARK build the login form' });
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'SECONDMARK now add validation' });
+
+    const builder = requests.slice(idx).find((r) => !isRolePrompt(r.system));
+    expect(builder).toBeDefined();
+    // The Builder's wire keeps prior conversation continuity (unlike a story build).
+    expect(allWireText(builder!)).toContain('FIRSTMARK');
+    expect(allWireText(builder!)).toContain('SECONDMARK');
+  });
+
+  it('a retried story starts with only the spec (clean-context restart)', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    const requests: ChatRequest[] = [];
+    let approveInspector = false; // story 1 fails first, then a retry approves
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        requests.push(request);
+        let events: StreamEvent[];
+        if (request.system.includes('FOREMAN')) events = textEvents(TWO_STORY_JSON);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+        else if (request.system.includes('SENTRY')) events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        else if (request.system.includes('INSPECTOR'))
+          events = textEvents(JSON.stringify({ verdict: approveInspector ? 'approve' : 'reject', findings: approveInspector ? [] : ['not yet'] }));
+        else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        }
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'RETRYPRDMARKER build it', prd: true }); // story 1 fails
+
+    approveInspector = true;
+    const idx = requests.length;
+    await session.handle({ type: 'retryStory' });
+
+    const retryBuilders = requests.slice(idx).filter((r) => !isRolePrompt(r.system));
+    expect(retryBuilders.length).toBeGreaterThan(0);
+    // The retried Builder sees the story spec (title) but not the PRD conversation text.
+    expect(retryBuilders.some((r) => allWireText(r).includes('First story'))).toBe(true);
+    for (const r of retryBuilders) {
+      expect(allWireText(r)).not.toContain('RETRYPRDMARKER');
+    }
   });
 });
 

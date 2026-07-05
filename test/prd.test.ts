@@ -166,7 +166,7 @@ describe('composeStoryPrompt', () => {
     const prompt = composeStoryPrompt(spec, 2, 5);
     expect(prompt).toContain('Story 2 of 5 decomposed from a PRD');
     expect(prompt).toContain('Implement ONLY this story');
-    expect(prompt).toContain('earlier stories are already staged/applied');
+    expect(prompt).toContain('read the files rather than assuming');
     expect(prompt).toContain('# Add pagination');
     // The spec text follows the preamble.
     expect(prompt.indexOf('Story 2 of 5')).toBeLessThan(prompt.indexOf('# Add pagination'));
