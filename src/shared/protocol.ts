@@ -94,7 +94,10 @@ export type HostToWebview =
   | { type: 'conversation'; conversation: Conversation }
   // streaming during a turn
   | { type: 'stream'; event: StreamEvent }
-  | { type: 'gateUpdate'; card: GateCard }
+  // `nodeId` is the assistant node the card belongs to — authoritative routing so
+  // a late update from a superseded turn can be dropped rather than grafted onto
+  // whatever node is newest.
+  | { type: 'gateUpdate'; card: GateCard; nodeId: string }
   | { type: 'turnStarted'; nodeId: string }                       // assistant node created
   | { type: 'selectionContext'; context: SelectionContext | null } // scoped editor selection (null clears the chip)
   | { type: 'turnFinished'; nodeId: string; usage: TokenUsage }

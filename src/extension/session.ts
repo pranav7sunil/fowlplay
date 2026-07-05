@@ -194,6 +194,14 @@ export class SessionCore {
   private changeset: ChangeSet;
   private settingsCache: FowlPlaySettings | null = null;
   private abort: AbortController | null = null;
+  /**
+   * Monotonically increasing turn counter. Every turn captures its epoch at the
+   * moment it starts; all posts it makes (stream/gate/turnStarted/turnFinished)
+   * and its finalization run through {@link postForTurn} / an epoch check, so the
+   * instant a newer turn or a conversation switch bumps the epoch, the old turn
+   * goes dark — even while its underlying model fetch is still unwinding.
+   */
+  private turnEpoch = 0;
   /** Monotonic counter for disk-only applies that have no commit sha. */
   private appliedSeq = 0;
 
@@ -488,6 +496,33 @@ export class SessionCore {
     }
   }
 
+  /**
+   * Post a message on behalf of a turn, dropping it if that turn has been
+   * superseded (its captured `epoch` no longer matches the live `turnEpoch`).
+   * Every stream / gate / turnStarted / turnFinished emission for a turn routes
+   * through here, so a runaway turn's progress ticker and role-call streams go
+   * dark the instant it is superseded — even before its fetch actually dies.
+   */
+  private postForTurn(epoch: number, msg: HostToWebview): void {
+    if (epoch !== this.turnEpoch) return;
+    this.deps.post(msg);
+  }
+
+  /**
+   * Supersede any in-flight turn before clearing / switching the conversation.
+   * Bumps the epoch FIRST (so the old turn's late posts are dropped immediately,
+   * even while its fetch is still unwinding), aborts its controller so the model
+   * call cancels, and posts a `stream done/cancelled` so the webview's streaming
+   * flag clears if it was mid-turn. A no-op when nothing is running.
+   */
+  private supersedeInFlightTurn(): void {
+    if (!this.abort) return;
+    this.turnEpoch += 1;
+    this.abort.abort();
+    this.abort = null;
+    this.deps.post({ type: 'stream', event: { type: 'done', stopReason: 'cancelled' } });
+  }
+
   // -------------------------------------------------------------------------
   // Turn flow
   // -------------------------------------------------------------------------
@@ -703,11 +738,22 @@ export class SessionCore {
     imageParts: WireUserPart[] = [],
     opts: { prd?: boolean; storyIndex?: number } = {},
   ): Promise<void> {
+    // Supersede any still-running turn: abort its controller (so its model call
+    // unwinds) and bump the epoch (so its late posts + finalization are dropped
+    // even before the fetch dies). Capture this turn's epoch for its closures.
+    if (this.abort) this.abort.abort();
+    this.turnEpoch += 1;
+    const epoch = this.turnEpoch;
+    this.abort = new AbortController();
+    const signal = this.abort.signal;
+
     const settings = await this.ensureSettings();
     const resolved = await this.resolveModel();
     if (!resolved) {
       this.toast('error', 'No model configured. Add a provider and pick a model first.');
       this.sendConversation();
+      // Release this turn's controller unless a newer turn already replaced it.
+      if (epoch === this.turnEpoch) this.abort = null;
       return;
     }
 
@@ -745,28 +791,25 @@ export class SessionCore {
     const assistant = appendAssistant(this.conv, [], { parentId: userNodeId, model: this.conv.model ?? undefined });
     this.conv = assistant.conv;
     const assistantId = assistant.nodeId;
-    this.deps.post({ type: 'turnStarted', nodeId: assistantId });
-
-    this.abort = new AbortController();
-    const signal = this.abort.signal;
+    this.postForTurn(epoch, { type: 'turnStarted', nodeId: assistantId });
 
     let blocks: ContentBlock[] = [];
     let usage: TokenUsage = emptyUsage();
     try {
       if (opts.prd) {
-        const out = await this.runPrd(userText, imageParts, resolved, settings.harness, signal, contextDigest);
+        const out = await this.runPrd(userText, imageParts, resolved, settings.harness, signal, epoch, assistantId, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else if (opts.storyIndex !== undefined) {
-        const out = await this.runStory(opts.storyIndex, resolved, settings.harness, signal, contextDigest);
+        const out = await this.runStory(opts.storyIndex, resolved, settings.harness, signal, epoch, assistantId, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else if (this.conv.harnessMode === 'coop') {
-        const out = await this.runCoop(userText, imageParts, baseWire, resolved, settings.harness, signal, contextDigest);
+        const out = await this.runCoop(userText, imageParts, baseWire, resolved, settings.harness, signal, epoch, assistantId, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else {
-        const out = await this.runSolo(userText, imageParts, baseWire, resolved, assistantId, signal);
+        const out = await this.runSolo(userText, imageParts, baseWire, resolved, assistantId, signal, epoch);
         blocks = out.blocks;
         usage = out.usage;
       }
@@ -774,8 +817,14 @@ export class SessionCore {
       blocks = [{ type: 'error', message: errMessage(err) }];
     }
 
+    // Superseded mid-flight (a newer turn, or a conversation switch/clear): this
+    // turn must NOT finalize — `this.conv` now points at a different conversation,
+    // and every late post is already being dropped. Bail without mutating state
+    // or nulling the newer turn's controller.
+    if (epoch !== this.turnEpoch) return;
+
     if (signal.aborted) {
-      this.deps.post({ type: 'stream', event: { type: 'done', stopReason: 'cancelled' } });
+      this.postForTurn(epoch, { type: 'stream', event: { type: 'done', stopReason: 'cancelled' } });
     }
 
     // Append a "Review Changes" block when the turn left staged edits.
@@ -787,9 +836,10 @@ export class SessionCore {
     this.snapshotOverlay(assistantId);
     await this.persist();
 
-    this.deps.post({ type: 'turnFinished', nodeId: assistantId, usage });
+    this.postForTurn(epoch, { type: 'turnFinished', nodeId: assistantId, usage });
     this.sendConversation();
-    this.abort = null;
+    // Release the controller unless the persist await let a newer turn replace it.
+    if (epoch === this.turnEpoch) this.abort = null;
   }
 
   private async runSolo(
@@ -799,6 +849,7 @@ export class SessionCore {
     resolved: ResolvedModel,
     assistantId: string,
     signal: AbortSignal,
+    epoch: number,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const settings = await this.ensureSettings();
     const fullHistory: WireMessage[] = [
@@ -834,7 +885,7 @@ export class SessionCore {
       history: sent,
       tools: this.toolsWithSkills(),
       toolHost: this.toolHost(),
-      onEvent: (e) => this.deps.post({ type: 'stream', event: e }),
+      onEvent: (e) => this.postForTurn(epoch, { type: 'stream', event: e }),
       signal,
     });
 
@@ -851,10 +902,12 @@ export class SessionCore {
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
+    epoch: number,
+    nodeId: string,
     contextDigest?: string,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const cards: GateCard[] = [];
-    const result = await this.runCoopCore(userText, imageParts, baseWire, resolved, harness, signal, cards, contextDigest);
+    const result = await this.runCoopCore(userText, imageParts, baseWire, resolved, harness, signal, cards, epoch, nodeId, contextDigest);
 
     const blocks: ContentBlock[] = cards.map((card) => ({ type: 'gate', card }));
     const text = this.coopOutcomeText(result);
@@ -876,6 +929,8 @@ export class SessionCore {
     harness: HarnessSettings,
     signal: AbortSignal,
     cards: GateCard[],
+    epoch: number,
+    nodeId: string,
     contextDigest?: string,
   ): Promise<CoopResult> {
     const settings = await this.ensureSettings();
@@ -956,7 +1011,7 @@ export class SessionCore {
           history,
           tools: this.toolsWithSkills(),
           toolHost: this.toolHost(),
-          onEvent: this.progressOnEvent((e) => this.deps.post({ type: 'stream', event: e }), onProgress),
+          onEvent: this.progressOnEvent((e) => this.postForTurn(epoch, { type: 'stream', event: e }), onProgress),
           signal: s,
         });
       } catch (err) {
@@ -981,7 +1036,7 @@ export class SessionCore {
       settings: harness,
       onGate: (card) => {
         upsertCard(cards, card);
-        this.deps.post({ type: 'gateUpdate', card });
+        this.postForTurn(epoch, { type: 'gateUpdate', card, nodeId });
       },
       modelLabelFor: (role) => this.roleModelLabel(settings, role),
       diffBudgetFor: (role) => this.payloadBudget(settings, role),
@@ -1025,6 +1080,8 @@ export class SessionCore {
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
+    epoch: number,
+    nodeId: string,
     contextDigest?: string,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const settings = await this.ensureSettings();
@@ -1032,7 +1089,7 @@ export class SessionCore {
     const cards: GateCard[] = [];
     const emit = (card: GateCard): GateCard => {
       upsertCard(cards, card);
-      this.deps.post({ type: 'gateUpdate', card });
+      this.postForTurn(epoch, { type: 'gateUpdate', card, nodeId });
       return card;
     };
     const gateBlocks = (): ContentBlock[] => cards.map((card) => ({ type: 'gate', card }));
@@ -1114,7 +1171,7 @@ export class SessionCore {
     );
 
     // --- Build story 1 immediately, within this same turn ---
-    const story1 = await this.runStory(0, resolved, harness, signal, contextDigest);
+    const story1 = await this.runStory(0, resolved, harness, signal, epoch, nodeId, contextDigest);
     addUsageInPlace(usage, story1.usage);
 
     // Blocks: Foreman gate, the plan marker (renders live), then story 1's cards + outcome.
@@ -1131,6 +1188,8 @@ export class SessionCore {
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
+    epoch: number,
+    nodeId: string,
     contextDigest?: string,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const plan = this.conv.prdPlan;
@@ -1152,7 +1211,7 @@ export class SessionCore {
     // "Retry story" is mechanically a clean-context restart. The Scout still
     // receives the cheap contextDigest for user clarifications.
     const cards: GateCard[] = [];
-    const result = await this.runCoopCore(userPrompt, [], [], resolved, harness, signal, cards, contextDigest);
+    const result = await this.runCoopCore(userPrompt, [], [], resolved, harness, signal, cards, epoch, nodeId, contextDigest);
 
     const status: PrdStory['status'] =
       result.outcome === 'ready-for-review' ? 'awaiting-review' : result.outcome === 'cancelled' ? 'pending' : 'failed';
@@ -1575,6 +1634,9 @@ export class SessionCore {
   }
 
   private async onNewConversation(): Promise<void> {
+    // Kill any in-flight turn before swapping the conversation out from under it,
+    // so its late gate/stream posts can't graft onto the fresh conversation.
+    this.supersedeInFlightTurn();
     const settings = await this.ensureSettings();
     this.conv = createConversation(settings.defaultModel, settings.harness.defaultMode);
     this.overlay = new StagingOverlay(this.deps.io);
@@ -1585,6 +1647,9 @@ export class SessionCore {
   }
 
   private async onOpenConversation(id: string): Promise<void> {
+    // Kill any in-flight turn before loading a different conversation, so its
+    // late gate/stream posts can't graft onto the one we switch to.
+    this.supersedeInFlightTurn();
     const loaded = await this.deps.history.load(id);
     if (!loaded) {
       this.toast('error', 'Conversation not found.');

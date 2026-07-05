@@ -450,6 +450,7 @@ await open('chat');
 await page.evaluate(() =>
   window.__host.emit({
     type: 'gateUpdate',
+    nodeId: 'a1',
     card: {
       id: 'gate-builder-model',
       role: 'builder',
