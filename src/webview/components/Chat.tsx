@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import type { Conversation, FowlPlaySettings } from '../../shared/types';
 import { activePath, post, store } from './store';
 import { Message } from './Message';
+import { PlanBar } from './blocks';
 import { Composer } from './Composer';
 import { StatusLine } from './StatusLine';
 import { IconHistory, IconPlus, IconGear, IconDiff } from './icons';
@@ -101,6 +102,7 @@ export function Chat({
           ))}
         </div>
       </div>
+      <PlanBar />
       <Composer streaming={streaming} />
       {conv && <StatusLine conv={conv} settings={settings} />}
     </div>

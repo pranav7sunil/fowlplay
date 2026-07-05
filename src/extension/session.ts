@@ -45,7 +45,8 @@ import { runAgentLoop } from '../core/agent/loop';
 import { buildToolSpecs, type DirEntry, type GrepMatch, type GrepOptions, type StageOp, type ToolHost } from '../core/agent/tools';
 import { BUNDLED_SKILLS, formatSkillCatalog, parseSkill } from '../core/agent/skills';
 import { gcHistory } from '../core/agent/contextGc';
-import { trimWireToBudget, wireTokens } from '../core/agent/contextBudget';
+import { estimateTokens, trimWireToBudget, wireTokens } from '../core/agent/contextBudget';
+import { capFileContent, expandFileMentions, extractFileMentions, fencedBlock } from '../core/agent/fileMentions';
 import { StagingOverlay, type DiskReader } from '../core/staging/overlay';
 import { ChangeSet } from '../core/staging/changeset';
 import { detectDrift, rebase as coreRebase } from '../core/staging/rebase';
@@ -59,6 +60,7 @@ import {
 } from '../core/harness/coop';
 import {
   FOREMAN_SYSTEM,
+  composeForemanPrompt,
   composeStoryPrompt,
   parseForeman,
   renderSpecMarkdown,
@@ -172,6 +174,9 @@ when you can. When you are done, briefly summarize what you changed.`;
 
 const READONLY_TOOL_NAMES = new Set(['open_files', 'list_dir', 'glob', 'grep']);
 
+/** Directories the composer's `@` file autocomplete never surfaces. */
+const FILE_LIST_EXCLUDE = new Set(['.git', 'node_modules', 'dist', '.fowlplay']);
+
 // ---------------------------------------------------------------------------
 // Session core
 // ---------------------------------------------------------------------------
@@ -263,6 +268,9 @@ export class SessionCore {
         return;
       case 'continueStoryLoop':
         await this.onContinueStoryLoop();
+        return;
+      case 'retryStory':
+        await this.rerunCursorStory('Retry');
         return;
       case 'cancelResponse':
         this.abort?.abort();
@@ -384,6 +392,9 @@ export class SessionCore {
       case 'fetchModels':
         await this.onFetchModels(msg.providerId);
         return;
+      case 'listFiles':
+        await this.onListFiles(msg.query);
+        return;
       default:
         return;
     }
@@ -498,8 +509,14 @@ export class SessionCore {
 
     // A new prompt supersedes any prompt still held behind an unanswered
     // disambiguation — otherwise answering the stale picker later would
-    // release (and run) the abandoned message.
-    this.heldMention = null;
+    // release (and run) the abandoned message. Never silently: the held
+    // message's unresolved (and even applied) assignments die with it, so the
+    // user must know their directive did not take effect.
+    if (this.heldMention) {
+      const dropped = this.heldMention.queue.map((q) => `"${q.query}"`).join(', ');
+      this.heldMention = null;
+      this.toast('warn', `Dropped the unanswered model choice for ${dropped} — that directive was not applied.`);
+    }
 
     const settings = await this.ensureSettings();
     const mentions = parseModelMentions(text);
@@ -685,8 +702,26 @@ export class SessionCore {
     this.turnSkills = await this.discoverSkills();
 
     const userNode = this.conv.nodes[userNodeId];
-    const userText = firstText(userNode?.blocks ?? []) ?? '';
+    const rawUserText = firstText(userNode?.blocks ?? []) ?? '';
+    // Resolve deterministic file references into the WIRE user text (the stored
+    // node keeps the compact reference). Skipped on synthetic story-advance turns
+    // ("Continue/Retry/Resume story N"), which build from the spec, not user prose.
+    // The budget role mirrors who dominates each mode: Scout for a PRD's Foreman,
+    // Builder for a Coop turn, the conversation model for Solo.
+    const budgetRole: CoopRole | undefined = opts.storyIndex !== undefined
+      ? undefined
+      : opts.prd
+        ? 'scout'
+        : this.conv.harnessMode === 'coop'
+          ? 'builder'
+          : undefined;
+    const userText = opts.storyIndex !== undefined
+      ? rawUserText
+      : await this.expandWireFileMentions(rawUserText, settings, budgetRole);
     const baseWire = this.wireBaseFor(userNodeId);
+    // Condensed prior-conversation context for the planning roles (Scout/Foreman),
+    // so a terse follow-up or a clarification reply is judged against the real goal.
+    const contextDigest = this.digestFor(userNodeId);
 
     // Surface the user's message (and any new branch) before streaming begins,
     // so the prompt is visible for the whole turn and the streaming assistant
@@ -705,15 +740,15 @@ export class SessionCore {
     let usage: TokenUsage = emptyUsage();
     try {
       if (opts.prd) {
-        const out = await this.runPrd(userText, imageParts, baseWire, resolved, settings.harness, signal);
+        const out = await this.runPrd(userText, imageParts, baseWire, resolved, settings.harness, signal, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else if (opts.storyIndex !== undefined) {
-        const out = await this.runStory(opts.storyIndex, baseWire, resolved, settings.harness, signal);
+        const out = await this.runStory(opts.storyIndex, baseWire, resolved, settings.harness, signal, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else if (this.conv.harnessMode === 'coop') {
-        const out = await this.runCoop(userText, imageParts, baseWire, resolved, settings.harness, signal);
+        const out = await this.runCoop(userText, imageParts, baseWire, resolved, settings.harness, signal, contextDigest);
         blocks = out.blocks;
         usage = out.usage;
       } else {
@@ -801,9 +836,10 @@ export class SessionCore {
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
+    contextDigest?: string,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const cards: GateCard[] = [];
-    const result = await this.runCoopCore(userText, imageParts, baseWire, resolved, harness, signal, cards);
+    const result = await this.runCoopCore(userText, imageParts, baseWire, resolved, harness, signal, cards, contextDigest);
 
     const blocks: ContentBlock[] = cards.map((card) => ({ type: 'gate', card }));
     const text = this.coopOutcomeText(result);
@@ -825,6 +861,7 @@ export class SessionCore {
     harness: HarnessSettings,
     signal: AbortSignal,
     cards: GateCard[],
+    contextDigest?: string,
   ): Promise<CoopResult> {
     const settings = await this.ensureSettings();
     const runner: RoleRunner = {
@@ -904,6 +941,7 @@ export class SessionCore {
 
     return runCoopPipeline({
       userPrompt,
+      contextDigest,
       runner,
       inspector,
       buildStage,
@@ -953,6 +991,7 @@ export class SessionCore {
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
+    contextDigest?: string,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const settings = await this.ensureSettings();
     const usage: TokenUsage = emptyUsage();
@@ -985,7 +1024,7 @@ export class SessionCore {
       apiKey: rm.apiKey,
       modelId: rm.modelId,
       system: FOREMAN_SYSTEM,
-      history: [{ role: 'user', content: [{ type: 'text', text: userText }, ...imageParts] }],
+      history: [{ role: 'user', content: [{ type: 'text', text: composeForemanPrompt(contextDigest, userText) }, ...imageParts] }],
       tools: this.readOnlyTools,
       toolHost: this.toolHost(),
       onEvent: () => {},
@@ -1040,7 +1079,7 @@ export class SessionCore {
     );
 
     // --- Build story 1 immediately, within this same turn ---
-    const story1 = await this.runStory(0, baseWire, resolved, harness, signal);
+    const story1 = await this.runStory(0, baseWire, resolved, harness, signal, contextDigest);
     addUsageInPlace(usage, story1.usage);
 
     // Blocks: Foreman gate, the plan marker (renders live), then story 1's cards + outcome.
@@ -1058,6 +1097,7 @@ export class SessionCore {
     resolved: ResolvedModel,
     harness: HarnessSettings,
     signal: AbortSignal,
+    contextDigest?: string,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const plan = this.conv.prdPlan;
     const story = plan?.stories[storyIndex];
@@ -1073,7 +1113,7 @@ export class SessionCore {
     const userPrompt = composeStoryPrompt(specMarkdown, storyIndex + 1, total);
 
     const cards: GateCard[] = [];
-    const result = await this.runCoopCore(userPrompt, [], baseWire, resolved, harness, signal, cards);
+    const result = await this.runCoopCore(userPrompt, [], baseWire, resolved, harness, signal, cards, contextDigest);
 
     const status: PrdStory['status'] =
       result.outcome === 'ready-for-review' ? 'awaiting-review' : result.outcome === 'cancelled' ? 'pending' : 'failed';
@@ -1105,11 +1145,7 @@ export class SessionCore {
     // A pending cursor story was cancelled (or never started): Continue means
     // RETRY it, not mark it done and skip past work that never happened.
     if (current.status === 'pending') {
-      const { conv, nodeId } = appendUser(this.conv, [
-        { type: 'text', text: `Resume story ${i + 1}: ${current.title}` },
-      ]);
-      this.conv = conv;
-      await this.runAssistantTurn(nodeId, [], { storyIndex: i });
+      await this.rerunCursorStory('Resume');
       return;
     }
 
@@ -1140,6 +1176,60 @@ export class SessionCore {
     ]);
     this.conv = conv;
     await this.runAssistantTurn(nodeId, [], { storyIndex: nextCursor });
+  }
+
+  /**
+   * Re-run the plan's cursor story as a fresh turn — the single code path behind both the
+   * `retryStory` message (a failed story) and the pending-resume branch of the Continue
+   * button (a cancelled/never-started story). Ignored while a turn is streaming; acts only
+   * when the cursor story is `failed` or `pending`. `verb` labels the synthetic user node
+   * ("Retry story N" / "Resume story N") so rewind/branching stay coherent.
+   */
+  private async rerunCursorStory(verb: 'Retry' | 'Resume'): Promise<void> {
+    if (this.abort) return; // a turn is in flight — ignore
+    const plan = this.conv.prdPlan;
+    if (!plan) return;
+    const i = plan.cursor;
+    const current = plan.stories[i];
+    if (!current) return;
+    if (current.status !== 'failed' && current.status !== 'pending') return;
+    const { conv, nodeId } = appendUser(this.conv, [
+      { type: 'text', text: `${verb} story ${i + 1}: ${current.title}` },
+    ]);
+    this.conv = conv;
+    await this.runAssistantTurn(nodeId, [], { storyIndex: i });
+  }
+
+  /**
+   * A condensed digest of the conversation preceding `userNodeId`, for the planning roles.
+   * Walks the active path up to (but excluding) the current user node, takes the last 6
+   * user/assistant nodes' TEXT blocks only (gate/tool/plan/commit blocks are skipped),
+   * truncates each message to ~600 chars, and joins them as `user:`/`assistant:` lines,
+   * capping the whole digest at ~2000 chars (oldest dropped first). Empty history → undefined.
+   */
+  private digestFor(userNodeId: string): string | undefined {
+    const MAX_PER = 600;
+    const MAX_TOTAL = 2000;
+    const parentId = this.conv.nodes[userNodeId]?.parentId ?? null;
+    if (!parentId) return undefined;
+
+    const relevant = this.chainTo(parentId).filter((n) => n.role === 'user' || n.role === 'assistant');
+    const entries: string[] = [];
+    for (const n of relevant.slice(-6)) {
+      const text = n.blocks
+        .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+        .map((b) => b.text.trim())
+        .filter(Boolean)
+        .join('\n');
+      if (!text) continue;
+      const clipped = text.length > MAX_PER ? `${text.slice(0, MAX_PER)} […]` : text;
+      entries.push(`${n.role}: ${clipped}`);
+    }
+    if (entries.length === 0) return undefined;
+
+    // Cap the whole digest, dropping the oldest entries first.
+    while (entries.length > 1 && entries.join('\n').length > MAX_TOTAL) entries.shift();
+    return entries.join('\n');
   }
 
   /** Set a story's status immutably on the conversation's plan (no-op if the plan is gone). */
@@ -1521,9 +1611,73 @@ export class SessionCore {
     }
   }
 
+  /**
+   * Serve the composer's `@` autocomplete: glob the workspace, drop noise
+   * directories, filter by the query (case-insensitive substring), and return the
+   * top matches. Best-effort — a glob failure yields an empty list.
+   */
+  private async onListFiles(query?: string): Promise<void> {
+    let paths: string[] = [];
+    try {
+      paths = await this.deps.io.glob('**/*');
+    } catch {
+      paths = [];
+    }
+    const visible = paths
+      .filter((p) => !p.split('/').some((seg) => FILE_LIST_EXCLUDE.has(seg)))
+      .slice(0, 2000);
+    const q = (query ?? '').trim().toLowerCase();
+    const matched = q ? visible.filter((p) => p.toLowerCase().includes(q)) : visible;
+    this.deps.post({ type: 'fileList', paths: matched.slice(0, 50) });
+  }
+
   // -------------------------------------------------------------------------
   // Helpers
   // -------------------------------------------------------------------------
+
+  /**
+   * Resolve deterministic file references in the wire user text and inline their
+   * content, so roles receive the referenced files directly rather than depending
+   * on a model choosing to call a tool. Explicit `@<path>` mentions that do not
+   * resolve get a warning toast; bare path-looking tokens that do not resolve are
+   * silently treated as prose. Each included file is capped to
+   * `min(24k chars, half the role's payload budget)`. A single success toast lists
+   * everything included. Returns the text unchanged when nothing resolves.
+   *
+   * Reads through the staging overlay so a staged edit of a file wins over disk,
+   * and runs at wire-composition time so edits/reruns re-read fresh content.
+   */
+  private async expandWireFileMentions(text: string, settings: FowlPlaySettings, budgetRole?: CoopRole): Promise<string> {
+    const { explicit, bare } = extractFileMentions(text);
+    if (explicit.length === 0 && bare.length === 0) return text;
+
+    const budget = this.payloadBudget(settings, budgetRole);
+    const cap = budget !== undefined ? Math.min(24_000, budget * 2) : 24_000;
+
+    const included: { path: string; content: string }[] = [];
+    const toastParts: string[] = [];
+    const includePath = async (path: string, missing: () => void): Promise<void> => {
+      const raw = await this.overlay.read(path);
+      if (raw === null) {
+        missing();
+        return;
+      }
+      const capped = capFileContent(raw, cap);
+      included.push({ path, content: capped.content });
+      toastParts.push(`${path} (~${fmtTokensK(estimateTokens(capped.content))} tokens)${capped.truncated ? ' — truncated' : ''}`);
+    };
+
+    for (const path of explicit) {
+      await includePath(path, () => this.toast('warn', `@${path} not found in the workspace`));
+    }
+    for (const path of bare) {
+      await includePath(path, () => {}); // bare non-matches are just prose
+    }
+
+    if (included.length === 0) return text;
+    this.toast('info', `Included ${toastParts.join(', ')}`);
+    return expandFileMentions(text, included);
+  }
 
   private toolHost(): ToolHost {
     const overlay = this.overlay;
@@ -1812,19 +1966,6 @@ function addUsageInPlace(a: TokenUsage, b: TokenUsage): void {
 function firstText(blocks: ContentBlock[]): string | null {
   for (const b of blocks) if (b.type === 'text' && b.text.trim()) return b.text;
   return null;
-}
-
-/**
- * Wrap arbitrary content in a fenced code block whose backtick run is longer
- * than any run inside the content, so selected text or a file that itself
- * contains ``` cannot break out of the fence (which would corrupt the pinned
- * context / open a prompt-injection seam).
- */
-function fencedBlock(info: string, content: string): string {
-  let longest = 0;
-  for (const m of content.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
-  const fence = '`'.repeat(Math.max(3, longest + 1));
-  return `${fence}${info}\n${content}\n${fence}`;
 }
 
 function joinText(blocks: ContentBlock[]): string {

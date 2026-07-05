@@ -161,6 +161,27 @@ you typed isn't a command, just press **Enter** to send it as an ordinary prompt
 `/model`, `/export`, and `/skills` open a second-level list in the same popup — keep typing
 to filter it, or press **Esc** to step back to the command list.
 
+### Referencing files (`@` mentions and bare paths)
+
+FowlPlay resolves file references in your prompt **on the host** and hands the file
+contents straight to the model — so a request like *"implement auraringprd.md"* works even
+in Coop or PRD builds, where the planning roles used to only see your words and had to guess
+whether to open the file.
+
+- **`@` autocomplete** — type **`@`** anywhere a word starts to open a file picker listing
+  your workspace files (`.git`, `node_modules`, `dist`, and `.fowlplay` are hidden). Keep
+  typing to filter (substring match on the path); **↑/↓** move, **Enter/Tab** or a click
+  inserts `@<path>`, **Esc** closes. An explicit `@`-mention that doesn't resolve gets a
+  warning so you know it was ignored.
+- **Bare paths** — a path-looking token *without* `@` (contains a `/`, or ends in a known
+  text extension like `.md`, `.ts`, `.json`, …) is picked up too. If it resolves to a real
+  file it's included; if not, it's just treated as prose (no warning). Plain numbers,
+  versions (`3.6`, `v1.2.3`), model names, and URLs are never mistaken for files.
+
+When files are included, a toast lists them with an approximate token size (large files are
+truncated to fit the model's context window). Your transcript keeps the compact reference —
+the full contents are re-read fresh on every send, edit, or rerun, so they never go stale.
+
 ---
 
 ## 6. Making your first change
@@ -218,9 +239,19 @@ review between each.
    status glyph each: ○ pending, spinner building, ◉ awaiting review, ✓ done, ✕ failed.
 5. Review story 1's diff as usual (apply, comment, revert, send feedback). When you're
    satisfied, press **Continue — next story** on the plan block. That marks the story done
-   and builds the next one as a fresh turn. If a story failed, the button reads **Continue
-   anyway** — moving on is your call, and the skip is noted in that story's spec file.
-6. When the last story is done, a short **completion summary** lists every story's final
+   and builds the next one as a fresh turn.
+   - If a story **failed** its checks, you get two buttons: **Retry story** re-runs that same
+     story from scratch (worth a try after you've tweaked its spec, or just to give it
+     another pass), and **Skip story** moves on anyway — your call, and the skip is noted in
+     that story's spec file.
+   - If a story was **cancelled** mid-build (it shows as pending), **Resume story N** re-runs
+     it — nothing is skipped that never happened.
+6. A **pinned PRD bar** sits just above the composer for the whole build: it shows
+   "N of M done · story K …" and repeats the current story's action buttons, so you can
+   retry, skip, or continue without scrolling back up to the plan block after a story has
+   streamed its gate cards. While a story is building it reads "building story K…" with no
+   buttons.
+7. When the last story is done, a short **completion summary** lists every story's final
    status.
 
 The plan lives on the conversation, so it survives save/reload and shows the live status

@@ -198,6 +198,57 @@ describe('runCoopPipeline — modelLabelFor', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Context digest → Scout prompt composition
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — contextDigest', () => {
+  it('prepends the condensed conversation to the Scout prompt when a digest is provided', async () => {
+    const { runner, calls } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      inspector: [approve],
+      sentry: [approve],
+    });
+
+    await runCoopPipeline({
+      userPrompt: 'use those 7 criteria',
+      contextDigest: 'user: build the auth flow\nassistant: which provider?',
+      runner,
+      inspector: fakeInspector(),
+      buildStage: vi.fn(async () => BUILDER_USAGE),
+      settings: settings(),
+      onGate: () => {},
+    });
+
+    const scoutPrompt = calls.find((c) => c.role === 'scout')!.userPrompt;
+    expect(scoutPrompt).toContain('CONVERSATION SO FAR (condensed):');
+    expect(scoutPrompt).toContain('build the auth flow');
+    expect(scoutPrompt).toContain('CURRENT REQUEST:');
+    expect(scoutPrompt).toContain('use those 7 criteria');
+    // The digest precedes the current request.
+    expect(scoutPrompt.indexOf('CONVERSATION SO FAR')).toBeLessThan(scoutPrompt.indexOf('CURRENT REQUEST'));
+  });
+
+  it('passes the bare request as the Scout prompt when no digest is given', async () => {
+    const { runner, calls } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      inspector: [approve],
+      sentry: [approve],
+    });
+
+    await runCoopPipeline({
+      userPrompt: 'add feature X',
+      runner,
+      inspector: fakeInspector(),
+      buildStage: vi.fn(async () => BUILDER_USAGE),
+      settings: settings(),
+      onGate: () => {},
+    });
+
+    expect(calls.find((c) => c.role === 'scout')!.userPrompt).toBe('add feature X');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Ambiguous scout → blocked
 // ---------------------------------------------------------------------------
 
@@ -226,6 +277,9 @@ describe('runCoopPipeline — ambiguous scout', () => {
     expect(result.outcome).toBe('blocked');
     expect(result.question).toBe(question);
     expect(buildStage).not.toHaveBeenCalled();
+
+    // The Scout card itself reads as blocked (not a green "passed") on an ambiguous result.
+    expect(result.cards.find((c) => c.role === 'scout')?.status).toBe('blocked');
 
     const stl = result.cards.find((c) => c.role === 'stop-the-line');
     expect(stl?.status).toBe('blocked');
@@ -570,5 +624,14 @@ describe('parseScout', () => {
   it('treats an empty-criteria non-ambiguous response as ambiguous (fail-safe)', () => {
     const s = parseScout('{"criteria":[],"plan":["do it"],"ambiguous":false}');
     expect(s.ambiguous).toBe(true);
+  });
+
+  it('extracts a JSON object embedded after a sentence of prose', () => {
+    const s = parseScout(
+      'Sure — here is the contract for the request. {"criteria":["C1: does X"],"plan":["step"],"ambiguous":false}',
+    );
+    expect(s.ambiguous).toBe(false);
+    expect(s.criteria).toEqual(['C1: does X']);
+    expect(s.plan).toEqual(['step']);
   });
 });

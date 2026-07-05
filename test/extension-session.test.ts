@@ -1455,3 +1455,423 @@ describe('PRD plan history round-trip', () => {
     expect(roundTripped.prdPlan?.cursor).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Conversation context digest for the planning roles (Scout)
+// ---------------------------------------------------------------------------
+
+/** The user prompt text of the SCOUT request(s) in a request list, oldest → newest. */
+function scoutPrompts(requests: ChatRequest[]): string[] {
+  return requests.filter((r) => r.system.includes('SCOUT')).map((r) => userWireText(r));
+}
+
+describe('coop context digest', () => {
+  it("carries prior conversation text into a follow-up coop turn's Scout prompt", async () => {
+    const { session, requests } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'FIRSTASK build the login form' });
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'SECONDASK now add validation' });
+
+    const scout = scoutPrompts(requests.slice(idx))[0];
+    expect(scout).toContain('CONVERSATION SO FAR (condensed):');
+    expect(scout).toContain('FIRSTASK build the login form'); // prior turn in the digest
+    expect(scout).toContain('CURRENT REQUEST:');
+    expect(scout).toContain('SECONDASK now add validation'); // the new turn
+  });
+
+  it("first turn has no digest — the Scout prompt is the bare request", async () => {
+    const { session, requests } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'add a feature' });
+
+    const scout = scoutPrompts(requests)[0];
+    expect(scout).not.toContain('CONVERSATION SO FAR');
+    expect(scout.trim()).toBe('add a feature');
+  });
+
+  it('clarification flow: the second Scout prompt carries BOTH the original request and the reply', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    const requests: ChatRequest[] = [];
+    let scoutCalls = 0;
+    // First Scout call is ambiguous (blocks the line); later ones return criteria.
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        requests.push(request);
+        let events: StreamEvent[];
+        if (request.system.includes('SCOUT')) {
+          scoutCalls += 1;
+          events =
+            scoutCalls === 1
+              ? textEvents(JSON.stringify({ criteria: [], plan: [], ambiguous: true, question: 'Which cache backend?' }))
+              : textEvents(JSON.stringify({ criteria: ['C1'], plan: ['p'], ambiguous: false }));
+        } else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) {
+          events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        } else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        }
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'ORIGINALASK add a cache layer' });
+    // First turn blocked on the clarifying question (no build ran).
+    const firstConv = lastConversation(posted)!;
+    const firstLeaf = assistantLeaf(firstConv)!;
+    expect(firstLeaf.blocks.some((b) => b.type === 'text' && b.text.includes('Which cache backend?'))).toBe(true);
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'REPLYTEXT use redis with a 60s TTL' });
+
+    const secondScout = scoutPrompts(requests.slice(idx))[0];
+    expect(secondScout).toContain('ORIGINALASK add a cache layer'); // original request survives via the digest
+    expect(secondScout).toContain('Which cache backend?'); // the assistant's question too
+    expect(secondScout).toContain('REPLYTEXT use redis with a 60s TTL'); // the new reply
+  });
+
+  it('bounds the digest for a long history (per-message + total caps respected)', async () => {
+    const { session, requests } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: `HEADMARK ${'L'.repeat(5000)}` });
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'follow up' });
+
+    const scout = scoutPrompts(requests.slice(idx))[0];
+    const digest = scout.split('CURRENT REQUEST:')[0];
+    // The long prior message was truncated with the ellipsis marker…
+    expect(digest).toContain('HEADMARK');
+    expect(digest).toContain('[…]');
+    // …and the digest is bounded (per-message ~600 chars, total ~2000).
+    expect(digest.length).toBeLessThan(2200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Retry a failed PRD story
+// ---------------------------------------------------------------------------
+
+describe('retryStory', () => {
+  it('re-runs a failed cursor story (failed → building → awaiting-review) via a "Retry story" node', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    let approveInspector = false; // story 1 fails first (inspector rejects), then a retry approves
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        let events: StreamEvent[];
+        if (request.system.includes('FOREMAN')) events = textEvents(TWO_STORY_JSON);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+        else if (request.system.includes('SENTRY')) events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        else if (request.system.includes('INSPECTOR'))
+          events = textEvents(JSON.stringify({ verdict: approveInspector ? 'approve' : 'reject', findings: approveInspector ? [] : ['not yet'] }));
+        else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        }
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+
+    // Story 1 exhausted its retry budget → failed, cursor still on it.
+    let conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.cursor).toBe(0);
+    expect(conv.prdPlan?.stories[0].status).toBe('failed');
+
+    // Now the inspector approves; retryStory re-runs the cursor story to awaiting-review.
+    approveInspector = true;
+    const before = posted.length;
+    await session.handle({ type: 'retryStory' });
+
+    conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.cursor).toBe(0); // cursor did NOT advance
+    expect(conv.prdPlan?.stories[0].status).toBe('awaiting-review'); // failed → awaiting-review
+    expect(conv.prdPlan?.stories[1].status).toBe('pending');
+    // A synthetic "Retry story 1" user node parented the re-run, and a turn ran.
+    expect(
+      Object.values(conv.nodes).some(
+        (n) => n.role === 'user' && n.blocks.some((b) => b.type === 'text' && b.text.startsWith('Retry story 1:')),
+      ),
+    ).toBe(true);
+    expect(posted.slice(before).some((m) => m.type === 'turnStarted')).toBe(true);
+  });
+
+  it('ignores retryStory while a turn is streaming', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    let unblock: () => void = () => {};
+    const blocker = new Promise<void>((res) => {
+      unblock = res;
+    });
+    // Hang the story-1 Sentry call so a turn is in flight when retryStory arrives.
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        let events: StreamEvent[];
+        let block = false;
+        if (request.system.includes('FOREMAN')) events = textEvents(TWO_STORY_JSON);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+        else if (request.system.includes('SENTRY')) {
+          events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+          block = true;
+        } else if (request.system.includes('INSPECTOR')) {
+          events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        } else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        }
+        return (async function* () {
+          if (block) await blocker;
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+    for (let i = 0; i < 100; i += 1) {
+      if (posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'sentry')) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'sentry')).toBe(true);
+
+    const before = posted.length;
+    await session.handle({ type: 'retryStory' });
+    expect(posted.length).toBe(before); // ignored while a turn is in flight
+
+    unblock();
+    await turn;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deterministic file references in prompts (@file + bare-path auto-include)
+// ---------------------------------------------------------------------------
+
+/** The system prompt of a request is a Coop role prompt (Scout/Inspector/Sentry/Foreman). */
+function isRolePrompt(sys: string): boolean {
+  return /(SCOUT|INSPECTOR|SENTRY|FOREMAN)/.test(sys);
+}
+
+describe('deterministic file references in prompts', () => {
+  it('inlines a bare file reference into the coop Scout and Builder prompts, and toasts once', async () => {
+    const { session, requests, io, posted } = makeSession({ mode: 'coop', path: 'x.txt', content: 'x\n' });
+    io.files.set('auraringprd.md', 'AURA-PRD-BODY: build the ring app');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'implement auraringprd.md' });
+
+    const scout = requests.find((r) => r.system.includes('SCOUT'));
+    expect(scout).toBeDefined();
+    const scoutText = userWireText(scout!);
+    expect(scoutText).toContain('Referenced file auraringprd.md:');
+    expect(scoutText).toContain('AURA-PRD-BODY: build the ring app');
+
+    // The Builder (solo-style system, not a role prompt) receives the content too.
+    const builder = requests.find((r) => !isRolePrompt(r.system));
+    expect(builder).toBeDefined();
+    expect(allWireText(builder!)).toContain('AURA-PRD-BODY');
+
+    // Exactly one success toast, listing the included file.
+    const included = posted.filter(
+      (m) => m.type === 'toast' && m.level === 'info' && m.message.startsWith('Included'),
+    );
+    expect(included).toHaveLength(1);
+    expect((included[0] as Extract<HostToWebview, { type: 'toast' }>).message).toContain('auraringprd.md');
+  });
+
+  it('keeps the stored user message compact — expansion is wire-only', async () => {
+    const { session, posted, io } = makeSession({ mode: 'coop', path: 'x.txt', content: 'x\n' });
+    io.files.set('auraringprd.md', 'AURA-PRD-BODY');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'implement auraringprd.md' });
+
+    const conv = lastConversation(posted)!;
+    const userNode = Object.values(conv.nodes).find((n) => n.role === 'user');
+    const stored = userNode?.blocks.map((b) => (b.type === 'text' ? b.text : '')).join('') ?? '';
+    expect(stored).toBe('implement auraringprd.md'); // no inlined body in the transcript
+    expect(stored).not.toContain('AURA-PRD-BODY');
+  });
+
+  it('a staged edit of the referenced file wins over the disk copy', async () => {
+    const io = new FakeIo();
+    io.files.set('spec.md', 'DISK-BODY');
+    const posted: HostToWebview[] = [];
+    const requests: ChatRequest[] = [];
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        requests.push(request);
+        let events: StreamEvent[];
+        if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['c'], plan: [], ambiguous: false }));
+        else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult
+            ? textEvents('done')
+            : [
+                { type: 'tool_call_start', id: 't1', name: 'edit_files' },
+                { type: 'tool_call_args', id: 't1', delta: JSON.stringify({ edits: [{ path: 'spec.md', find: 'DISK-BODY', replace: 'STAGED-BODY' }] }) },
+                { type: 'tool_call_end', id: 't1' },
+                USAGE,
+                { type: 'done', stopReason: 'tool_use' },
+              ];
+        }
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'edit the spec' }); // stages spec.md → STAGED-BODY
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: 'now summarize spec.md' }); // references the file
+
+    const scout = requests.slice(idx).find((r) => r.system.includes('SCOUT'));
+    expect(scout).toBeDefined();
+    const t = userWireText(scout!);
+    expect(t).toContain('STAGED-BODY');
+    expect(t).not.toContain('DISK-BODY'); // the staged overlay copy wins
+  });
+
+  it('warns on a missing @-mention but still runs the turn', async () => {
+    const { session, posted } = makeSession({ mode: 'solo', path: 'x.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'read @missing.md and continue' });
+
+    expect(
+      posted.some((m) => m.type === 'toast' && m.level === 'warn' && m.message === '@missing.md not found in the workspace'),
+    ).toBe(true);
+    // The prompt still ran as an ordinary turn.
+    expect(posted.some((m) => m.type === 'turnStarted')).toBe(true);
+  });
+
+  it("a PRD turn inlines the referenced file into the Foreman's prompt", async () => {
+    const { session, requests, io } = makeSession({ mode: 'coop', path: 'x.txt', content: 'x\n' });
+    io.files.set('auraringprd.md', 'AURA-PRD-BODY: the ring spec');
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'implement auraringprd.md', prd: true });
+
+    const foreman = requests.find((r) => r.system.includes('FOREMAN'));
+    expect(foreman).toBeDefined();
+    const t = userWireText(foreman!);
+    expect(t).toContain('Referenced file auraringprd.md:');
+    expect(t).toContain('AURA-PRD-BODY: the ring spec');
+  });
+
+  it('does NOT expand file references on synthetic "Continue story" turns', async () => {
+    const io = new FakeIo();
+    io.files.set('notes.md', 'NOTES-BODY-SHOULD-NOT-INLINE');
+    const posted: HostToWebview[] = [];
+    const requests: ChatRequest[] = [];
+    // A decomposition whose second story TITLE contains a resolvable path — if the
+    // synthetic "Continue to story 2: …" node were expanded, notes.md would inline.
+    const twoStories = JSON.stringify({
+      stories: [
+        { title: 'First slice', summary: 's1', criteria: ['a'] },
+        { title: 'Configure notes.md', summary: 's2', criteria: ['b'] },
+      ],
+    });
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        requests.push(request);
+        let events: StreamEvent[];
+        if (request.system.includes('FOREMAN')) events = textEvents(twoStories);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['c'], plan: [], ambiguous: false }));
+        else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        }
+        return (async function* () {
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+
+    await session.handle({ type: 'ready' });
+    // Turn-1 PRD prompt references NO file, so no expansion happens on it either.
+    await session.handle({ type: 'sendPrompt', text: 'build the whole thing', prd: true });
+
+    const idx = requests.length;
+    await session.handle({ type: 'continueStoryLoop' }); // synthetic "Continue to story 2: Configure notes.md"
+
+    // The continue turn's requests carry the spec (title text) but NOT an inlined file.
+    for (const r of requests.slice(idx)) {
+      const text = allWireText(r);
+      expect(text).not.toContain('Referenced file notes.md:');
+      expect(text).not.toContain('NOTES-BODY-SHOULD-NOT-INLINE');
+    }
+    // No "Included …" toast fired for the synthetic advance.
+    expect(posted.some((m) => m.type === 'toast' && m.level === 'info' && m.message.startsWith('Included'))).toBe(false);
+  });
+});

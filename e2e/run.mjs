@@ -299,6 +299,32 @@ await composer().fill('/notacommand');
 await composer().press('Enter');
 ok((await sent(page, 'sendPrompt')).some((m) => m.text === '/notacommand'), 'unknown /command sends as a prompt');
 
+// ============================== FILE MENTION AUTOCOMPLETE ====================
+console.log('\n# file mention autocomplete');
+await open('chat');
+// Typing '@' opens the file popup (a new SlashMenu mode) listing workspace files.
+await composer().fill('@');
+await waitFor(page, () => !!document.querySelector('.fp-slash-menu'), '@ opens the file popup');
+await waitFor(page, () => document.body.innerText.includes('src/auth/authService.ts'), 'file popup lists workspace files');
+// Typing after '@' filters the list (substring, case-insensitive).
+await composer().fill('@errors');
+await waitFor(
+  page,
+  () => {
+    const names = Array.from(document.querySelectorAll('.fp-slash-name')).map((n) => n.textContent);
+    return names.includes('src/auth/errors.ts') && !names.includes('README.md');
+  },
+  '@errors filters the file list',
+);
+// Picking a file inserts `@<path> ` at the caret.
+await page.locator('.fp-slash-item', { hasText: 'src/auth/errors.ts' }).first().click();
+await waitFor(
+  page,
+  () => document.querySelector('.fp-composer-textarea')?.value === '@src/auth/errors.ts ',
+  'picking a file inserts @path into the composer',
+);
+await page.screenshot({ path: join(SHOTS, 'file-mention.png'), fullPage: false });
+
 // ============================== CONTEXT INDICATOR ============================
 console.log('\n# context indicator');
 await open('chat');
@@ -353,16 +379,22 @@ await waitFor(page, () => {
 }, 'plan checklist lists all story titles');
 await waitFor(page, () => document.querySelector('.fp-plan-count')?.textContent === '1 of 3 done', 'plan shows "1 of 3 done"');
 ok((await page.locator('.fp-plan-story .fp-plan-glyph').count()) === 3, 'each story renders a status glyph');
-ok(await page.getByRole('button', { name: /Continue — next story/ }).isVisible().catch(() => false), 'awaiting-review cursor shows "Continue — next story"');
+ok(await page.getByRole('button', { name: /Continue — next story/ }).first().isVisible().catch(() => false), 'awaiting-review cursor shows "Continue — next story"');
 await page.screenshot({ path: join(SHOTS, 'prd-plan.png'), fullPage: false });
-await page.getByRole('button', { name: /Continue — next story/ }).click();
+await page.getByRole('button', { name: /Continue — next story/ }).first().click();
 ok((await sent(page, 'continueStoryLoop')).length >= 1, 'Continue button posts continueStoryLoop');
+// The pinned PRD bar mirrors the plan block's actions between transcript and composer.
+await waitFor(page, () => !!document.querySelector('.fp-plan-bar'), 'pinned PRD bar renders while a build is active');
 // Re-inject the same plan with the cursor story pending → "Resume story 2".
 await page.evaluate(() => window.__host.emit(window.__fixtures.prdConversation('pending')));
 await waitFor(page, () => !!document.querySelector('.fp-plan') && !!Array.from(document.querySelectorAll('button')).find((b) => /Resume story 2/.test(b.textContent || '')), 'pending cursor shows "Resume story 2"');
-// …and with the cursor story failed → "Continue anyway".
+// …and with the cursor story failed → "Retry story" (primary) + "Skip story" (secondary).
 await page.evaluate(() => window.__host.emit(window.__fixtures.prdConversation('failed')));
-await waitFor(page, () => !!Array.from(document.querySelectorAll('button')).find((b) => /Continue anyway/.test(b.textContent || '')), 'failed cursor shows "Continue anyway"');
+await waitFor(page, () => !!Array.from(document.querySelectorAll('button')).find((b) => /Retry story/.test(b.textContent || '')), 'failed cursor shows "Retry story"');
+await waitFor(page, () => !!Array.from(document.querySelectorAll('button')).find((b) => /Skip story/.test(b.textContent || '')), 'failed cursor shows "Skip story"');
+// Retry posts retryStory (one code path re-runs the cursor story).
+await page.getByRole('button', { name: /Retry story/ }).first().click();
+ok((await sent(page, 'retryStory')).length >= 1, 'Retry button posts retryStory');
 
 // ============================== PRD CHIP =====================================
 console.log('\n# prd chip');

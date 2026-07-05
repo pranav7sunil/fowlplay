@@ -35,6 +35,8 @@ export type WebviewToHost =
   | { type: 'cancelResponse' }
   // Advance a PRD build to the next story (marks the cursor story done, runs the next).
   | { type: 'continueStoryLoop' }
+  // Re-run the cursor story of a PRD build (a failed — or pending — story).
+  | { type: 'retryStory' }
   | { type: 'clearSelection' }                                    // dismiss the pinned selection chip
   | { type: 'editMessage'; nodeId: string; text: string }        // branches
   | { type: 'rerunMessage'; nodeId: string }                      // sibling response
@@ -72,7 +74,9 @@ export type WebviewToHost =
   | { type: 'addProvider'; provider: ProviderConfig; apiKey?: string }
   | { type: 'updateProvider'; provider: ProviderConfig; apiKey?: string }
   | { type: 'deleteProvider'; providerId: string }
-  | { type: 'fetchModels'; providerId: string };
+  | { type: 'fetchModels'; providerId: string }
+  // composer `@` autocomplete: list workspace files (optionally filtered by query)
+  | { type: 'listFiles'; query?: string };
 
 export interface Attachment {
   name: string;
@@ -114,6 +118,8 @@ export type HostToWebview =
       query: string;
       candidates: { providerId: string; modelId: string; label: string }[];
     }
+  // composer `@` autocomplete: workspace file paths matching the current query
+  | { type: 'fileList'; paths: string[] }
   // misc
   | { type: 'showView'; view: 'chat' | 'diff' | 'settings' | 'history' }
   | { type: 'toast'; level: 'info' | 'warn' | 'error'; message: string };

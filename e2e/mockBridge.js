@@ -53,6 +53,26 @@
       if (msg && msg.type === 'continueStoryLoop') {
         /* no-op ack — protocol stays mirrored */
       }
+      // retryStory (re-run the cursor story) is likewise acked as a no-op — no
+      // scripted scenario drives the per-story loop.
+      if (msg && msg.type === 'retryStory') {
+        /* no-op ack — protocol stays mirrored */
+      }
+      // Composer `@` autocomplete: serve a small static file list, filtered by the
+      // query (case-insensitive substring) exactly as the real host would.
+      if (msg && msg.type === 'listFiles') {
+        const all = [
+          'src/auth/authService.ts',
+          'src/auth/errors.ts',
+          'src/webview/index.tsx',
+          'docs/USER_MANUAL.md',
+          'README.md',
+          'package.json',
+        ];
+        const q = (msg.query || '').toLowerCase();
+        const paths = (q ? all.filter((p) => p.toLowerCase().includes(q)) : all).slice(0, 50);
+        emit({ type: 'fileList', paths });
+      }
     },
     onMessage(handler) {
       handlers.push(handler);

@@ -1,6 +1,7 @@
 /** Assistant content-block renderers. */
 import type { JSX } from 'preact';
-import type { ContentBlock, ToolCallRecord, GateCard, CoopRole, GateStatus, PrdStoryStatus } from '../../shared/types';
+import type { ContentBlock, ToolCallRecord, GateCard, CoopRole, GateStatus, PrdPlan, PrdStoryStatus } from '../../shared/types';
+import type { WebviewToHost } from '../../shared/protocol';
 import { Markdown, Collapsible } from './common';
 import {
   IconCheck, IconX, IconWrench, IconCompass, IconHammer, IconEye, IconShield,
@@ -241,12 +242,72 @@ const PLAN_GLYPH: Record<PrdStoryStatus, JSX.Element> = {
   failed: <span class="fp-plan-glyph fp-plan-failed">✕</span>,
 };
 
+/** A PRD-plan action button descriptor (label + the message it posts). */
+export interface PlanAction {
+  label: string;
+  message: WebviewToHost;
+  variant: 'primary' | 'secondary';
+}
+
+/** Human status word for the cursor story, shown in the pinned bar. */
+const STORY_STATUS_WORD: Record<PrdStoryStatus, string> = {
+  pending: 'pending',
+  building: 'building',
+  'awaiting-review': 'awaiting review',
+  done: 'done',
+  failed: 'failed',
+};
+
+/**
+ * The actions offered for a plan's cursor story — the single source of truth shared by the
+ * plan block and the pinned bar so their buttons can't drift. Empty while streaming or when
+ * the cursor story is not actionable (building/done). A failed story offers Retry (primary) +
+ * Skip (secondary); pending offers Resume; awaiting-review offers Continue. Retry and Resume
+ * both post `retryStory` — one host code path re-runs the cursor story.
+ */
+export function planActions(plan: PrdPlan, streaming: boolean): PlanAction[] {
+  if (streaming) return [];
+  const cursorStory = plan.stories[plan.cursor];
+  if (!cursorStory) return [];
+  switch (cursorStory.status) {
+    case 'failed':
+      return [
+        { label: 'Retry story', message: { type: 'retryStory' }, variant: 'primary' },
+        { label: 'Skip story', message: { type: 'continueStoryLoop' }, variant: 'secondary' },
+      ];
+    case 'pending':
+      return [{ label: `Resume story ${plan.cursor + 1}`, message: { type: 'retryStory' }, variant: 'primary' }];
+    case 'awaiting-review':
+      return [{ label: 'Continue — next story', message: { type: 'continueStoryLoop' }, variant: 'primary' }];
+    default:
+      return [];
+  }
+}
+
+function PlanActionButtons({ plan, streaming }: { plan: PrdPlan; streaming: boolean }) {
+  const actions = planActions(plan, streaming);
+  if (actions.length === 0) return null;
+  return (
+    <>
+      {actions.map((a) => (
+        <button
+          key={a.label}
+          type="button"
+          class={`fp-btn fp-btn-sm ${a.variant === 'primary' ? 'fp-btn-primary' : 'fp-btn-secondary'}`}
+          onClick={() => post(a.message)}
+        >
+          {a.variant === 'primary' && <IconArrowRight size={15} />} {a.label}
+        </button>
+      ))}
+    </>
+  );
+}
+
 /**
  * PRD build plan — a marker block that renders LIVE from the conversation's `prdPlan`
  * (statuses advance across turns; the block itself is only a snapshot placeholder). Shows a
- * story checklist with status glyphs, an "N of M done" header, and — when not streaming and
- * the cursor story is awaiting review or failed — a primary button to continue to the next
- * story.
+ * story checklist with status glyphs, an "N of M done" header, and — via {@link planActions}
+ * — the cursor story's action buttons (Retry/Skip, Resume, or Continue) when not streaming.
  */
 export function PlanBlock() {
   const conv = useStore((s) => s.conversation);
@@ -255,17 +316,7 @@ export function PlanBlock() {
   if (!plan || plan.stories.length === 0) return null;
 
   const done = plan.stories.filter((s) => s.status === 'done').length;
-  const cursorStory = plan.stories[plan.cursor];
-  const canContinue =
-    !streaming &&
-    cursorStory &&
-    (cursorStory.status === 'awaiting-review' || cursorStory.status === 'failed' || cursorStory.status === 'pending');
-  const continueLabel =
-    cursorStory?.status === 'failed'
-      ? 'Continue anyway'
-      : cursorStory?.status === 'pending'
-        ? `Resume story ${plan.cursor + 1}`
-        : 'Continue — next story';
+  const actions = planActions(plan, streaming);
 
   return (
     <div class="fp-plan">
@@ -282,16 +333,48 @@ export function PlanBlock() {
           </li>
         ))}
       </ol>
-      {canContinue && (
-        <button
-          type="button"
-          class="fp-btn fp-btn-primary fp-btn-sm"
-          style={{ alignSelf: 'flex-start' }}
-          onClick={() => post({ type: 'continueStoryLoop' })}
-        >
-          <IconArrowRight size={15} /> {continueLabel}
-        </button>
+      {actions.length > 0 && (
+        <div class="fp-plan-actions">
+          <PlanActionButtons plan={plan} streaming={streaming} />
+        </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * A pinned, one-line PRD status bar rendered between the transcript and the composer whenever
+ * a PRD build is active (a plan exists with a story not yet done). It surfaces "N of M done ·
+ * story K <status>" plus the cursor story's action buttons — so the human can retry/skip/
+ * continue without scrolling back up to the plan block that streamed a screen ago. During
+ * streaming it shows a subtle "building story K…" and no buttons.
+ */
+export function PlanBar() {
+  const conv = useStore((s) => s.conversation);
+  const streaming = useStore((s) => s.streaming);
+  const plan = conv?.prdPlan;
+  if (!plan || plan.stories.length === 0) return null;
+  // Only while the build is still active — a fully-done plan is finished.
+  if (plan.stories.every((s) => s.status === 'done')) return null;
+
+  const done = plan.stories.filter((s) => s.status === 'done').length;
+  const total = plan.stories.length;
+  const k = plan.cursor + 1;
+  const cursorStory = plan.stories[plan.cursor];
+  const statusWord = STORY_STATUS_WORD[cursorStory?.status ?? 'pending'];
+
+  return (
+    <div class="fp-plan-bar">
+      <span class="fp-plan-bar-label">
+        <IconFile size={14} />
+        <span>
+          PRD build · {done} of {total} done ·{' '}
+          {streaming ? <em class="fp-plan-bar-building">building story {k}…</em> : <>story {k} {statusWord}</>}
+        </span>
+      </span>
+      <span class="fp-plan-bar-actions">
+        <PlanActionButtons plan={plan} streaming={streaming} />
+      </span>
     </div>
   );
 }

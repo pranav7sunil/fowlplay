@@ -51,6 +51,8 @@ export interface AppState {
   historyItems: ConversationSummary[];
   modelsFetched: Record<string, { id: string; contextWindow?: number }[]>;
   modelsError: Record<string, string | undefined>;
+  /** Workspace file paths for the composer's `@` autocomplete (latest listFiles result). */
+  fileList: string[];
   toasts: Toast[];
   bootstrapped: boolean;
 }
@@ -72,6 +74,7 @@ const initialState: AppState = {
   historyItems: [],
   modelsFetched: {},
   modelsError: {},
+  fileList: [],
   toasts: [],
   bootstrapped: false,
 };
@@ -199,6 +202,9 @@ class Store {
         this.patch({
           modelMentionChoice: { role: msg.role, query: msg.query, candidates: msg.candidates },
         });
+        break;
+      case 'fileList':
+        this.patch({ fileList: msg.paths });
         break;
       case 'showView':
         this.setView(msg.view);

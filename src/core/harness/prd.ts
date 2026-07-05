@@ -14,6 +14,7 @@
  */
 
 import { extractJsonObject, toStringList } from './evidence';
+import { composeScoutPrompt } from './roles';
 import type { PrdPlan, PrdStory, PrdStoryStatus } from '../../shared/types';
 
 export type { PrdPlan, PrdStory, PrdStoryStatus } from '../../shared/types';
@@ -60,6 +61,15 @@ Reply with ONE fenced JSON block and nothing that could be mistaken for a second
 \`\`\`
 
 Do not wrap the stories in extra prose. Keep titles and criteria concrete and buildable.`;
+
+/**
+ * Compose the Foreman's prompt from an optional condensed conversation digest and the PRD
+ * text. Shares {@link composeScoutPrompt}'s formatting so the planning roles read prior
+ * context identically (PRDs are usually turn one, so the digest is normally empty).
+ */
+export function composeForemanPrompt(contextDigest: string | undefined, prd: string): string {
+  return composeScoutPrompt(contextDigest, prd);
+}
 
 // ===========================================================================
 // Parsing
