@@ -16,6 +16,8 @@ import type {
   ConversationSummary,
   FowlPlaySettings,
   HarnessMode,
+  HarnessSettings,
+  ModelRef,
   ProviderConfig,
   StreamEvent,
 } from '../src/shared/types';
@@ -163,14 +165,32 @@ function textEvents(text: string): StreamEvent[] {
   return [{ type: 'text', delta: text }, USAGE, { type: 'done', stopReason: 'end' }];
 }
 
-/** Adapter that stages `path`/`content` on a build turn and approves every role gate. */
-function scriptedAdapter(path = 'foo.txt', content = 'hello\nworld\n'): { adapter: ProviderAdapter; requests: ChatRequest[] } {
+/** A 2-story Foreman decomposition, returned when `foreman: 'two'`. */
+const TWO_STORY_JSON = JSON.stringify({
+  stories: [
+    { title: 'First story', summary: 'the first slice', criteria: ['story one works'] },
+    { title: 'Second story', summary: 'the second slice', criteria: ['story two works'] },
+  ],
+});
+
+/**
+ * Adapter that stages `path`/`content` on a build turn and approves every role gate. When a
+ * FOREMAN system prompt arrives it returns a decomposition: two stories (`foreman: 'two'`,
+ * the default) or unparseable text (`foreman: 'garbage'`) to exercise the failure path.
+ */
+function scriptedAdapter(
+  path = 'foo.txt',
+  content = 'hello\nworld\n',
+  foreman: 'two' | 'garbage' = 'two',
+): { adapter: ProviderAdapter; requests: ChatRequest[] } {
   const requests: ChatRequest[] = [];
   const adapter: ProviderAdapter = {
     chat(request: ChatRequest) {
       requests.push(request);
       let events: StreamEvent[];
-      if (request.system.includes('SCOUT')) {
+      if (request.system.includes('FOREMAN')) {
+        events = textEvents(foreman === 'garbage' ? 'I cannot break this down, sorry.' : TWO_STORY_JSON);
+      } else if (request.system.includes('SCOUT')) {
         events = textEvents(JSON.stringify({ criteria: ['File is created'], plan: ['create file'], ambiguous: false, question: '' }));
       } else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) {
         events = textEvents(JSON.stringify({ verdict: 'approve', findings: [], evidence: 'looks fine' }));
@@ -191,10 +211,10 @@ function scriptedAdapter(path = 'foo.txt', content = 'hello\nworld\n'): { adapte
 // Harness
 // ---------------------------------------------------------------------------
 
-function makeSession(opts: { mode?: HarnessMode; path?: string; content?: string } = {}) {
+function makeSession(opts: { mode?: HarnessMode; path?: string; content?: string; foreman?: 'two' | 'garbage' } = {}) {
   const io = new FakeIo();
   const posted: HostToWebview[] = [];
-  const { adapter, requests } = scriptedAdapter(opts.path, opts.content);
+  const { adapter, requests } = scriptedAdapter(opts.path, opts.content, opts.foreman);
   const settings = new FakeSettings(opts.mode ?? 'solo');
   // Count broadcast triggers so tests can assert which mutations notify siblings.
   const changed = { count: 0 };
@@ -663,6 +683,124 @@ describe('coop pipeline', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Hard context-window management
+// ---------------------------------------------------------------------------
+
+/** A session whose single model optionally advertises a context window. */
+function makeWindowSession(opts: { window?: number; mode?: HarnessMode; path?: string; content?: string }) {
+  const io = new FakeIo();
+  const posted: HostToWebview[] = [];
+  const { adapter, requests } = scriptedAdapter(opts.path, opts.content);
+  const model = opts.window ? { id: 'm1', contextWindow: opts.window } : { id: 'm1' };
+  const provider: ProviderConfig = { ...PROVIDER, models: [model] };
+  const mode = opts.mode ?? 'solo';
+  const settings: SettingsPort = {
+    async load(): Promise<FowlPlaySettings> {
+      return {
+        appearance: APPEARANCE,
+        harness: { defaultMode: mode, qasRetryBudget: 1 },
+        providers: [provider],
+        defaultModel: { providerId: 'p1', modelId: 'm1' },
+      };
+    },
+    async saveAppearance() {},
+    async saveHarness() {},
+    async saveProviders() {},
+    async saveDefaultModel() {},
+  };
+  const deps: SessionDeps = {
+    io,
+    secrets: new FakeSecrets(),
+    settings,
+    history: new FakeHistory(),
+    git: fakeGit,
+    post: (m) => posted.push(m),
+    createAdapter: () => adapter,
+    fetchModels: async () => [{ id: 'm1' }],
+    clock: () => Date.now(),
+  };
+  return { session: createSessionCore(deps), posted, io, requests };
+}
+
+/** Every text payload in a wire request (user text + tool results). */
+function allWireText(req: ChatRequest): string {
+  return req.messages
+    .map((m) =>
+      m.role === 'tool'
+        ? m.results.map((r) => r.content).join('\n')
+        : m.content.map((p) => (p.type === 'text' ? p.text : '')).join('\n'),
+    )
+    .join('\n');
+}
+
+describe('context-window management', () => {
+  // ~4000 tokens each (chars/4); a small-window model must trim one to fit.
+  const T1 = `TURN1MARK ${'x'.repeat(16000)}`;
+  const T2 = `TURN2MARK ${'x'.repeat(16000)}`;
+
+  it('trims the oldest turn when the conversation model has a small context window', async () => {
+    // window 8000 → reserve max(1500, 2000)=2000 → payload budget 6000.
+    const { session, requests } = makeWindowSession({ window: 8000, path: 'foo.txt', content: 'hi\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: T1 }); // fits alone (~4k ≤ 6k)
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: T2 }); // now T1+T2 overruns → trim T1
+    const first = allWireText(requests[idx]);
+
+    expect(first).toContain('trimmed to fit'); // synthetic note prepended
+    expect(first).toContain('TURN2MARK'); // newest turn preserved
+    expect(first).not.toContain('TURN1MARK'); // oldest whole turn dropped
+  });
+
+  it('a model with no known context window keeps full history (no regression)', async () => {
+    const { session, requests } = makeWindowSession({ path: 'foo.txt', content: 'hi\n' }); // no window
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: T1 });
+
+    const idx = requests.length;
+    await session.handle({ type: 'sendPrompt', text: T2 });
+    const first = allWireText(requests[idx]);
+
+    expect(first).not.toContain('trimmed to fit'); // no budget → no trim
+    expect(first).toContain('TURN1MARK'); // full history retained
+    expect(first).toContain('TURN2MARK');
+  });
+
+  it('surfaces a friendly block when the request exceeds the model context window (coop)', async () => {
+    // window 4000 → payload budget 2500; a ~3000-token prompt cannot fit.
+    const { session, posted } = makeWindowSession({ window: 4000, mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: `refactor everything ${'x'.repeat(12000)}` });
+
+    const conv = lastConversation(posted)!;
+    const leaf = assistantLeaf(conv)!;
+    const textBlock = leaf.blocks.find(
+      (b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text',
+    );
+    expect(textBlock?.text).toMatch(/exceeds .* context window/);
+    expect(textBlock?.text).toContain('4.0k');
+    // A blocked Context limit gate card was emitted.
+    expect(leaf.blocks.some((b) => b.type === 'gate' && b.card.title === 'Context limit')).toBe(true);
+  });
+
+  it('surfaces a friendly error block in solo mode when the request exceeds the window', async () => {
+    const { session, posted } = makeWindowSession({ window: 4000, mode: 'solo', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: `rewrite it all ${'x'.repeat(12000)}` });
+
+    const conv = lastConversation(posted)!;
+    const leaf = assistantLeaf(conv)!;
+    const errorBlock = leaf.blocks.find(
+      (b): b is Extract<ContentBlock, { type: 'error' }> => b.type === 'error',
+    );
+    expect(errorBlock?.message).toMatch(/exceeds .* context window/);
+    // No gate cards in solo mode.
+    expect(leaf.blocks.some((b) => b.type === 'gate')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Cross-surface settings sync
 // ---------------------------------------------------------------------------
 
@@ -783,5 +921,537 @@ describe('reloadSettings', () => {
     const before = changed.count;
     await session.reloadSettings();
     expect(changed.count).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-role model overrides + chat-mention parsing
+// ---------------------------------------------------------------------------
+
+/** A provider whose model ids/displayNames drive the resolution + mention tests. */
+const P_ROLES: ProviderConfig = {
+  id: 'p1',
+  name: 'Roles',
+  kind: 'local',
+  sdkType: 'openai-completions',
+  baseUrl: 'http://localhost/v1',
+  requiresApiKey: false,
+  models: [
+    { id: 'm-base' },
+    { id: 'm-scout-conv' },
+    { id: 'm-scout-settings' },
+    { id: 'm-builder', displayName: 'BuilderModel' },
+    { id: 'qwen-a', displayName: 'Qwen A' },
+    { id: 'qwen-b', displayName: 'Qwen B' },
+  ],
+};
+
+function makeCustomSession(opts: {
+  providers?: ProviderConfig[];
+  harness?: HarnessSettings;
+  conversation?: Conversation;
+  defaultModel?: ModelRef | null;
+}) {
+  const io = new FakeIo();
+  const posted: HostToWebview[] = [];
+  const { adapter, requests } = scriptedAdapter();
+  const providers = opts.providers ?? [P_ROLES];
+  const harness = opts.harness ?? { defaultMode: 'coop', qasRetryBudget: 1 };
+  const defaultModel = opts.defaultModel ?? { providerId: 'p1', modelId: 'm-base' };
+  const settings: SettingsPort = {
+    async load(): Promise<FowlPlaySettings> {
+      return { appearance: APPEARANCE, harness, providers, defaultModel };
+    },
+    async saveAppearance() {},
+    async saveHarness() {},
+    async saveProviders() {},
+    async saveDefaultModel() {},
+  };
+  const deps: SessionDeps = {
+    io,
+    secrets: new FakeSecrets(),
+    settings,
+    history: new FakeHistory(),
+    git: fakeGit,
+    post: (m) => posted.push(m),
+    createAdapter: () => adapter,
+    fetchModels: async () => [],
+    clock: () => Date.now(),
+  };
+  const session = createSessionCore(deps, opts.conversation ? { conversation: opts.conversation } : undefined);
+  return { session, posted, requests };
+}
+
+function coopConversation(overrides: Partial<Conversation> = {}): Conversation {
+  return {
+    id: 'c1',
+    title: 'test',
+    nodes: {},
+    rootIds: [],
+    currentLeafId: null,
+    model: { providerId: 'p1', modelId: 'm-base' },
+    harnessMode: 'coop',
+    createdAt: 0,
+    updatedAt: 0,
+    usageTotals: { inputTokens: 0, outputTokens: 0, cachedTokens: 0 },
+    ...overrides,
+  };
+}
+
+/** Which modelId each Coop role's request ran on, keyed off the role system prompt. */
+function coopModelIds(requests: ChatRequest[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const r of requests) {
+    if (r.system.includes('SCOUT')) out.scout = r.modelId;
+    else if (r.system.includes('INSPECTOR')) out.inspector = r.modelId;
+    else if (r.system.includes('SENTRY')) out.sentry = r.modelId;
+    else if (out.builder === undefined) out.builder = r.modelId; // Builder/agent loop
+  }
+  return out;
+}
+
+describe('per-role model resolution chain', () => {
+  it('resolves conv override > settings override > conv model, and stale overrides fall through', async () => {
+    const conversation = coopConversation({
+      roleModelOverrides: { scout: { providerId: 'p1', modelId: 'm-scout-conv' } },
+    });
+    const { session, requests } = makeCustomSession({
+      conversation,
+      harness: {
+        defaultMode: 'coop',
+        qasRetryBudget: 1,
+        roleModelOverrides: {
+          // conv override wins for scout; this settings one should be shadowed.
+          scout: { providerId: 'p1', modelId: 'm-scout-settings' },
+          // stale — references a model that no longer exists → falls through.
+          inspector: { providerId: 'p1', modelId: 'm-deleted' },
+        },
+      },
+    });
+
+    await session.handle({ type: 'sendPrompt', text: 'add a feature' });
+
+    const ids = coopModelIds(requests);
+    expect(ids.scout).toBe('m-scout-conv'); // conversation override wins
+    expect(ids.builder).toBe('m-base'); // no override anywhere → conv model
+    expect(ids.inspector).toBe('m-base'); // stale settings override → falls through
+    expect(ids.sentry).toBe('m-base'); // no override → conv model
+  });
+});
+
+describe('directive-only chat mention', () => {
+  it('applies a per-role override and does NOT start a turn', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+
+    const before = posted.length;
+    await session.handle({ type: 'sendPrompt', text: 'build with m-builder' });
+
+    // No turn ran.
+    expect(posted.slice(before).some((m) => m.type === 'turnStarted')).toBe(false);
+    // The override rode onto the conversation.
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides?.builder).toEqual({ providerId: 'p1', modelId: 'm-builder' });
+    // A confirmation toast summarizing the assignment was posted.
+    expect(
+      posted.some((m) => m.type === 'toast' && m.level === 'info' && m.message === 'Builder → BuilderModel'),
+    ).toBe(true);
+  });
+
+  it('warns and ignores a mention that matches no configured model', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'use nonexistent-model' });
+
+    expect(posted.some((m) => m.type === 'toast' && m.level === 'warn' && m.message.includes('nonexistent-model'))).toBe(true);
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides).toBeUndefined();
+  });
+});
+
+describe('ambiguous chat mention', () => {
+  it('holds the prompt, then releases it on resolveModelMention with the picked model', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+
+    const before = posted.length;
+    // "qwen" matches qwen-a AND qwen-b → ambiguous; trailing prose keeps it a real turn.
+    await session.handle({ type: 'sendPrompt', text: 'qwen to build the login page' });
+
+    // A choice was surfaced and the prompt is held (no turn yet).
+    const choice = posted.slice(before).find(
+      (m): m is Extract<HostToWebview, { type: 'modelMentionChoice' }> => m.type === 'modelMentionChoice',
+    );
+    expect(choice).toBeDefined();
+    expect(choice!.role).toBe('builder');
+    expect(choice!.query).toBe('qwen');
+    expect(choice!.candidates.map((c) => c.modelId).sort()).toEqual(['qwen-a', 'qwen-b']);
+    expect(posted.slice(before).some((m) => m.type === 'turnStarted')).toBe(false);
+
+    // Resolve with a pick → the held prompt runs with the ORIGINAL full text.
+    const pick = choice!.candidates[0];
+    const beforeResolve = posted.length;
+    await session.handle({ type: 'resolveModelMention', role: 'builder', model: { providerId: pick.providerId, modelId: pick.modelId } });
+
+    expect(posted.slice(beforeResolve).some((m) => m.type === 'turnStarted')).toBe(true);
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides?.builder).toEqual({ providerId: pick.providerId, modelId: pick.modelId });
+    // The stored user message keeps the original text (mentions not stripped).
+    const userNode = Object.values(conv.nodes).find((n) => n.role === 'user');
+    expect(userNode?.blocks.some((b) => b.type === 'text' && b.text.includes('qwen to build the login page'))).toBe(true);
+  });
+
+  it('a new prompt supersedes a held one — answering the stale picker releases nothing', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+
+    // Ambiguous mention → prompt held behind the picker.
+    await session.handle({ type: 'sendPrompt', text: 'qwen to build the login page' });
+    expect(posted.some((m) => m.type === 'modelMentionChoice')).toBe(true);
+
+    // The user abandons the picker and sends a plain prompt instead.
+    const beforeSecond = posted.length;
+    await session.handle({ type: 'sendPrompt', text: 'just fix the typo in README' });
+    const turnsAfterSecond = posted.slice(beforeSecond).filter((m) => m.type === 'turnStarted').length;
+    expect(turnsAfterSecond).toBe(1);
+
+    // Answering the stale picker now must not release the abandoned prompt.
+    const beforeStale = posted.length;
+    await session.handle({ type: 'resolveModelMention', role: 'builder', model: { providerId: 'p1', modelId: 'qwen-a' } });
+    expect(posted.slice(beforeStale).some((m) => m.type === 'turnStarted')).toBe(false);
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides?.builder).toBeUndefined();
+    // The abandoned prompt's text never became a user node.
+    expect(
+      Object.values(conv.nodes).some(
+        (n) => n.role === 'user' && n.blocks.some((b) => b.type === 'text' && b.text.includes('login page')),
+      ),
+    ).toBe(false);
+  });
+
+  it('dismissal (null) sends the prompt without applying any override', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'qwen to build the login page' });
+
+    const beforeResolve = posted.length;
+    await session.handle({ type: 'resolveModelMention', role: 'builder', model: null });
+
+    // The prompt still ran…
+    expect(posted.slice(beforeResolve).some((m) => m.type === 'turnStarted')).toBe(true);
+    // …with an info toast and NO override applied.
+    expect(posted.some((m) => m.type === 'toast' && m.level === 'info' && m.message.includes('without changing'))).toBe(true);
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides?.builder).toBeUndefined();
+  });
+});
+
+describe('conversation-level model directive persists (JSON round-trip)', () => {
+  it('keeps roleModelOverrides through a history save/load', async () => {
+    const history = new FakeHistory();
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    const { adapter } = scriptedAdapter();
+    const settings: SettingsPort = {
+      async load(): Promise<FowlPlaySettings> {
+        return { appearance: APPEARANCE, harness: { defaultMode: 'solo', qasRetryBudget: 1 }, providers: [P_ROLES], defaultModel: { providerId: 'p1', modelId: 'm-base' } };
+      },
+      async saveAppearance() {},
+      async saveHarness() {},
+      async saveProviders() {},
+      async saveDefaultModel() {},
+    };
+    const deps: SessionDeps = {
+      io, secrets: new FakeSecrets(), settings, history, git: fakeGit,
+      post: (m) => posted.push(m), createAdapter: () => adapter, fetchModels: async () => [], clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'build with m-builder' }); // directive-only → applies + persists
+
+    // Serialize exactly as persistence does, then reload.
+    const saved = [...history.store.values()][0];
+    expect(saved).toBeDefined();
+    const roundTripped: Conversation = JSON.parse(JSON.stringify(saved));
+    expect(roundTripped.roleModelOverrides?.builder).toEqual({ providerId: 'p1', modelId: 'm-builder' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PRD builds (Foreman decomposition → per-story build loop)
+// ---------------------------------------------------------------------------
+
+/** Roles of the distinct gate cards emitted so far, in first-seen order. */
+function gateRoles(posted: HostToWebview[]): string[] {
+  const gates = posted.filter(
+    (m): m is Extract<HostToWebview, { type: 'gateUpdate' }> => m.type === 'gateUpdate',
+  );
+  const order: string[] = [];
+  for (const g of gates) if (!order.includes(g.card.id)) order.push(g.card.id);
+  return order.map((id) => gates.find((g) => g.card.id === id)!.card.role);
+}
+
+/** The synthetic user nodes ("Continue to story N: …") on the current conversation. */
+function continueNodes(conv: Conversation): string[] {
+  return Object.values(conv.nodes)
+    .filter((n) => n.role === 'user')
+    .map((n) => n.blocks.map((b) => (b.type === 'text' ? b.text : '')).join(''))
+    .filter((t) => t.startsWith('Continue to story'));
+}
+
+describe('PRD build turn', () => {
+  it('decomposes the PRD, writes a spec per story, sets the plan, and builds story 1 to awaiting-review', async () => {
+    const { session, posted, io } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'Build the whole thing per this PRD…', prd: true });
+
+    // Two spec files were written directly to disk (not staged).
+    const specs = [...io.files.keys()].filter((p) => p.startsWith('.fowlplay/specs/'));
+    expect(specs).toHaveLength(2);
+    expect(io.files.get(specs[0])).toContain('First story');
+    expect(io.files.get(specs[1])).toContain('Second story');
+
+    // The plan rode onto the conversation with two stories, cursor at 0.
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.stories).toHaveLength(2);
+    expect(conv.prdPlan?.cursor).toBe(0);
+    expect(conv.prdPlan?.stories[0].status).toBe('awaiting-review'); // story 1 built to review
+    expect(conv.prdPlan?.stories[1].status).toBe('pending');
+
+    // Foreman + full pipeline cards were emitted; a plan block marker sits in the node.
+    const roles = gateRoles(posted);
+    expect(roles).toEqual(['foreman', 'scout', 'stop-the-line', 'builder', 'inspector', 'sentry', 'hitl']);
+    const leaf = assistantLeaf(conv)!;
+    expect(leaf.blocks.some((b) => b.type === 'plan')).toBe(true);
+    expect(leaf.blocks.some((b) => b.type === 'gate' && b.card.role === 'foreman')).toBe(true);
+    // Story 1 staged a change → a changes block was appended.
+    expect(leaf.blocks.some((b) => b.type === 'changes')).toBe(true);
+  });
+
+  it('blocks the Foreman card and creates no plan when decomposition fails', async () => {
+    const { session, posted, io } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n', foreman: 'garbage' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'a vague half-idea', prd: true });
+
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan).toBeUndefined(); // no plan
+    // No spec files written.
+    expect([...io.files.keys()].some((p) => p.startsWith('.fowlplay/specs/'))).toBe(false);
+
+    // The Foreman card is blocked; no downstream role cards ran.
+    const roles = gateRoles(posted);
+    expect(roles).toEqual(['foreman']);
+    const foreman = posted
+      .filter((m): m is Extract<HostToWebview, { type: 'gateUpdate' }> => m.type === 'gateUpdate')
+      .map((m) => m.card)
+      .filter((c) => c.role === 'foreman')
+      .pop();
+    expect(foreman?.status).toBe('blocked');
+    const leaf = assistantLeaf(conv)!;
+    expect(leaf.blocks.some((b) => b.type === 'text' && b.text.toLowerCase().includes('could not decompose'))).toBe(true);
+    expect(leaf.blocks.some((b) => b.type === 'plan')).toBe(false);
+  });
+
+  it('continueStoryLoop marks story 1 done, appends a synthetic user node, and builds story 2', async () => {
+    const { session, posted } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+
+    const before = posted.length;
+    await session.handle({ type: 'continueStoryLoop' });
+
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.cursor).toBe(1);
+    expect(conv.prdPlan?.stories[0].status).toBe('done');
+    expect(conv.prdPlan?.stories[1].status).toBe('awaiting-review'); // story 2 built to review
+    // A synthetic "Continue to story 2" user node was appended and a turn ran.
+    expect(continueNodes(conv)).toEqual(['Continue to story 2: Second story']);
+    expect(posted.slice(before).some((m) => m.type === 'turnStarted')).toBe(true);
+    // The second story's pipeline cards ran again (a fresh set of gate ids).
+    expect(posted.slice(before).some((m) => m.type === 'gateUpdate' && m.card.role === 'scout')).toBe(true);
+  });
+
+  it('a second continue completes the plan with a summary block and no further story turn', async () => {
+    const { session, posted } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+    await session.handle({ type: 'continueStoryLoop' }); // story 1 → done, build story 2
+
+    const before = posted.length;
+    await session.handle({ type: 'continueStoryLoop' }); // story 2 → done, plan complete
+
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.cursor).toBe(2);
+    expect(conv.prdPlan?.stories.every((s) => s.status === 'done')).toBe(true);
+    // No new story turn ran; a completion summary was appended instead.
+    expect(posted.slice(before).some((m) => m.type === 'turnStarted')).toBe(false);
+    const leaf = assistantLeaf(conv)!;
+    expect(leaf.blocks.some((b) => b.type === 'text' && b.text.includes('PRD build complete'))).toBe(true);
+  });
+
+  it('resets a story cancelled mid-pipeline to pending (retryable)', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    let unblock: () => void = () => {};
+    const blocker = new Promise<void>((res) => {
+      unblock = res;
+    });
+    // Block the Builder loop of story 1 so the pipeline hangs after the plan is set (story
+    // 'building'); cancel while blocked, then release. The pipeline's post-build abort check
+    // yields a cancelled outcome → the story must reset to 'pending', never left 'building'.
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        let events: StreamEvent[];
+        let block = false;
+        if (request.system.includes('FOREMAN')) events = textEvents(TWO_STORY_JSON);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+        else if (request.system.includes('INSPECTOR') || request.system.includes('SENTRY')) events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+          if (!hasToolResult) block = true; // the Builder's first (edit) round hangs
+        }
+        return (async function* () {
+          if (block) await blocker;
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+    // Flush until the Builder card is emitted (the loop is now blocked).
+    for (let i = 0; i < 100; i += 1) {
+      if (posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'builder')) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    await session.handle({ type: 'cancelResponse' });
+    unblock();
+    await turn;
+
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan).toBeDefined();
+    expect(conv.prdPlan?.stories[0].status).toBe('pending'); // cancelled → retryable, not building
+
+    // Continue on the pending cursor story must RETRY it — not mark it done and
+    // skip past work that never happened. The adapter no longer blocks, so the
+    // rerun completes to awaiting-review with the cursor still on story 1.
+    const beforeResume = posted.length;
+    await session.handle({ type: 'continueStoryLoop' });
+    const after = lastConversation(posted)!;
+    expect(after.prdPlan?.cursor).toBe(0);
+    expect(after.prdPlan?.stories[0].status).toBe('awaiting-review');
+    expect(after.prdPlan?.stories[1].status).toBe('pending');
+    // The retry ran as a real turn parented on a synthetic "Resume story" node.
+    expect(posted.slice(beforeResume).some((m) => m.type === 'turnStarted')).toBe(true);
+    expect(
+      Object.values(after.nodes).some(
+        (n) => n.role === 'user' && n.blocks.some((b) => b.type === 'text' && b.text.startsWith('Resume story 1:')),
+      ),
+    ).toBe(true);
+  });
+
+  it('ignores continueStoryLoop while a turn is streaming', async () => {
+    const io = new FakeIo();
+    const posted: HostToWebview[] = [];
+    let unblock: () => void = () => {};
+    const blocker = new Promise<void>((res) => {
+      unblock = res;
+    });
+    // Block the Sentry role call so the story-1 pipeline hangs mid-turn (plan already set,
+    // abort controller live) — the moment continueStoryLoop must be ignored.
+    const adapter: ProviderAdapter = {
+      chat(request: ChatRequest) {
+        let events: StreamEvent[];
+        let block = false;
+        if (request.system.includes('FOREMAN')) events = textEvents(TWO_STORY_JSON);
+        else if (request.system.includes('SCOUT')) events = textEvents(JSON.stringify({ criteria: ['x'], plan: [], ambiguous: false }));
+        else if (request.system.includes('SENTRY')) {
+          events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+          block = true;
+        } else if (request.system.includes('INSPECTOR')) {
+          events = textEvents(JSON.stringify({ verdict: 'approve', findings: [] }));
+        } else {
+          const hasToolResult = request.messages.some((m) => m.role === 'tool');
+          events = hasToolResult ? textEvents('done') : editEvents('foo.txt', 'x\n');
+        }
+        return (async function* () {
+          if (block) await blocker;
+          for (const e of events) yield e;
+        })();
+      },
+    };
+    const deps: SessionDeps = {
+      io,
+      secrets: new FakeSecrets(),
+      settings: new FakeSettings('coop'),
+      history: new FakeHistory(),
+      git: fakeGit,
+      post: (m) => posted.push(m),
+      createAdapter: () => adapter,
+      fetchModels: async () => [{ id: 'm1' }],
+      clock: () => Date.now(),
+    };
+    const session = createSessionCore(deps);
+    await session.handle({ type: 'ready' });
+
+    const turn = session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+
+    // Flush until the Sentry card has been emitted (the pipeline is now blocked on it).
+    for (let i = 0; i < 100; i += 1) {
+      if (posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'sentry')) break;
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(posted.some((m) => m.type === 'gateUpdate' && m.card.role === 'sentry')).toBe(true);
+
+    // A turn is in flight → continueStoryLoop is ignored (posts nothing, advances nothing).
+    const before = posted.length;
+    await session.handle({ type: 'continueStoryLoop' });
+    expect(posted.length).toBe(before);
+
+    unblock();
+    await turn;
+    // The turn finished normally; the plan advanced only through the pipeline, not a stray continue.
+    const conv = lastConversation(posted)!;
+    expect(conv.prdPlan?.cursor).toBe(0);
+    expect(continueNodes(conv)).toEqual([]);
+  });
+});
+
+describe('PRD plan history round-trip', () => {
+  it('keeps prdPlan through a JSON save/load', async () => {
+    const { session } = makeSession({ mode: 'coop', path: 'foo.txt', content: 'x\n' });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'PRD text', prd: true });
+
+    const saved = session.conversation;
+    expect(saved.prdPlan).toBeDefined();
+    const roundTripped: Conversation = JSON.parse(JSON.stringify(saved));
+    expect(roundTripped.prdPlan?.stories).toHaveLength(2);
+    expect(roundTripped.prdPlan?.stories[0].specPath).toBe(saved.prdPlan!.stories[0].specPath);
+    expect(roundTripped.prdPlan?.stories[0].status).toBe('awaiting-review');
+    expect(roundTripped.prdPlan?.cursor).toBe(0);
   });
 });

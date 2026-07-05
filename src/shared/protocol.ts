@@ -9,6 +9,7 @@ import type {
   ChangeSetView,
   Conversation,
   ConversationSummary,
+  CoopRole,
   FowlPlaySettings,
   GateCard,
   HarnessMode,
@@ -28,8 +29,12 @@ export type WebviewToHost =
   // lifecycle
   | { type: 'ready' }
   // chat
-  | { type: 'sendPrompt'; text: string; attachments?: Attachment[] }
+  // `prd: true` decomposes the prompt as a PRD (Foreman → per-story build loop) instead of
+  // running it as a single Coop/Solo turn. Ordinary sends omit the flag.
+  | { type: 'sendPrompt'; text: string; attachments?: Attachment[]; prd?: boolean }
   | { type: 'cancelResponse' }
+  // Advance a PRD build to the next story (marks the cursor story done, runs the next).
+  | { type: 'continueStoryLoop' }
   | { type: 'clearSelection' }                                    // dismiss the pinned selection chip
   | { type: 'editMessage'; nodeId: string; text: string }        // branches
   | { type: 'rerunMessage'; nodeId: string }                      // sibling response
@@ -40,6 +45,10 @@ export type WebviewToHost =
   // model & harness
   | { type: 'setModel'; model: ModelRef }
   | { type: 'setHarnessMode'; mode: HarnessMode }
+  // per-role model mention disambiguation: resolve a held ambiguous mention
+  // (non-null applies the pick; null dismisses it). `role: 'conversation'`
+  // targets the conversation model, otherwise a specific Coop role.
+  | { type: 'resolveModelMention'; role: CoopRole | 'conversation'; model: ModelRef | null }
   // diff review
   | { type: 'openDiff'; changesetId?: string }                    // omit = current
   | { type: 'toggleRevert'; hunkId: string; reverted: boolean }
@@ -96,6 +105,15 @@ export type HostToWebview =
   // settings & providers
   | { type: 'settings'; settings: FowlPlaySettings }
   | { type: 'modelsFetched'; providerId: string; models: { id: string; contextWindow?: number }[]; error?: string }
+  // per-role model mention disambiguation: an ambiguous "<name> for <role>"
+  // matched more than one configured model. The whole prompt is held until the
+  // webview posts `resolveModelMention`. Emitted one ambiguity at a time.
+  | {
+      type: 'modelMentionChoice';
+      role: CoopRole | 'conversation';
+      query: string;
+      candidates: { providerId: string; modelId: string; label: string }[];
+    }
   // misc
   | { type: 'showView'; view: 'chat' | 'diff' | 'settings' | 'history' }
   | { type: 'toast'; level: 'info' | 'warn' | 'error'; message: string };

@@ -7,6 +7,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { GateCard, HarnessSettings, TokenUsage } from '../src/shared/types';
 import {
+  ContextExceededError,
   runCoopPipeline,
   type ChangesetInspector,
   type CoopResult,
@@ -14,6 +15,7 @@ import {
 } from '../src/core/harness/coop';
 import { parseVerdict } from '../src/core/harness/evidence';
 import { parseScout } from '../src/core/harness/roles';
+import { estimateTokens } from '../src/core/agent/contextBudget';
 
 // ---------------------------------------------------------------------------
 // Fakes & helpers
@@ -136,6 +138,62 @@ describe('runCoopPipeline — happy path', () => {
     // the Builder loop (BUILDER_USAGE) — the Builder must not be dropped.
     expect(result.usage.inputTokens).toBe(3 + BUILDER_USAGE.inputTokens);
     expect(result.usage.outputTokens).toBe(3 + BUILDER_USAGE.outputTokens);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-role model labels
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — modelLabelFor', () => {
+  it('stamps each role card with the label from modelLabelFor', async () => {
+    const { runner } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      inspector: [approve],
+      sentry: [approve],
+    });
+    const labels: Record<string, string> = {
+      scout: 'Qwen-Plan',
+      builder: 'GLM-Build',
+      inspector: 'Fable-QA',
+      sentry: 'Fable-Sec',
+    };
+
+    const result = await runCoopPipeline({
+      userPrompt: 'do it',
+      runner,
+      inspector: fakeInspector(),
+      buildStage: vi.fn(async () => BUILDER_USAGE),
+      settings: settings(),
+      onGate: () => {},
+      modelLabelFor: (role) => labels[role],
+    });
+
+    const labelOf = (role: GateCard['role']) => result.cards.find((c) => c.role === role)?.modelLabel;
+    expect(labelOf('scout')).toBe('Qwen-Plan');
+    expect(labelOf('builder')).toBe('GLM-Build');
+    expect(labelOf('inspector')).toBe('Fable-QA');
+    expect(labelOf('sentry')).toBe('Fable-Sec');
+    // Synthetic gates carry no model label.
+    expect(labelOf('stop-the-line')).toBeUndefined();
+    expect(labelOf('hitl')).toBeUndefined();
+  });
+
+  it('leaves modelLabel unset when modelLabelFor is omitted', async () => {
+    const { runner } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      inspector: [approve],
+      sentry: [approve],
+    });
+    const result = await runCoopPipeline({
+      userPrompt: 'do it',
+      runner,
+      inspector: fakeInspector(),
+      buildStage: vi.fn(async () => BUILDER_USAGE),
+      settings: settings(),
+      onGate: () => {},
+    });
+    expect(result.cards.every((c) => c.modelLabel === undefined)).toBe(true);
   });
 });
 
@@ -319,6 +377,122 @@ describe('runCoopPipeline — cancellation', () => {
 
     expect(result.outcome).toBe('cancelled');
     expect(buildStage).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Chunked review under a diff budget
+// ---------------------------------------------------------------------------
+
+/** Two equal-size single-hunk files; a budget of one file forces a 2-chunk split. */
+function twoFileDiff(): { diff: string; oneFileBudget: number } {
+  const file = (name: string, ch: string) =>
+    [`--- a/${name}`, `+++ b/${name}`, '@@ -1,1 +1,1 @@', `-${ch.repeat(40)}`, `+${ch.repeat(40)}`].join('\n');
+  const f1 = file('f1.ts', 'a');
+  const f2 = file('f2.ts', 'b');
+  return { diff: `${f1}\n${f2}`, oneFileBudget: estimateTokens(f1) };
+}
+
+describe('runCoopPipeline — chunked inspector under a diff budget', () => {
+  it('reviews each chunk and rejects overall (with unioned findings) when any chunk rejects', async () => {
+    const { diff, oneFileBudget } = twoFileDiff();
+    const { runner, calls } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      // FIFO across the two chunk calls: first rejects, second rejects (distinct + a dup).
+      inspector: [rejectWith(['dup finding', 'part-1 issue']), rejectWith(['dup finding', 'part-2 issue'])],
+      sentry: [approve],
+    });
+    const buildStage = vi.fn(async () => BUILDER_USAGE);
+
+    const result = await runCoopPipeline({
+      userPrompt: 'do it',
+      runner,
+      inspector: fakeInspector(diff),
+      buildStage,
+      settings: settings(0), // no route-backs → single inspector attempt
+      onGate: () => {},
+      diffBudgetFor: (role) => (role === 'inspector' ? oneFileBudget : undefined),
+    });
+
+    // The inspector ran once per chunk (2 chunks).
+    expect(calls.filter((c) => c.role === 'inspector')).toHaveLength(2);
+    // Overall rejected → budget exhausted → qas-failed.
+    expect(result.outcome).toBe('qas-failed');
+    const inspector = result.cards.find((c) => c.role === 'inspector')!;
+    expect(inspector.status).toBe('failed');
+    // Findings unioned across chunks (deduplicated, order preserved).
+    expect(inspector.findings).toEqual(['dup finding', 'part-1 issue', 'part-2 issue']);
+    // Evidence notes the chunked review.
+    expect(inspector.evidence).toContain('reviewed in 2 parts');
+  });
+
+  it('passes to Sentry only when every chunk approves', async () => {
+    const { diff, oneFileBudget } = twoFileDiff();
+    const { runner, calls } = scriptedRunner({
+      scout: [scoutOk(['C1'])],
+      inspector: [approve], // reused for both chunk calls → both approve
+      sentry: [approve], // reused for both sentry chunk calls
+    });
+
+    const result = await runCoopPipeline({
+      userPrompt: 'do it',
+      runner,
+      inspector: fakeInspector(diff),
+      buildStage: vi.fn(async () => BUILDER_USAGE),
+      settings: settings(),
+      onGate: () => {},
+      diffBudgetFor: (role) => (role === 'inspector' || role === 'sentry' ? oneFileBudget : undefined),
+    });
+
+    expect(result.outcome).toBe('ready-for-review');
+    // Both the inspector and the sentry chunked into 2 calls each.
+    expect(calls.filter((c) => c.role === 'inspector')).toHaveLength(2);
+    expect(calls.filter((c) => c.role === 'sentry')).toHaveLength(2);
+    const sentry = result.cards.find((c) => c.role === 'sentry')!;
+    expect(sentry.status).toBe('passed');
+    expect(sentry.evidence).toContain('reviewed in 2 parts');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Context-exceeded outcome (Builder cannot fit the newest turn)
+// ---------------------------------------------------------------------------
+
+describe('runCoopPipeline — context-exceeded', () => {
+  it('emits a blocked Context limit gate and returns context-exceeded when buildStage throws', async () => {
+    const { runner } = scriptedRunner({ scout: [scoutOk(['C1'])] });
+    const buildStage = vi.fn(async () => {
+      throw new ContextExceededError({
+        role: 'builder',
+        modelLabel: 'Tiny-8k',
+        windowTokens: 8000,
+        neededTokens: 9000,
+        budgetTokens: 6000,
+      });
+    });
+
+    const result = await runCoopPipeline({
+      userPrompt: 'refactor the whole app',
+      runner,
+      inspector: fakeInspector(),
+      buildStage,
+      settings: settings(),
+      onGate: () => {},
+    });
+
+    expect(result.outcome).toBe('context-exceeded');
+    expect(result.context?.modelLabel).toBe('Tiny-8k');
+    expect(result.context?.windowTokens).toBe(8000);
+
+    const ctxCard = result.cards.find((c) => c.title === 'Context limit')!;
+    expect(ctxCard.role).toBe('stop-the-line');
+    expect(ctxCard.status).toBe('blocked');
+    expect(ctxCard.evidence).toContain('Context window exceeded');
+
+    // The in-flight Builder card was marked failed, and nothing after it ran.
+    expect(result.cards.find((c) => c.role === 'builder')?.status).toBe('failed');
+    expect(result.cards.some((c) => c.role === 'inspector')).toBe(false);
+    expect(result.cards.some((c) => c.role === 'sentry')).toBe(false);
   });
 });
 

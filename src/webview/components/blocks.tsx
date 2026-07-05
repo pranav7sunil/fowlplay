@@ -1,12 +1,12 @@
 /** Assistant content-block renderers. */
 import type { JSX } from 'preact';
-import type { ContentBlock, ToolCallRecord, GateCard, CoopRole, GateStatus } from '../../shared/types';
+import type { ContentBlock, ToolCallRecord, GateCard, CoopRole, GateStatus, PrdStoryStatus } from '../../shared/types';
 import { Markdown, Collapsible } from './common';
 import {
   IconCheck, IconX, IconWrench, IconCompass, IconHammer, IconEye, IconShield,
-  IconDiff, IconGit, IconAlert, IconArrowRight, IconArrowUp, IconChevronRight,
+  IconDiff, IconGit, IconAlert, IconArrowRight, IconArrowUp, IconChevronRight, IconFile,
 } from './icons';
-import { store } from './store';
+import { post, store, useStore } from './store';
 
 export function BlockView({ block }: { block: ContentBlock }) {
   switch (block.type) {
@@ -22,6 +22,8 @@ export function BlockView({ block }: { block: ContentBlock }) {
       return <ChangesBlock summary={block.summary} />;
     case 'commit':
       return <CommitBlock commit={block.commit} />;
+    case 'plan':
+      return <PlanBlock />;
     case 'error':
       return <ErrorBlock message={block.message} />;
   }
@@ -30,6 +32,12 @@ export function BlockView({ block }: { block: ContentBlock }) {
 function fmtDuration(ms?: number): string {
   if (!ms) return '';
   return ` for ${(ms / 1000).toFixed(1)}s`;
+}
+
+/** Compact token count, e.g. 1234 → "1.2k". Local to avoid cross-component imports. */
+function fmtTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
+  return String(n);
 }
 
 export function ThinkingBlock({ text, durationMs }: { text: string; durationMs?: number }) {
@@ -95,13 +103,14 @@ export function ToolCallCard({ call }: { call: ToolCallRecord }) {
   );
 }
 
-const ROLE_ICON: Record<CoopRole | 'stop-the-line' | 'hitl', (p: { size?: number }) => JSX.Element> = {
+const ROLE_ICON: Record<CoopRole | 'stop-the-line' | 'hitl' | 'foreman', (p: { size?: number }) => JSX.Element> = {
   scout: IconCompass,
   builder: IconHammer,
   inspector: IconEye,
   sentry: IconShield,
   'stop-the-line': IconAlert,
   hitl: IconEye,
+  foreman: IconFile,
 };
 
 function StatusChip({ status }: { status: GateStatus }) {
@@ -134,6 +143,7 @@ export function GateCardView({ card }: { card: GateCard }) {
       <div class="fp-gate-head">
         <span class="fp-gate-icon"><Icon size={17} /></span>
         <span class="fp-gate-title">{card.title}</span>
+        {card.modelLabel && <span class="fp-gate-model" title={`Ran on ${card.modelLabel}`}>{card.modelLabel}</span>}
         {card.attempt && card.attempt > 1 && <span class="fp-chip">attempt {card.attempt}</span>}
         <StatusChip status={card.status} />
       </div>
@@ -167,6 +177,14 @@ export function GateCardView({ card }: { card: GateCard }) {
           <button type="button" class="fp-btn fp-btn-primary fp-btn-sm" onClick={() => store.openReview()} style={{ alignSelf: 'flex-start' }}>
             <IconDiff size={15} /> Review Changes
           </button>
+        )}
+        {card.usage && (card.usage.inputTokens > 0 || card.usage.outputTokens > 0) && (
+          <div
+            class="fp-gate-usage"
+            style={{ fontSize: '11px', color: 'var(--fp-fg-muted)', fontFamily: 'var(--fp-font)' }}
+          >
+            ↑{fmtTokens(card.usage.inputTokens)} ↓{fmtTokens(card.usage.outputTokens)}
+          </div>
         )}
       </div>
     </div>
@@ -211,6 +229,69 @@ export function CommitBlock({
       <button type="button" class="fp-btn-ghost" onClick={() => store.openReview(commit.changesetId, true)} style={{ padding: 0, color: 'var(--fp-accent)' }}>
         View Changes <IconArrowRight size={14} />
       </button>
+    </div>
+  );
+}
+
+const PLAN_GLYPH: Record<PrdStoryStatus, JSX.Element> = {
+  pending: <span class="fp-plan-glyph fp-plan-pending">○</span>,
+  building: <span class="fp-plan-glyph fp-plan-building fp-dot" />,
+  'awaiting-review': <span class="fp-plan-glyph fp-plan-awaiting">◉</span>,
+  done: <span class="fp-plan-glyph fp-plan-done">✓</span>,
+  failed: <span class="fp-plan-glyph fp-plan-failed">✕</span>,
+};
+
+/**
+ * PRD build plan — a marker block that renders LIVE from the conversation's `prdPlan`
+ * (statuses advance across turns; the block itself is only a snapshot placeholder). Shows a
+ * story checklist with status glyphs, an "N of M done" header, and — when not streaming and
+ * the cursor story is awaiting review or failed — a primary button to continue to the next
+ * story.
+ */
+export function PlanBlock() {
+  const conv = useStore((s) => s.conversation);
+  const streaming = useStore((s) => s.streaming);
+  const plan = conv?.prdPlan;
+  if (!plan || plan.stories.length === 0) return null;
+
+  const done = plan.stories.filter((s) => s.status === 'done').length;
+  const cursorStory = plan.stories[plan.cursor];
+  const canContinue =
+    !streaming &&
+    cursorStory &&
+    (cursorStory.status === 'awaiting-review' || cursorStory.status === 'failed' || cursorStory.status === 'pending');
+  const continueLabel =
+    cursorStory?.status === 'failed'
+      ? 'Continue anyway'
+      : cursorStory?.status === 'pending'
+        ? `Resume story ${plan.cursor + 1}`
+        : 'Continue — next story';
+
+  return (
+    <div class="fp-plan">
+      <div class="fp-plan-head">
+        <span class="fp-gate-icon"><IconFile size={17} /></span>
+        <span class="fp-plan-title">PRD build</span>
+        <span class="fp-plan-count">{done} of {plan.stories.length} done</span>
+      </div>
+      <ol class="fp-plan-list">
+        {plan.stories.map((s, i) => (
+          <li key={i} class={`fp-plan-story${i === plan.cursor ? ' fp-plan-cursor' : ''}`}>
+            {PLAN_GLYPH[s.status]}
+            <span class="fp-plan-story-title">{s.title}</span>
+          </li>
+        ))}
+      </ol>
+      {canContinue && (
+        <button
+          type="button"
+          class="fp-btn fp-btn-primary fp-btn-sm"
+          style={{ alignSelf: 'flex-start' }}
+          onClick={() => post({ type: 'continueStoryLoop' })}
+        >
+          <IconArrowRight size={15} /> {continueLabel}
+        </button>
+      )}
     </div>
   );
 }

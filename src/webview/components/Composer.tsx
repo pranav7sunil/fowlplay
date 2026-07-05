@@ -1,7 +1,7 @@
 /** Auto-growing composer with attachments, slash commands, send / stop. */
 import { useEffect, useRef, useState } from 'preact/hooks';
 import type { Attachment } from '../../shared/protocol';
-import type { Conversation, FowlPlaySettings, ModelRef, TokenUsage } from '../../shared/types';
+import type { Conversation, CoopRole, FowlPlaySettings, ModelRef, TokenUsage } from '../../shared/types';
 import { post, store, useStore } from './store';
 import { filterCommands, type SlashCommand } from '../slashCommands';
 import { SlashMenu, type SlashItem } from './SlashMenu';
@@ -35,6 +35,7 @@ function fmt(n: number): string {
 export function Composer({ streaming }: { streaming: boolean }) {
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [prdArmed, setPrdArmed] = useState(false);
   const [menuMode, setMenuMode] = useState<MenuMode>('closed');
   const [highlight, setHighlight] = useState(0);
   const [showStatus, setShowStatus] = useState(false);
@@ -66,9 +67,20 @@ export function Composer({ streaming }: { streaming: boolean }) {
   const send = () => {
     const t = text.trim();
     if (!t && attachments.length === 0) return;
-    post({ type: 'sendPrompt', text: t, attachments: attachments.length ? attachments : undefined });
+    // A new prompt supersedes any pending model-mention picker (host discards
+    // the held prompt too); drop the card so it can't answer a stale question.
+    store.clearModelMentionChoice();
+    post({
+      type: 'sendPrompt',
+      text: t,
+      attachments: attachments.length ? attachments : undefined,
+      // The armed "PRD build" chip flags this one send for Foreman decomposition;
+      // it disarms immediately after so ordinary sends stay ordinary.
+      prd: prdArmed || undefined,
+    });
     setText('');
     setAttachments([]);
+    setPrdArmed(false);
     setMenuMode('closed');
     resetHeight();
   };
@@ -118,6 +130,13 @@ export function Composer({ streaming }: { streaming: boolean }) {
       case 'coop':
         post({ type: 'setHarnessMode', mode: 'coop' });
         clearAndClose();
+        break;
+      case 'prd':
+        // Arm the next send as a PRD build (Foreman → per-story loop). The chip
+        // renders above the composer; the send consumes and clears it.
+        setPrdArmed(true);
+        clearAndClose();
+        requestAnimationFrame(() => taRef.current?.focus());
         break;
       case 'diff':
         store.openReview();
@@ -323,6 +342,7 @@ export function Composer({ streaming }: { streaming: boolean }) {
 
   return (
     <div class="fp-composer-wrap">
+      <ModelMentionPicker settings={settings} />
       {showStatus && <StatusCard conv={conv} settings={settings} onClose={() => setShowStatus(false)} />}
       {selection && (
         <div class="fp-attachments">
@@ -334,8 +354,16 @@ export function Composer({ streaming }: { streaming: boolean }) {
           </span>
         </div>
       )}
-      {attachments.length > 0 && (
+      {(attachments.length > 0 || prdArmed) && (
         <div class="fp-attachments">
+          {prdArmed && (
+            <span class="fp-attach-chip fp-prd-chip" title="The next message is decomposed into stories and built one by one">
+              ⚑ PRD build
+              <button type="button" class="fp-btn-ghost" style={{ padding: 0 }} onClick={() => setPrdArmed(false)} aria-label="Disarm PRD build">
+                <IconX size={13} />
+              </button>
+            </span>
+          )}
           {attachments.map((a, i) => (
             <span class="fp-attach-chip" key={i}>
               {a.name}
@@ -388,6 +416,74 @@ export function Composer({ streaming }: { streaming: boolean }) {
   );
 }
 
+/** Capitalized, human name for a mention target. */
+function roleTitle(role: string): string {
+  return role === 'conversation' ? 'the conversation' : role[0].toUpperCase() + role.slice(1);
+}
+
+/**
+ * Disambiguation card for an ambiguous per-role model mention ("qwen" matched
+ * two loaded models). Rendered above the composer while the host holds the
+ * prompt. A pick posts `resolveModelMention` with the model; the X (or Esc)
+ * dismisses with null (send without changing that role). Number keys 1–9 pick.
+ */
+function ModelMentionPicker({ settings }: { settings: FowlPlaySettings | null }) {
+  const choice = useStore((s) => s.modelMentionChoice);
+
+  useEffect(() => {
+    if (!choice) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        store.resolveModelMention(null);
+        return;
+      }
+      const n = Number(e.key);
+      if (Number.isInteger(n) && n >= 1 && n <= choice.candidates.length) {
+        e.preventDefault();
+        const c = choice.candidates[n - 1];
+        store.resolveModelMention({ providerId: c.providerId, modelId: c.modelId });
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [choice]);
+
+  if (!choice) return null;
+  const providerName = (id: string) => settings?.providers.find((p) => p.id === id)?.name ?? id;
+
+  return (
+    <div class="fp-mention-card">
+      <div class="fp-mention-head">
+        <span>Which “{choice.query}” for {roleTitle(choice.role)}?</span>
+        <button
+          type="button"
+          class="fp-btn-ghost"
+          style={{ padding: 0 }}
+          onClick={() => store.resolveModelMention(null)}
+          aria-label="Dismiss — send without changing the model"
+        >
+          <IconX size={14} />
+        </button>
+      </div>
+      <div class="fp-mention-options">
+        {choice.candidates.map((c, i) => (
+          <button
+            type="button"
+            class="fp-mention-option"
+            key={`${c.providerId}::${c.modelId}`}
+            onClick={() => store.resolveModelMention({ providerId: c.providerId, modelId: c.modelId })}
+          >
+            <span class="fp-mention-idx">{i + 1}</span>
+            <span class="fp-mention-label">{c.label}</span>
+            <span class="fp-mention-provider">{providerName(c.providerId)}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 const EMPTY_USAGE: TokenUsage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
 
 /**
@@ -413,6 +509,18 @@ function StatusCard({
   const pct = ctx ? Math.min(100, Math.round((lastInput / ctx) * 100)) : 0;
   const mode = conv?.harnessMode ?? settings?.harness.defaultMode ?? 'coop';
 
+  // Active per-role model overrides (conversation layer wins over settings).
+  const ROLES: CoopRole[] = ['scout', 'builder', 'inspector', 'sentry'];
+  const roleOverrides = ROLES.map((r) => {
+    const ref = conv?.roleModelOverrides?.[r] ?? settings?.harness.roleModelOverrides?.[r] ?? null;
+    return ref ? { role: r, label: modelLabel(settings, ref) } : null;
+  }).filter((x): x is { role: CoopRole; label: string } => x !== null);
+  const rolesLine =
+    roleOverrides.length > 0
+      ? roleOverrides.map((o) => `${o.role[0].toUpperCase()}${o.role.slice(1)} → ${o.label}`).join(', ') +
+        (roleOverrides.length < ROLES.length ? ', others → conversation model' : '')
+      : null;
+
   return (
     <div class="fp-status-card">
       <div class="fp-status-card-head">
@@ -424,6 +532,7 @@ function StatusCard({
       <div class="fp-status-card-rows">
         <div class="fp-status-row"><span class="fp-status-key">Model</span><span>{modelLabel(settings, model)}</span></div>
         <div class="fp-status-row"><span class="fp-status-key">Mode</span><span>{mode === 'coop' ? 'Coop (pipeline)' : 'Solo (direct)'}</span></div>
+        {rolesLine && <div class="fp-status-row"><span class="fp-status-key">Roles</span><span>{rolesLine}</span></div>}
         <div class="fp-status-row">
           <span class="fp-status-key">Context</span>
           <span>

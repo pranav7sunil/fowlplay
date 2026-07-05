@@ -1,6 +1,6 @@
 /** Settings: Appearance, Models & Providers, Harness. */
 import { useState } from 'preact/hooks';
-import type { FowlPlaySettings, AppearanceSettings, ThemeName, HarnessMode, ProviderConfig } from '../../shared/types';
+import type { FowlPlaySettings, AppearanceSettings, ThemeName, HarnessMode, HarnessSettings, ProviderConfig, CoopRole, ModelRef } from '../../shared/types';
 import { post, store, applyAppearance } from './store';
 import { AddProvider, ModelManagement } from './ProviderForm';
 import { IconX, IconPlus, IconTrash, IconArrowRight } from './icons';
@@ -174,6 +174,8 @@ function HarnessTab({ settings }: { settings: FowlPlaySettings | null }) {
         </div>
       </div>
 
+      <RoleModelsSection settings={settings} h={h} mode={mode} budget={budget} />
+
       <div class="fp-section">
         <h2>The Coop pipeline</h2>
         <div class="fp-section-desc">Every stage is rendered in chat as a gate card with pass/fail evidence.</div>
@@ -189,6 +191,71 @@ function HarnessTab({ settings }: { settings: FowlPlaySettings | null }) {
 
       <SkillsSection settings={settings} />
     </>
+  );
+}
+
+const ROLE_ROWS: { role: CoopRole; label: string }[] = [
+  { role: 'scout', label: 'Scout' },
+  { role: 'builder', label: 'Builder' },
+  { role: 'inspector', label: 'Inspector' },
+  { role: 'sentry', label: 'Sentry' },
+];
+
+/** Per-role model overrides: a dropdown per Coop role, saved into harness settings. */
+function RoleModelsSection({
+  settings,
+  h,
+  mode,
+  budget,
+}: {
+  settings: FowlPlaySettings | null;
+  h: HarnessSettings;
+  mode: HarnessMode;
+  budget: number;
+}) {
+  const providers = settings?.providers ?? [];
+  const [ov, setOv] = useState<Partial<Record<CoopRole, ModelRef>>>(h.roleModelOverrides ?? {});
+
+  const change = (role: CoopRole, value: string) => {
+    const next: Partial<Record<CoopRole, ModelRef>> = { ...ov };
+    if (!value) {
+      delete next[role];
+    } else {
+      const [providerId, modelId] = value.split('::');
+      next[role] = { providerId, modelId };
+    }
+    setOv(next);
+    post({ type: 'saveHarnessSettings', harness: { ...h, defaultMode: mode, qasRetryBudget: budget, roleModelOverrides: next } });
+  };
+
+  const valueFor = (role: CoopRole): string => {
+    const r = ov[role];
+    return r ? `${r.providerId}::${r.modelId}` : '';
+  };
+
+  return (
+    <div class="fp-section">
+      <h2>Role models</h2>
+      <div class="fp-section-desc">
+        Assign a specific model to each Coop role. “Default” uses the conversation model. A chat
+        directive like “qwen to orchestrate” overrides these for one conversation.
+      </div>
+      {ROLE_ROWS.map(({ role, label }) => (
+        <div class="fp-field" key={role}>
+          <label>{label}</label>
+          <select class="fp-select" value={valueFor(role)} onChange={(e) => change(role, (e.target as HTMLSelectElement).value)}>
+            <option value="">Default (conversation model)</option>
+            {providers.map((p) => (
+              <optgroup label={p.name} key={p.id}>
+                {p.models.map((m) => (
+                  <option value={`${p.id}::${m.id}`} key={m.id}>{m.displayName || m.id}</option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+        </div>
+      ))}
+    </div>
   );
 }
 

@@ -68,6 +68,7 @@ export type ContentBlock =
   | { type: 'gate'; card: GateCard }
   | { type: 'changes'; summary: ChangesSummary }          // "Review Changes" block
   | { type: 'commit'; commit: CommitRecord }               // historical commit block
+  | { type: 'plan' }                                       // PRD plan marker — renders live conv.prdPlan
   | { type: 'error'; message: string };
 
 export interface ToolCallRecord {
@@ -116,7 +117,21 @@ export interface Conversation {
   rootIds: string[];
   currentLeafId: string | null;
   model: ModelRef | null;
+  /**
+   * Per-conversation role model overrides (Coop). Highest-priority layer in the
+   * per-role resolution chain: conversation override → settings-level
+   * `harness.roleModelOverrides` → conversation `model`. Rides on the Conversation
+   * object so it persists with history (plain JSON).
+   */
+  roleModelOverrides?: Partial<Record<CoopRole, ModelRef>>;
   harnessMode: HarnessMode;
+  /**
+   * PRD build plan (Foreman decomposition → per-story build loop). Present once a `/prd`
+   * turn has decomposed a PRD into ordered stories; the plan block renders live from here
+   * (statuses advance across turns). Plain JSON, so it persists with history. Cleared
+   * naturally when a new conversation is started.
+   */
+  prdPlan?: PrdPlan;
   createdAt: number;
   updatedAt: number;
   usageTotals: TokenUsage;
@@ -202,9 +217,11 @@ export type GateStatus = 'running' | 'passed' | 'failed' | 'blocked' | 'skipped'
 /** Evidence-based delivery: every gate emits a card with its proof. */
 export interface GateCard {
   id: string;
-  role: CoopRole | 'stop-the-line' | 'hitl';
+  role: CoopRole | 'stop-the-line' | 'hitl' | 'foreman';
   title: string;               // e.g. "Inspector — QA validation"
   status: GateStatus;
+  /** Display label of the model that ran this role (Coop per-role models). */
+  modelLabel?: string;
   /** What was checked / produced. Markdown. */
   evidence: string;
   /** For scout: acceptance criteria. */
@@ -212,12 +229,41 @@ export interface GateCard {
   /** For inspector/sentry: findings that routed work back. */
   findings?: string[];
   attempt?: number;            // builder/inspector retry round
+  /** Token usage this role spent (shown dimmed in the card footer). */
+  usage?: TokenUsage;
 }
 
 export interface HarnessSettings {
   defaultMode: HarnessMode;
   qasRetryBudget: number;      // bounded route-backs, default 2
   roleModelOverrides?: Partial<Record<CoopRole, ModelRef>>;
+}
+
+// ---------------------------------------------------------------------------
+// PRD builds (Foreman decomposition → per-story build loop)
+// ---------------------------------------------------------------------------
+
+/** Lifecycle of one story in a PRD plan. */
+export type PrdStoryStatus = 'pending' | 'building' | 'awaiting-review' | 'done' | 'failed';
+
+/**
+ * One ordered story of a decomposed PRD. `specPath` is the workspace-relative markdown spec
+ * written to disk for this story. Behavior (parsing, spec rendering, path derivation) lives
+ * in `core/harness/prd.ts`; this is the JSON-serializable state that rides on `Conversation`.
+ */
+export interface PrdStory {
+  title: string;
+  summary: string;
+  criteria: string[];
+  specPath: string;
+  status: PrdStoryStatus;
+}
+
+/** A PRD build plan: ordered stories plus the cursor into the story currently in focus. */
+export interface PrdPlan {
+  stories: PrdStory[];
+  /** Index of the story the human is currently building / reviewing. */
+  cursor: number;
 }
 
 // ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ import type {
   Conversation,
   ContentBlock,
   ConversationSummary,
+  CoopRole,
   FowlPlaySettings,
   GateCard,
   HarnessMode,
@@ -44,15 +45,34 @@ import { runAgentLoop } from '../core/agent/loop';
 import { buildToolSpecs, type DirEntry, type GrepMatch, type GrepOptions, type StageOp, type ToolHost } from '../core/agent/tools';
 import { BUNDLED_SKILLS, formatSkillCatalog, parseSkill } from '../core/agent/skills';
 import { gcHistory } from '../core/agent/contextGc';
+import { trimWireToBudget, wireTokens } from '../core/agent/contextBudget';
 import { StagingOverlay, type DiskReader } from '../core/staging/overlay';
 import { ChangeSet } from '../core/staging/changeset';
 import { detectDrift, rebase as coreRebase } from '../core/staging/rebase';
 import { renderHunkDiff } from '../core/diff/compute';
 import {
+  ContextExceededError,
   runCoopPipeline,
   type ChangesetInspector,
+  type CoopResult,
   type RoleRunner,
 } from '../core/harness/coop';
+import {
+  FOREMAN_SYSTEM,
+  composeStoryPrompt,
+  parseForeman,
+  renderSpecMarkdown,
+  specRelPath,
+  type PrdPlan,
+  type PrdStory,
+} from '../core/harness/prd';
+import {
+  createCard,
+  joinSections,
+  numberedList,
+  section,
+  transition,
+} from '../core/harness/evidence';
 import {
   appendAssistant,
   appendUser,
@@ -64,6 +84,13 @@ import {
   switchBranch as treeSwitchBranch,
 } from '../core/conversation/tree';
 import { toJSON, toMarkdown } from '../core/conversation/serialize';
+import {
+  isDirectiveOnly,
+  matchModels,
+  parseModelMentions,
+  type MentionRole,
+  type ModelMatch,
+} from '../core/agent/modelMentions';
 
 // ---------------------------------------------------------------------------
 // Injected ports (implemented by the vscode layer or by test fakes)
@@ -167,6 +194,21 @@ export class SessionCore {
   private pendingSelection: SelectionContext | null = null;
 
   /**
+   * A prompt held while the webview disambiguates one or more model mentions that
+   * matched more than one configured model. `queue[0]` is the choice currently
+   * surfaced; each `resolveModelMention` shifts it. When the queue drains the held
+   * prompt is released (run as a turn, or applied silently if directive-only).
+   */
+  private heldMention: {
+    text: string;
+    attachments?: Attachment[];
+    queue: { role: MentionRole; query: string; candidates: ModelMatch[] }[];
+    assignments: string[];
+    /** Carried through the disambiguation so a held PRD prompt still decomposes on release. */
+    prd?: boolean;
+  } | null = null;
+
+  /**
    * Skills available for the current turn (bundled defaults + workspace
    * `.fowlplay/skills/*.md`), rediscovered at the start of each turn. Consumed by
    * `toolHost()` (for `load_skill`) and the system-prompt catalog injection.
@@ -217,7 +259,10 @@ export class SessionCore {
         await this.onReady();
         return;
       case 'sendPrompt':
-        await this.onSendPrompt(msg.text, msg.attachments);
+        await this.onSendPrompt(msg.text, msg.attachments, msg.prd);
+        return;
+      case 'continueStoryLoop':
+        await this.onContinueStoryLoop();
         return;
       case 'cancelResponse':
         this.abort?.abort();
@@ -258,6 +303,9 @@ export class SessionCore {
         this.conv = { ...this.conv, harnessMode: msg.mode, updatedAt: this.clock() };
         this.sendConversation();
         void this.persist();
+        return;
+      case 'resolveModelMention':
+        await this.onResolveModelMention(msg.role, msg.model);
         return;
       case 'openDiff':
         this.sendChangeset(msg.changesetId);
@@ -431,7 +479,123 @@ export class SessionCore {
   // Turn flow
   // -------------------------------------------------------------------------
 
-  private async onSendPrompt(text: string, attachments?: Attachment[]): Promise<void> {
+  /**
+   * Entry point for a user prompt. Before anything is appended to the tree, the
+   * text is scanned for per-role model directives ("qwen to orchestrate",
+   * "use glm for review", role-less "switch to qwen"). Each mention resolves to
+   * 0, 1, or >1 configured models:
+   *   0  → warn and ignore that mention.
+   *   1  → apply it (conversation model or a per-role override).
+   *   >1 → hold the ENTIRE prompt and ask the webview to disambiguate.
+   * Once mentions are settled, a directive-ONLY message applies without running a
+   * turn; otherwise the turn runs with the ORIGINAL full text (mentions are not
+   * stripped from what the model sees — keeping history honest is harmless).
+   */
+  private async onSendPrompt(text: string, attachments?: Attachment[], prd?: boolean): Promise<void> {
+    const trimmed = text.trim();
+    const atts = attachments ?? [];
+    if (!trimmed && atts.length === 0) return;
+
+    // A new prompt supersedes any prompt still held behind an unanswered
+    // disambiguation — otherwise answering the stale picker later would
+    // release (and run) the abandoned message.
+    this.heldMention = null;
+
+    const settings = await this.ensureSettings();
+    const mentions = parseModelMentions(text);
+    const assignments: string[] = [];
+    const queue: { role: MentionRole; query: string; candidates: ModelMatch[] }[] = [];
+
+    for (const mention of mentions) {
+      const candidates = matchModels(mention.query, settings.providers);
+      if (candidates.length === 0) {
+        this.toast('warn', `No configured model matches "${mention.query}"`);
+        continue;
+      }
+      if (candidates.length === 1) {
+        this.applyMention(mention.role, refOf(candidates[0]));
+        assignments.push(assignmentLabel(mention.role, candidates[0].label));
+        continue;
+      }
+      queue.push({ role: mention.role, query: mention.query, candidates });
+    }
+
+    if (queue.length > 0) {
+      // Hold the whole prompt (selection stays pinned) until every ambiguity is
+      // resolved; surface the first choice now.
+      this.heldMention = { text, attachments, queue, assignments, prd };
+      const first = queue[0];
+      this.deps.post({
+        type: 'modelMentionChoice',
+        role: first.role,
+        query: first.query,
+        candidates: first.candidates.map((c) => ({ providerId: c.providerId, modelId: c.modelId, label: c.label })),
+      });
+      return;
+    }
+
+    await this.finishMentions(text, attachments, assignments, prd);
+  }
+
+  /** Resolve one held ambiguity, then advance the queue or release the prompt. */
+  private async onResolveModelMention(role: MentionRole, model: ModelRef | null): Promise<void> {
+    const held = this.heldMention;
+    if (!held) return;
+    if (model) {
+      const label = this.labelForRef(model);
+      this.applyMention(role, model);
+      held.assignments.push(assignmentLabel(role, label));
+    } else {
+      this.toast('info', `Sent without changing the ${roleWord(role)} model`);
+    }
+    held.queue.shift();
+    if (held.queue.length > 0) {
+      const next = held.queue[0];
+      this.deps.post({
+        type: 'modelMentionChoice',
+        role: next.role,
+        query: next.query,
+        candidates: next.candidates.map((c) => ({ providerId: c.providerId, modelId: c.modelId, label: c.label })),
+      });
+      return;
+    }
+    this.heldMention = null;
+    await this.finishMentions(held.text, held.attachments, held.assignments, held.prd);
+  }
+
+  /** Apply a resolved mention to the conversation (role override or the model itself). */
+  private applyMention(role: MentionRole, model: ModelRef): void {
+    if (role === 'conversation') {
+      // setModel semantics WITHOUT saving as the global default — a chat directive
+      // steers this conversation only.
+      this.conv = { ...this.conv, model, updatedAt: this.clock() };
+    } else {
+      const roleModelOverrides = { ...(this.conv.roleModelOverrides ?? {}), [role]: model };
+      this.conv = { ...this.conv, roleModelOverrides, updatedAt: this.clock() };
+    }
+  }
+
+  /**
+   * After mentions are settled: persist any assignments, then either apply-only
+   * (directive-only message: no turn, just a confirmation toast) or run the turn
+   * with the original full text.
+   */
+  private async finishMentions(text: string, attachments: Attachment[] | undefined, assignments: string[], prd?: boolean): Promise<void> {
+    if (assignments.length > 0) {
+      this.sendConversation();
+      await this.persist();
+    }
+    // Only short-circuit when something was actually applied AND nothing but
+    // directives remain. A message whose "mentions" all matched nothing (e.g.
+    // "use the foo skill") still runs as an ordinary turn.
+    if (assignments.length > 0 && isDirectiveOnly(text)) {
+      this.toast('info', assignments.join(', '));
+      return;
+    }
+    await this.runPromptTurn(text, attachments, prd);
+  }
+
+  private async runPromptTurn(text: string, attachments?: Attachment[], prd?: boolean): Promise<void> {
     const trimmed = text.trim();
     const atts = attachments ?? [];
     if (!trimmed && atts.length === 0) return;
@@ -473,7 +637,7 @@ export class SessionCore {
 
     const { conv, nodeId } = appendUser(this.conv, [{ type: 'text', text: displayText || '(see attachments)' }]);
     this.conv = conv;
-    await this.runAssistantTurn(nodeId, imageParts);
+    await this.runAssistantTurn(nodeId, imageParts, { prd });
   }
 
   private async onEditMessage(nodeId: string, text: string): Promise<void> {
@@ -496,8 +660,18 @@ export class SessionCore {
     }
   }
 
-  /** The shared turn engine: given a user node, produce an assistant response. */
-  private async runAssistantTurn(userNodeId: string, imageParts: WireUserPart[] = []): Promise<void> {
+  /**
+   * The shared turn engine: given a user node, produce an assistant response.
+   *
+   * `opts.prd` runs the PRD front-end (Foreman decomposition → write specs → build story 1);
+   * `opts.storyIndex` runs one story of an existing plan (used by `continueStoryLoop`).
+   * With neither, the turn runs an ordinary Coop or Solo response.
+   */
+  private async runAssistantTurn(
+    userNodeId: string,
+    imageParts: WireUserPart[] = [],
+    opts: { prd?: boolean; storyIndex?: number } = {},
+  ): Promise<void> {
     const settings = await this.ensureSettings();
     const resolved = await this.resolveModel();
     if (!resolved) {
@@ -530,7 +704,15 @@ export class SessionCore {
     let blocks: ContentBlock[] = [];
     let usage: TokenUsage = emptyUsage();
     try {
-      if (this.conv.harnessMode === 'coop') {
+      if (opts.prd) {
+        const out = await this.runPrd(userText, imageParts, baseWire, resolved, settings.harness, signal);
+        blocks = out.blocks;
+        usage = out.usage;
+      } else if (opts.storyIndex !== undefined) {
+        const out = await this.runStory(opts.storyIndex, baseWire, resolved, settings.harness, signal);
+        blocks = out.blocks;
+        usage = out.usage;
+      } else if (this.conv.harnessMode === 'coop') {
         const out = await this.runCoop(userText, imageParts, baseWire, resolved, settings.harness, signal);
         blocks = out.blocks;
         usage = out.usage;
@@ -569,11 +751,29 @@ export class SessionCore {
     assistantId: string,
     signal: AbortSignal,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
+    const settings = await this.ensureSettings();
     const fullHistory: WireMessage[] = [
       ...baseWire,
       { role: 'user', content: [{ type: 'text', text: userText }, ...imageParts] },
     ];
-    const sent = gcHistory(fullHistory);
+    let sent = gcHistory(fullHistory);
+
+    // Hard context-window management: trim oldest turns to fit the conversation
+    // model's payload budget. If the newest turn alone still overruns, surface a
+    // friendly error block instead of letting the provider 400 on us.
+    const budget = this.payloadBudget(settings);
+    if (budget !== undefined) {
+      const trimmed = trimWireToBudget(sent, budget);
+      sent = trimmed.messages;
+      if (wireTokens(sent) > budget) {
+        const label = this.roleModelLabel(settings) ?? 'the selected model';
+        const window = this.roleWindow(settings);
+        return {
+          blocks: [{ type: 'error', message: contextExceededMessage(label, window) }],
+          usage: emptyUsage(),
+        };
+      }
+    }
 
     const result = await runAgentLoop({
       adapter: resolved.adapter,
@@ -603,15 +803,42 @@ export class SessionCore {
     signal: AbortSignal,
   ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
     const cards: GateCard[] = [];
+    const result = await this.runCoopCore(userText, imageParts, baseWire, resolved, harness, signal, cards);
+
+    const blocks: ContentBlock[] = cards.map((card) => ({ type: 'gate', card }));
+    const text = this.coopOutcomeText(result);
+    if (text) blocks.push({ type: 'text', text });
+    return { blocks, usage: result.usage };
+  }
+
+  /**
+   * Wire up the Coop collaborators (per-role model runner, changeset inspector, Builder
+   * loop) and run the pipeline once for `userPrompt`. Emitted gate cards are pushed onto
+   * `cards` and streamed to the webview. Shared by ordinary Coop turns and per-story PRD
+   * builds — the caller maps the returned outcome to blocks / plan status.
+   */
+  private async runCoopCore(
+    userPrompt: string,
+    imageParts: WireUserPart[],
+    baseWire: WireMessage[],
+    resolved: ResolvedModel,
+    harness: HarnessSettings,
+    signal: AbortSignal,
+    cards: GateCard[],
+  ): Promise<CoopResult> {
+    const settings = await this.ensureSettings();
     const runner: RoleRunner = {
-      run: async ({ system, userPrompt, readOnly, signal: s }) => {
+      run: async ({ role, system, userPrompt: rolePrompt, readOnly, signal: s }) => {
+        // Each role resolves its own model through the override chain, falling
+        // back to the turn's conversation model.
+        const rm = (await this.resolveModel(role)) ?? resolved;
         const res = await runAgentLoop({
-          adapter: resolved.adapter,
-          baseUrl: resolved.baseUrl,
-          apiKey: resolved.apiKey,
-          modelId: resolved.modelId,
+          adapter: rm.adapter,
+          baseUrl: rm.baseUrl,
+          apiKey: rm.apiKey,
+          modelId: rm.modelId,
           system,
-          history: [{ role: 'user', content: [{ type: 'text', text: userPrompt }] }],
+          history: [{ role: 'user', content: [{ type: 'text', text: rolePrompt }] }],
           tools: readOnly ? this.readOnlyTools : this.allTools,
           toolHost: this.toolHost(),
           onEvent: () => {}, // role calls are summarized as gate cards, not streamed
@@ -631,17 +858,40 @@ export class SessionCore {
     };
 
     const buildStage = async (instructions: string, s?: AbortSignal): Promise<TokenUsage> => {
+      // The Builder stage uses the `builder` role's resolution.
+      const rm = (await this.resolveModel('builder')) ?? resolved;
       const base: WireMessage[] = [
         ...baseWire,
         { role: 'user', content: [{ type: 'text', text: instructions }, ...imageParts] },
       ];
+      let history = gcHistory(base);
+
+      // Trim oldest turns to the Builder model's payload budget. If the newest
+      // turn alone overruns, throw — the pipeline turns this into a Context limit
+      // gate and a `context-exceeded` outcome.
+      const budget = this.payloadBudget(settings, 'builder');
+      if (budget !== undefined) {
+        const trimmed = trimWireToBudget(history, budget);
+        history = trimmed.messages;
+        const needed = wireTokens(history);
+        if (needed > budget) {
+          throw new ContextExceededError({
+            role: 'builder',
+            modelLabel: this.roleModelLabel(settings, 'builder'),
+            windowTokens: this.roleWindow(settings, 'builder'),
+            neededTokens: needed,
+            budgetTokens: budget,
+          });
+        }
+      }
+
       const res = await runAgentLoop({
-        adapter: resolved.adapter,
-        baseUrl: resolved.baseUrl,
-        apiKey: resolved.apiKey,
-        modelId: resolved.modelId,
+        adapter: rm.adapter,
+        baseUrl: rm.baseUrl,
+        apiKey: rm.apiKey,
+        modelId: rm.modelId,
         system: this.systemWithSkills(SOLO_SYSTEM),
-        history: gcHistory(base),
+        history,
         tools: this.toolsWithSkills(),
         toolHost: this.toolHost(),
         onEvent: (e) => this.deps.post({ type: 'stream', event: e }),
@@ -652,8 +902,8 @@ export class SessionCore {
       return res.usage;
     };
 
-    const result = await runCoopPipeline({
-      userPrompt: userText,
+    return runCoopPipeline({
+      userPrompt,
       runner,
       inspector,
       buildStage,
@@ -662,27 +912,268 @@ export class SessionCore {
         upsertCard(cards, card);
         this.deps.post({ type: 'gateUpdate', card });
       },
+      modelLabelFor: (role) => this.roleModelLabel(settings, role),
+      diffBudgetFor: (role) => this.payloadBudget(settings, role),
       signal,
     });
+  }
 
-    const blocks: ContentBlock[] = cards.map((card) => ({ type: 'gate', card }));
+  /** The explanatory text block for a non-ready Coop outcome (empty for ready-for-review). */
+  private coopOutcomeText(result: CoopResult): string {
     switch (result.outcome) {
       case 'blocked':
-        blocks.push({ type: 'text', text: result.question ?? 'The request needs clarification before work can begin.' });
-        break;
+        return result.question ?? 'The request needs clarification before work can begin.';
       case 'qas-failed':
-        blocks.push({ type: 'text', text: 'The Inspector could not approve the changes within the retry budget. They remain staged for your review.' });
-        break;
+        return 'The Inspector could not approve the changes within the retry budget. They remain staged for your review.';
       case 'security-blocked':
-        blocks.push({ type: 'text', text: 'Sentry flagged a security concern. The changes remain staged — review carefully before applying.' });
-        break;
+        return 'Sentry flagged a security concern. The changes remain staged — review carefully before applying.';
+      case 'context-exceeded':
+        return contextExceededMessage(result.context?.modelLabel ?? 'the selected model', result.context?.windowTokens);
       case 'cancelled':
-        blocks.push({ type: 'text', text: 'Cancelled.' });
-        break;
+        return 'Cancelled.';
       case 'ready-for-review':
-        break;
+        return '';
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // PRD builds (Foreman decomposition → per-story build loop)
+  // -------------------------------------------------------------------------
+
+  /**
+   * A PRD turn: the Foreman decomposes the PRD into ordered stories (read-only, Scout's
+   * model), each story is written to disk as a spec, the plan is stored on the conversation,
+   * and story 1 is built immediately within this same turn. A decomposition failure (<2
+   * stories, or unparseable output) blocks the Foreman card and creates no plan.
+   */
+  private async runPrd(
+    userText: string,
+    imageParts: WireUserPart[],
+    baseWire: WireMessage[],
+    resolved: ResolvedModel,
+    harness: HarnessSettings,
+    signal: AbortSignal,
+  ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
+    const settings = await this.ensureSettings();
+    const usage: TokenUsage = emptyUsage();
+    const cards: GateCard[] = [];
+    const emit = (card: GateCard): GateCard => {
+      upsertCard(cards, card);
+      this.deps.post({ type: 'gateUpdate', card });
+      return card;
+    };
+    const gateBlocks = (): ContentBlock[] => cards.map((card) => ({ type: 'gate', card }));
+
+    // --- Foreman gate: decompose the PRD (Scout's model, read-only) ---
+    let foremanCard = emit(
+      createCard('gate-foreman-1', {
+        role: 'foreman',
+        title: 'Foreman — PRD decomposition',
+        evidence: 'Decomposing the PRD into ordered, independently-buildable stories…',
+        modelLabel: this.roleModelLabel(settings, 'scout'),
+      }),
+    );
+    if (signal.aborted) {
+      emit(transition(foremanCard, 'failed', { evidence: joinSections(foremanCard.evidence, '_Cancelled by user._') }));
+      return { blocks: [...gateBlocks(), { type: 'text', text: 'Cancelled.' }], usage };
+    }
+
+    const rm = (await this.resolveModel('scout')) ?? resolved;
+    const res = await runAgentLoop({
+      adapter: rm.adapter,
+      baseUrl: rm.baseUrl,
+      apiKey: rm.apiKey,
+      modelId: rm.modelId,
+      system: FOREMAN_SYSTEM,
+      history: [{ role: 'user', content: [{ type: 'text', text: userText }, ...imageParts] }],
+      tools: this.readOnlyTools,
+      toolHost: this.toolHost(),
+      onEvent: () => {},
+      maxRounds: 8,
+      signal,
+    });
+    addUsageInPlace(usage, res.usage);
+    const foremanUsage = res.usage;
+
+    if (signal.aborted) {
+      emit(transition(foremanCard, 'failed', { usage: foremanUsage, evidence: joinSections(foremanCard.evidence, '_Cancelled by user._') }));
+      return { blocks: [...gateBlocks(), { type: 'text', text: 'Cancelled.' }], usage };
+    }
+
+    const stories = parseForeman(joinText(res.blocks));
+    if (stories.length < 2) {
+      emit(
+        transition(foremanCard, 'blocked', {
+          usage: foremanUsage,
+          evidence: joinSections(
+            section('Could not decompose', 'The PRD did not yield at least two ordered, buildable stories.'),
+            section('What to do', 'Rephrase the PRD, split it into clearer deliverables, or send it as a normal request.'),
+          ),
+        }),
+      );
+      return {
+        blocks: [...gateBlocks(), { type: 'text', text: 'Could not decompose the PRD into stories — rephrase or split it, or send it as a normal request.' }],
+        usage,
+      };
+    }
+
+    // --- Build the plan + write each spec to disk (direct meta-artifacts) ---
+    const total = stories.length;
+    const plan: PrdPlan = { stories: [], cursor: 0 };
+    for (let i = 0; i < total; i += 1) {
+      const s = stories[i];
+      const specPath = specRelPath(this.conv.id, i + 1, s.title);
+      const story: PrdStory = { title: s.title, summary: s.summary, criteria: s.criteria, specPath, status: 'pending' };
+      plan.stories.push(story);
+      await this.writeSpec(story, i + 1, total);
+    }
+    this.conv = { ...this.conv, prdPlan: plan };
+
+    emit(
+      transition(foremanCard, 'passed', {
+        usage: foremanUsage,
+        evidence: joinSections(
+          section(`Decomposed into ${total} stories`, numberedList(plan.stories.map((s) => s.title))),
+          section('Next', 'Building story 1 now; you review between stories.'),
+        ),
+      }),
+    );
+
+    // --- Build story 1 immediately, within this same turn ---
+    const story1 = await this.runStory(0, baseWire, resolved, harness, signal);
+    addUsageInPlace(usage, story1.usage);
+
+    // Blocks: Foreman gate, the plan marker (renders live), then story 1's cards + outcome.
+    return { blocks: [...gateBlocks(), { type: 'plan' }, ...story1.blocks], usage };
+  }
+
+  /**
+   * Run the Coop pipeline for one story of the current plan, mapping the outcome to the
+   * story's status and the explanatory blocks. Updates the story's spec file on disk after
+   * each transition (best-effort; rebuilt from plan data if it went missing).
+   */
+  private async runStory(
+    storyIndex: number,
+    baseWire: WireMessage[],
+    resolved: ResolvedModel,
+    harness: HarnessSettings,
+    signal: AbortSignal,
+  ): Promise<{ blocks: ContentBlock[]; usage: TokenUsage }> {
+    const plan = this.conv.prdPlan;
+    const story = plan?.stories[storyIndex];
+    if (!plan || !story) {
+      return { blocks: [{ type: 'text', text: 'No story to build — the plan is missing.' }], usage: emptyUsage() };
+    }
+
+    const total = plan.stories.length;
+    this.setStoryStatus(storyIndex, 'building');
+    await this.writeSpec(this.conv.prdPlan!.stories[storyIndex], storyIndex + 1, total);
+
+    const specMarkdown = renderSpecMarkdown(this.conv.prdPlan!.stories[storyIndex], storyIndex + 1, total);
+    const userPrompt = composeStoryPrompt(specMarkdown, storyIndex + 1, total);
+
+    const cards: GateCard[] = [];
+    const result = await this.runCoopCore(userPrompt, [], baseWire, resolved, harness, signal, cards);
+
+    const status: PrdStory['status'] =
+      result.outcome === 'ready-for-review' ? 'awaiting-review' : result.outcome === 'cancelled' ? 'pending' : 'failed';
+    this.setStoryStatus(storyIndex, status);
+    await this.writeSpec(this.conv.prdPlan!.stories[storyIndex], storyIndex + 1, total);
+
+    const blocks: ContentBlock[] = cards.map((card) => ({ type: 'gate', card }));
+    const text = this.coopOutcomeText(result);
+    if (text) blocks.push({ type: 'text', text });
     return { blocks, usage: result.usage };
+  }
+
+  /**
+   * Advance a PRD build to the next story. Ignored while a turn is streaming. Marks the
+   * cursor story done (a failed story continued past is also marked done — the human decided
+   * to move on; the `(skipped review)` nuance is recorded only in the spec file). If no
+   * stories remain, appends a completion summary; otherwise appends a synthetic user node
+   * and runs the next story as a fresh turn (so rewind/branching stay coherent).
+   */
+  private async onContinueStoryLoop(): Promise<void> {
+    if (this.abort) return; // a turn is in flight — ignore
+    const plan = this.conv.prdPlan;
+    if (!plan) return;
+    const i = plan.cursor;
+    const current = plan.stories[i];
+    if (!current) return;
+    if (current.status === 'building') return; // defensive — a turn should be in flight
+
+    // A pending cursor story was cancelled (or never started): Continue means
+    // RETRY it, not mark it done and skip past work that never happened.
+    if (current.status === 'pending') {
+      const { conv, nodeId } = appendUser(this.conv, [
+        { type: 'text', text: `Resume story ${i + 1}: ${current.title}` },
+      ]);
+      this.conv = conv;
+      await this.runAssistantTurn(nodeId, [], { storyIndex: i });
+      return;
+    }
+
+    const skippedReview = current.status === 'failed';
+    const stories = plan.stories.map((s, idx) => (idx === i ? { ...s, status: 'done' as const } : s));
+    const nextCursor = i + 1;
+    this.conv = { ...this.conv, prdPlan: { stories, cursor: nextCursor } };
+    // Record the skipped-review nuance in the spec file only (state machine stays simple).
+    await this.writeSpec(stories[i], i + 1, stories.length, skippedReview ? 'skipped review' : undefined);
+
+    if (nextCursor >= stories.length) {
+      // Plan complete — summarize the final statuses in a short assistant block.
+      const summary = this.renderPlanSummary(stories);
+      const { conv } = appendAssistant(this.conv, [{ type: 'text', text: summary }], {
+        parentId: this.conv.currentLeafId ?? undefined,
+        model: this.conv.model ?? undefined,
+      });
+      this.conv = conv;
+      await this.persist();
+      this.sendConversation();
+      return;
+    }
+
+    // Run the next story as a new turn, parented on a synthetic "Continue" user node.
+    const next = stories[nextCursor];
+    const { conv, nodeId } = appendUser(this.conv, [
+      { type: 'text', text: `Continue to story ${nextCursor + 1}: ${next.title}` },
+    ]);
+    this.conv = conv;
+    await this.runAssistantTurn(nodeId, [], { storyIndex: nextCursor });
+  }
+
+  /** Set a story's status immutably on the conversation's plan (no-op if the plan is gone). */
+  private setStoryStatus(index: number, status: PrdStory['status']): void {
+    const plan = this.conv.prdPlan;
+    if (!plan || !plan.stories[index]) return;
+    const stories = plan.stories.map((s, idx) => (idx === index ? { ...s, status } : s));
+    this.conv = { ...this.conv, prdPlan: { ...plan, stories } };
+  }
+
+  /**
+   * Write (or rewrite) a story's spec file. A direct meta-artifact — NOT staged through the
+   * overlay. Best-effort: swallows write errors so a spec-write hiccup never fails a build.
+   */
+  private async writeSpec(story: PrdStory, index: number, total: number, note?: string): Promise<void> {
+    try {
+      await this.deps.io.write(story.specPath, renderSpecMarkdown(story, index, total, undefined, note));
+    } catch {
+      /* spec files are best-effort meta-artifacts */
+    }
+  }
+
+  /** A one-line-per-story completion summary for a finished PRD build. */
+  private renderPlanSummary(stories: PrdStory[]): string {
+    const glyph: Record<PrdStory['status'], string> = {
+      pending: '○',
+      building: '…',
+      'awaiting-review': '◉',
+      done: '✓',
+      failed: '✕',
+    };
+    const done = stories.filter((s) => s.status === 'done').length;
+    const lines = stories.map((s, i) => `${i + 1}. ${glyph[s.status]} ${s.title}`);
+    return `PRD build complete — ${done} of ${stories.length} stories done.\n\n${lines.join('\n')}`;
   }
 
   private finalizeAssistant(nodeId: string, blocks: ContentBlock[], usage: TokenUsage): void {
@@ -1101,12 +1592,21 @@ export class SessionCore {
     return metas.length > 0 ? buildToolSpecs({ skills: metas }) : this.allTools;
   }
 
-  private async resolveModel(): Promise<ResolvedModel | null> {
+  /**
+   * Resolve the model to run a given Coop `role` (or, with no role, the plain
+   * conversation model). The chain is:
+   *   conversation `roleModelOverrides[role]` → settings `harness.roleModelOverrides[role]`
+   *   → conversation `model`.
+   * Override layers that reference a deleted provider/model fall through to the
+   * next layer; the final conversation-model layer only requires the provider to
+   * still exist (mirroring the historical behavior). Returns null only when
+   * nothing in the chain resolves.
+   */
+  private async resolveModel(role?: CoopRole): Promise<ResolvedModel | null> {
     const settings = await this.ensureSettings();
-    const ref = this.conv.model;
-    if (!ref) return null;
-    const provider = settings.providers.find((p) => p.id === ref.providerId);
-    if (!provider) return null;
+    const found = this.resolveRef(settings, role);
+    if (!found) return null;
+    const { provider, ref } = found;
     const apiKey = provider.requiresApiKey ? await this.deps.secrets.get(provider.id) : undefined;
     return {
       adapter: this.createAdapter(provider.sdkType),
@@ -1114,6 +1614,68 @@ export class SessionCore {
       apiKey,
       modelId: ref.modelId,
     };
+  }
+
+  /**
+   * The provider + ModelRef that a role resolves to under the override chain, or
+   * null. Override layers require the model to still exist; the conversation-model
+   * fallback requires only the provider (a model list may lag behind a fetch).
+   */
+  private resolveRef(
+    settings: FowlPlaySettings,
+    role?: CoopRole,
+  ): { provider: ProviderConfig; ref: ModelRef } | null {
+    const layers: Array<{ ref: ModelRef | null | undefined; requireModel: boolean }> = [];
+    if (role) {
+      layers.push({ ref: this.conv.roleModelOverrides?.[role], requireModel: true });
+      layers.push({ ref: settings.harness.roleModelOverrides?.[role], requireModel: true });
+    }
+    layers.push({ ref: this.conv.model, requireModel: false });
+
+    for (const { ref, requireModel } of layers) {
+      if (!ref) continue;
+      const provider = settings.providers.find((p) => p.id === ref.providerId);
+      if (!provider) continue;
+      if (requireModel && !provider.models.some((m) => m.id === ref.modelId)) continue;
+      return { provider, ref };
+    }
+    return null;
+  }
+
+  /** Display label for the model a role resolves to (for gate cards / status). */
+  private roleModelLabel(settings: FowlPlaySettings, role?: CoopRole): string | undefined {
+    const found = this.resolveRef(settings, role);
+    if (!found) return undefined;
+    const model = found.provider.models.find((m) => m.id === found.ref.modelId);
+    return model?.displayName || model?.id || found.ref.modelId;
+  }
+
+  /** The known context window (tokens) of the model a role resolves to, if any. */
+  private roleWindow(settings: FowlPlaySettings, role?: CoopRole): number | undefined {
+    const found = this.resolveRef(settings, role);
+    const model = found?.provider.models.find((m) => m.id === found.ref.modelId);
+    const window = model?.contextWindow;
+    return window && window > 0 ? window : undefined;
+  }
+
+  /**
+   * The payload token budget for a role's model: the context window minus a
+   * reserve for the system prompt, instructions, and response headroom
+   * (`max(1500, 25% of window)`). Returns `undefined` when the window is unknown
+   * — no hard budget, preserving today's behavior for such providers.
+   */
+  private payloadBudget(settings: FowlPlaySettings, role?: CoopRole): number | undefined {
+    const window = this.roleWindow(settings, role);
+    if (window === undefined) return undefined;
+    const reserve = Math.max(1500, Math.floor(window * 0.25));
+    return Math.max(0, window - reserve);
+  }
+
+  /** Display label for an explicit ModelRef (used in mention confirmations). */
+  private labelForRef(ref: ModelRef): string {
+    const provider = this.settingsCache?.providers.find((p) => p.id === ref.providerId);
+    const model = provider?.models.find((m) => m.id === ref.modelId);
+    return model?.displayName || model?.id || ref.modelId;
   }
 
   /** Wire history that a follow-up from `userNodeId` should build on. */
@@ -1215,6 +1777,18 @@ function emptyUsage(): TokenUsage {
   return { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
 }
 
+/** User-facing message when a request + its context overruns the model's window. */
+function contextExceededMessage(modelLabel: string, windowTokens?: number): string {
+  const size = windowTokens ? ` (~${fmtTokensK(windowTokens)})` : '';
+  return `The request plus its context exceeds ${modelLabel}'s context window${size}. Trim the request, start a fresh conversation, or pick a larger model.`;
+}
+
+/** Format a token count with a thousands suffix, e.g. 1234 → "1.2k". */
+function fmtTokensK(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k`;
+  return String(n);
+}
+
 /** Strip skill bodies down to catalog metadata (name + description). */
 function toSkillMetas(skills: Skill[]): SkillMeta[] {
   return skills.map(({ name, description }) => ({ name, description }));
@@ -1226,6 +1800,13 @@ function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
     outputTokens: a.outputTokens + b.outputTokens,
     cachedTokens: a.cachedTokens + b.cachedTokens,
   };
+}
+
+/** Accumulate `b` into `a` in place (for summing usage across sub-calls in one turn). */
+function addUsageInPlace(a: TokenUsage, b: TokenUsage): void {
+  a.inputTokens += b.inputTokens;
+  a.outputTokens += b.outputTokens;
+  a.cachedTokens += b.cachedTokens;
 }
 
 function firstText(blocks: ContentBlock[]): string | null {
@@ -1311,4 +1892,20 @@ function stripFences(text: string): string {
 
 function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** A ModelMatch as a bare ModelRef. */
+function refOf(match: ModelMatch): ModelRef {
+  return { providerId: match.providerId, modelId: match.modelId };
+}
+
+/** Human word for a mention target, e.g. "conversation" or "Builder". */
+function roleWord(role: MentionRole): string {
+  return role === 'conversation' ? 'conversation' : role;
+}
+
+/** "Builder → Qwen3.6-35B-MoE" / "Model → Qwen3.6-35B-MoE" for confirmation toasts. */
+function assignmentLabel(role: MentionRole, modelLabel: string): string {
+  const who = role === 'conversation' ? 'Model' : `${role[0].toUpperCase()}${role.slice(1)}`;
+  return `${who} → ${modelLabel}`;
 }

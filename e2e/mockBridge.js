@@ -7,7 +7,11 @@
  *  - window.__fowlplayBridge       : the bridge the webview bundle picks up
  *
  * On the UI's 'ready' message a scripted scenario runs, selected by URL hash:
- *   #chat #diff #settings #onboarding #stream   (default: #chat)
+ *   #chat #diff #settings #onboarding #stream #history #history-diff #selection
+ *   #prd-plan #markdown   (default: #chat)
+ *
+ * window.__fixtures exposes fixture builders (prdConversation, markdownConversation)
+ * so a test can re-inject variants mid-scenario via window.__host.emit().
  */
 (function () {
   const handlers = [];
@@ -37,6 +41,17 @@
       // "Edit Selection" chip dismissed → the host clears the pinned selection.
       if (msg && msg.type === 'clearSelection') {
         emit({ type: 'selectionContext', context: null });
+      }
+      // Model-mention disambiguation answered → the real host would apply/dismiss
+      // and release the held prompt. The mock just acks (no scripted flow needs it).
+      if (msg && msg.type === 'resolveModelMention') {
+        /* no-op ack — protocol stays mirrored */
+      }
+      // A PRD send (sendPrompt with prd:true) is treated as a normal send here; the
+      // `prd` flag is accepted so the protocol stays mirrored. continueStoryLoop is
+      // acked as a no-op — no scripted scenario drives the per-story loop.
+      if (msg && msg.type === 'continueStoryLoop') {
+        /* no-op ack — protocol stays mirrored */
       }
     },
     onMessage(handler) {
@@ -357,6 +372,100 @@
     };
   }
 
+  // A PRD-build conversation: a `plan` marker block plus a live `prdPlan` of three
+  // stories. `cursorStatus` sets the status of the cursor story (index 1) so a test
+  // can exercise every "Continue" button label. The other two stories stay fixed
+  // (story 1 done, story 3 pending) so exactly one story reads as done.
+  function prdStory(title, status) {
+    return {
+      title,
+      summary: `${title} — one-line summary`,
+      criteria: [`${title} behaves as specified`],
+      specPath: `.fowlplay/prd/${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.md`,
+      status,
+    };
+  }
+
+  function prdConversation(cursorStatus) {
+    const stories = [
+      prdStory('Story 1 — schema', 'done'),
+      prdStory('Story 2 — endpoint', cursorStatus || 'awaiting-review'),
+      prdStory('Story 3 — UI', 'pending'),
+    ];
+    const u = {
+      id: 'u1', parentId: null, role: 'user',
+      blocks: [{ type: 'text', text: 'Build this PRD end to end.' }],
+      createdAt: now - 60000,
+    };
+    const a = {
+      id: 'a1', parentId: 'u1', role: 'assistant',
+      blocks: [
+        { type: 'text', text: 'Decomposed the PRD into three stories; building them one by one.' },
+        { type: 'plan' },
+      ],
+      createdAt: now - 30000,
+      model: { providerId: 'prov-ollama', modelId: 'qwen2.5-coder:32b' },
+      usage: { inputTokens: 500, outputTokens: 200, cachedTokens: 0 },
+    };
+    return {
+      type: 'conversation',
+      conversation: {
+        id: 'conv-prd', title: 'PRD build',
+        nodes: { u1: u, a1: a },
+        rootIds: ['u1'], currentLeafId: 'a1',
+        model: { providerId: 'prov-ollama', modelId: 'qwen2.5-coder:32b' },
+        harnessMode: 'coop',
+        prdPlan: { stories, cursor: 1 },
+        createdAt: now - 60000, updatedAt: now,
+        usageTotals: { inputTokens: 500, outputTokens: 200, cachedTokens: 0 },
+      },
+    };
+  }
+
+  // A conversation whose only assistant text exercises the markdown list renderer:
+  // a numbered list with nested bullets between items (the Scout/Builder shape that
+  // used to fragment into multiple <ol>s), plus emphasis wrapping an inline-code span.
+  function markdownConversation() {
+    const md =
+      'Here is the plan:\n\n' +
+      '1. Parse the request into acceptance criteria\n' +
+      '   - restate the ask\n' +
+      '   - list the edge cases\n' +
+      '2. Implement the change\n' +
+      '   - update `login()`\n' +
+      '   - add `AuthError`\n' +
+      '3. Cover it with a test\n\n' +
+      'This is **bold with `code` inside** to prove emphasis wraps a code span.';
+    const u = {
+      id: 'u1', parentId: null, role: 'user',
+      blocks: [{ type: 'text', text: 'Outline the plan.' }],
+      createdAt: now - 60000,
+    };
+    const a = {
+      id: 'a1', parentId: 'u1', role: 'assistant',
+      blocks: [{ type: 'text', text: md }],
+      createdAt: now - 30000,
+      model: { providerId: 'prov-ollama', modelId: 'qwen2.5-coder:32b' },
+      usage: { inputTokens: 200, outputTokens: 80, cachedTokens: 0 },
+    };
+    return {
+      type: 'conversation',
+      conversation: {
+        id: 'conv-md', title: 'Markdown rendering',
+        nodes: { u1: u, a1: a },
+        rootIds: ['u1'], currentLeafId: 'a1',
+        model: { providerId: 'prov-ollama', modelId: 'qwen2.5-coder:32b' },
+        harnessMode: 'coop',
+        createdAt: now - 60000, updatedAt: now,
+        usageTotals: { inputTokens: 200, outputTokens: 80, cachedTokens: 0 },
+      },
+    };
+  }
+
+  // Expose fixture builders so a test can re-inject variants mid-scenario (e.g. the
+  // same PRD plan with a different cursor-story status) via window.__host.emit().
+  window.__fixtures = { prdConversation, markdownConversation };
+
   // --------------------------------------------------------------------------
   // Scenarios
   // --------------------------------------------------------------------------
@@ -392,6 +501,14 @@
         emit(settings(true));
         emit(conversationList());
         setView('history');
+        break;
+      case 'prd-plan':
+        emit(settings(true));
+        emit(prdConversation('awaiting-review'));
+        break;
+      case 'markdown':
+        emit(settings(true));
+        emit(markdownConversation());
         break;
       case 'selection':
         emit(settings(true));
