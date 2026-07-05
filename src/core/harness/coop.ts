@@ -71,7 +71,7 @@ export interface RoleRunner {
 /** Read-only view of the currently staged changeset. */
 export interface ChangesetInspector {
   unifiedDiff(): string;
-  summary(): { filesChanged: number; additions: number; deletions: number };
+  summary(): { filesChanged: number; additions: number; deletions: number; previewPath?: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +588,8 @@ export async function runCoopPipeline(opts: CoopPipelineOptions): Promise<CoopRe
       title: 'Human review',
       status: 'awaiting',
       evidence: 'Awaiting your diff review — you are the final gate.',
+      // Surface a Preview button on the card when the changeset has a previewable entry.
+      previewPath: inspector.summary().previewPath,
     }),
   );
 

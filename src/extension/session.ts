@@ -49,6 +49,7 @@ import { estimateTokens, trimWireToBudget, wireTokens } from '../core/agent/cont
 import { capFileContent, expandFileMentions, extractFileMentions, fencedBlock } from '../core/agent/fileMentions';
 import { StagingOverlay, type DiskReader } from '../core/staging/overlay';
 import { ChangeSet } from '../core/staging/changeset';
+import { detectPreviewEntry } from '../core/staging/preview';
 import { detectDrift, rebase as coreRebase } from '../core/staging/rebase';
 import { renderHunkDiff } from '../core/diff/compute';
 import {
@@ -139,12 +140,32 @@ export interface GitPort {
   head(): Promise<{ sha: string; branch: string } | null>;
 }
 
+/** Read-only view of the staging layer for the preview server. */
+export interface PreviewSource {
+  /**
+   * Staged content for a workspace-relative path.
+   * - `{ content: string }`  → path is tracked; serve this.
+   * - `{ content: null }`    → tracked as a staged DELETE; must 404 (never fall back to disk).
+   * - `null`                 → untracked; the server falls back to raw disk bytes.
+   */
+  staged(path: string): Promise<{ content: string | null } | null>;
+}
+
+export interface PreviewPort {
+  /** (Re)point the server at a source + entry; returns the externally reachable URL of the entry. */
+  open(source: PreviewSource, entryPath: string): Promise<{ url: string }>;
+  close(): void;
+  openExternal(url: string): void;
+}
+
 export interface SessionDeps {
   io: DiskIo;
   secrets: SecretsPort;
   settings: SettingsPort;
   history: HistoryPort;
   git?: GitPort;
+  /** Overlay-backed preview server (absent when there is no workspace folder). */
+  preview?: PreviewPort;
   /** Emit a message to the webview. */
   post(msg: HostToWebview): void;
   /**
@@ -204,6 +225,9 @@ export class SessionCore {
   private turnEpoch = 0;
   /** Monotonic counter for disk-only applies that have no commit sha. */
   private appliedSeq = 0;
+
+  /** The externally reachable URL of the current page preview, for "Open in Browser". */
+  private lastPreviewUrl: string | null = null;
 
   /** A highlighted editor region pinned as scoped context for the NEXT prompt. */
   private pendingSelection: SelectionContext | null = null;
@@ -350,6 +374,15 @@ export class SessionCore {
         return;
       case 'rebase':
         await this.onRebase();
+        return;
+      case 'openPreview':
+        await this.onOpenPreview(msg.path, msg.changesetId);
+        return;
+      case 'closePreview':
+        this.closePreview();
+        return;
+      case 'openPreviewExternal':
+        if (this.lastPreviewUrl) this.deps.preview?.openExternal(this.lastPreviewUrl);
         return;
       case 'listConversations':
         this.deps.post({ type: 'conversationList', items: await this.deps.history.list(msg.query) });
@@ -963,7 +996,7 @@ export class SessionCore {
       unifiedDiff: () => renderUnifiedDiff(this.changeset.view()),
       summary: () => {
         const s = this.changeset.summary();
-        return { filesChanged: s.filesChanged, additions: s.additions, deletions: s.deletions };
+        return { filesChanged: s.filesChanged, additions: s.additions, deletions: s.deletions, previewPath: s.previewPath };
       },
     };
 
@@ -1455,6 +1488,7 @@ export class SessionCore {
       message: commitInfo?.message ?? 'Applied to disk',
       changesetId: id,
       filesChanged,
+      previewPath: frozen.previewPath,
     });
 
     // Applied changes are on disk now — no longer staged.
@@ -1669,6 +1703,77 @@ export class SessionCore {
   }
 
   // -------------------------------------------------------------------------
+  // Preview
+  // -------------------------------------------------------------------------
+
+  /**
+   * Open a preview of a staged (or historical) artifact. Markdown entries render
+   * in the webview directly; everything else is served through the overlay preview
+   * server and rendered in an iframe.
+   *
+   * Live mode reads through the overlay (staged wins, disk fallback). History mode
+   * (`changesetId` naming a frozen committed changeset) can only serve pure disk —
+   * frozen hunks don't carry full file content — so it is best-effort; the commit
+   * was applied to disk anyway.
+   */
+  private async onOpenPreview(path?: string, changesetId?: string): Promise<void> {
+    const frozen = changesetId ? this.conv.committedChangesets?.[changesetId] : undefined;
+
+    let source: PreviewSource;
+    let entry: string | null;
+    if (frozen) {
+      // History mode: pure disk (frozen hunks can't reconstruct staged content).
+      source = { staged: async () => null };
+      entry = path ?? frozen.previewPath ?? null;
+    } else {
+      // Live mode: read through the overlay.
+      source = {
+        staged: async (p) => (this.overlay.has(p) ? { content: await this.overlay.read(p) } : null),
+      };
+      entry = path ?? detectPreviewEntry(this.overlay.ops());
+    }
+
+    if (!entry) {
+      this.toast('warn', 'Nothing previewable in this changeset.');
+      return;
+    }
+
+    if (entry.toLowerCase().endsWith('.md')) {
+      const content = frozen ? await this.deps.io.read(entry) : await this.overlay.read(entry);
+      if (content === null) {
+        this.toast('error', `Could not read ${entry}.`);
+        return;
+      }
+      this.deps.post({ type: 'preview', state: { kind: 'markdown', path: entry, content } });
+      return;
+    }
+
+    if (!this.deps.preview) {
+      this.toast('warn', "Preview isn't available in this environment.");
+      return;
+    }
+    try {
+      const { url } = await this.deps.preview.open(source, entry);
+      this.lastPreviewUrl = url;
+      this.deps.post({ type: 'preview', state: { kind: 'page', url, path: entry } });
+    } catch (err) {
+      this.toast('error', `Could not start the preview server: ${errMessage(err)}`);
+    }
+  }
+
+  /** Tear down the current preview: close the server (if any) and clear the view. */
+  private closePreview(): void {
+    this.deps.preview?.close();
+    this.lastPreviewUrl = null;
+    this.deps.post({ type: 'preview', state: null });
+  }
+
+  /** Release host resources when the owning webview is disposed. */
+  dispose(): void {
+    this.deps.preview?.close();
+  }
+
+  // -------------------------------------------------------------------------
   // Branch / conversation ops
   // -------------------------------------------------------------------------
 
@@ -1700,6 +1805,8 @@ export class SessionCore {
     // Kill any in-flight turn before swapping the conversation out from under it,
     // so its late gate/stream posts can't graft onto the fresh conversation.
     this.supersedeInFlightTurn();
+    // A preview of this conversation's overlay must not survive into the next one.
+    this.closePreview();
     const settings = await this.ensureSettings();
     this.conv = createConversation(settings.defaultModel, settings.harness.defaultMode);
     this.overlay = new StagingOverlay(this.deps.io);
@@ -1718,6 +1825,8 @@ export class SessionCore {
       this.toast('error', 'Conversation not found.');
       return;
     }
+    // A preview of the previous conversation's overlay must not survive the switch.
+    this.closePreview();
     this.conv = loaded;
     this.wireByNode.clear();
     this.restoreOverlayFor(loaded.currentLeafId);

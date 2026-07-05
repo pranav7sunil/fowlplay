@@ -86,6 +86,8 @@ export interface ChangesSummary {
   filesChanged: number;
   additions: number;
   deletions: number;
+  /** Workspace-relative entry point the changeset can be previewed from, when artifact detection found one. */
+  previewPath?: string;
 }
 
 export interface CommitRecord {
@@ -93,6 +95,8 @@ export interface CommitRecord {
   message: string;
   changesetId: string;
   filesChanged: number;
+  /** Workspace-relative entry point the changeset can be previewed from, when artifact detection found one. */
+  previewPath?: string;
 }
 
 /** A node in the conversation tree. */
@@ -197,12 +201,19 @@ export interface ChangeSetView {
   totalChanges: number;        // number of hunks
   additions: number;
   deletions: number;
+  /** Workspace-relative entry point the changeset can be previewed from, when artifact detection found one. */
+  previewPath?: string;
 }
 
 export interface RebaseState {
   needed: boolean;
   conflictedPaths: string[];
 }
+
+/** What the Preview view renders. */
+export type PreviewState =
+  | { kind: 'page'; url: string; path: string }          // iframe → overlay server
+  | { kind: 'markdown'; path: string; content: string }; // in-webview render
 
 // ---------------------------------------------------------------------------
 // Coop harness
@@ -231,6 +242,8 @@ export interface GateCard {
   attempt?: number;            // builder/inspector retry round
   /** Token usage this role spent (shown dimmed in the card footer). */
   usage?: TokenUsage;
+  /** Workspace-relative entry point the changeset can be previewed from, when artifact detection found one. */
+  previewPath?: string;
 }
 
 export interface HarnessSettings {

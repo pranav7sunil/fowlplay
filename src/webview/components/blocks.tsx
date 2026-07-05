@@ -41,6 +41,11 @@ function fmtTokens(n: number): string {
   return String(n);
 }
 
+/** Last path segment, for compact Preview button labels. */
+function basename(path: string): string {
+  return path.slice(path.lastIndexOf('/') + 1);
+}
+
 export function ThinkingBlock({ text, durationMs }: { text: string; durationMs?: number }) {
   return (
     <Collapsible
@@ -175,9 +180,16 @@ export function GateCardView({ card }: { card: GateCard }) {
           </div>
         )}
         {card.role === 'hitl' && (
-          <button type="button" class="fp-btn fp-btn-primary fp-btn-sm" onClick={() => store.openReview()} style={{ alignSelf: 'flex-start' }}>
-            <IconDiff size={15} /> Review Changes
-          </button>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button type="button" class="fp-btn fp-btn-primary fp-btn-sm" onClick={() => store.openReview()}>
+              <IconDiff size={15} /> Review Changes
+            </button>
+            {card.previewPath && (
+              <button type="button" class="fp-btn fp-btn-secondary fp-btn-sm" onClick={() => store.openPreview(card.previewPath)}>
+                <IconEye size={15} /> Preview {basename(card.previewPath)}
+              </button>
+            )}
+          </div>
         )}
         {card.usage && (card.usage.inputTokens > 0 || card.usage.outputTokens > 0) && (
           <div
@@ -195,7 +207,7 @@ export function GateCardView({ card }: { card: GateCard }) {
 export function ChangesBlock({
   summary,
 }: {
-  summary: { changesetId: string; filesChanged: number; additions: number; deletions: number };
+  summary: { changesetId: string; filesChanged: number; additions: number; deletions: number; previewPath?: string };
 }) {
   return (
     <div class="fp-changes">
@@ -207,6 +219,11 @@ export function ChangesBlock({
           <span class="fp-add">+{summary.additions}</span> <span class="fp-del">-{summary.deletions}</span>
         </div>
       </div>
+      {summary.previewPath && (
+        <button type="button" class="fp-btn fp-btn-secondary" onClick={() => store.openPreview(summary.previewPath)}>
+          <IconEye size={16} /> Preview
+        </button>
+      )}
       <button type="button" class="fp-btn fp-btn-primary" onClick={() => store.openReview(summary.changesetId)}>
         <IconDiff size={16} /> Review Changes
       </button>
@@ -217,7 +234,7 @@ export function ChangesBlock({
 export function CommitBlock({
   commit,
 }: {
-  commit: { sha: string; message: string; changesetId: string; filesChanged: number };
+  commit: { sha: string; message: string; changesetId: string; filesChanged: number; previewPath?: string };
 }) {
   return (
     <div class="fp-commit">
@@ -227,9 +244,16 @@ export function CommitBlock({
         <span style={{ color: 'var(--fp-fg-muted)', fontSize: '12px' }}>{commit.filesChanged} files</span>
       </div>
       <div class="fp-commit-msg">{commit.message}</div>
-      <button type="button" class="fp-btn-ghost" onClick={() => store.openReview(commit.changesetId, true)} style={{ padding: 0, color: 'var(--fp-accent)' }}>
-        View Changes <IconArrowRight size={14} />
-      </button>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        <button type="button" class="fp-btn-ghost" onClick={() => store.openReview(commit.changesetId, true)} style={{ padding: 0, color: 'var(--fp-accent)' }}>
+          View Changes <IconArrowRight size={14} />
+        </button>
+        {commit.previewPath && (
+          <button type="button" class="fp-btn-ghost" onClick={() => store.openPreview(commit.previewPath, commit.changesetId)} style={{ padding: 0, color: 'var(--fp-accent)' }}>
+            <IconEye size={14} /> Preview
+          </button>
+        )}
+      </div>
     </div>
   );
 }

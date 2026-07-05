@@ -14,6 +14,7 @@ import type { Conversation, SelectionContext, SerializedOverlay } from '../share
 import type { WebviewToHost } from '../shared/protocol';
 import { createSessionCore, type SessionCore, type SessionDeps } from './session';
 import { WorkspaceIo } from './workspaceIo';
+import { PreviewServer } from './previewServer';
 import { SecretsStore } from './secrets';
 import { SettingsStore } from './settingsStore';
 import { HistoryStore } from './historyStore';
@@ -68,6 +69,7 @@ export class TabManager {
     panel.onDidDispose(() => {
       this.panels.delete(panel);
       this.liveSessions.delete(session);
+      session.dispose();
     });
     return panel;
   }
@@ -85,6 +87,7 @@ export class TabManager {
     this.homeSession = session;
     view.onDidDispose(() => {
       this.liveSessions.delete(session);
+      session.dispose();
       if (this.homeView === view) {
         this.homeView = null;
         this.homeSession = null;
@@ -200,6 +203,7 @@ export class TabManager {
 
   private attachSession(webview: vscode.Webview, seed?: Seed): SessionCore {
     const io = WorkspaceIo.forActiveWorkspace();
+    const folderUri = vscode.workspace.workspaceFolders?.[0]?.uri;
     // `session` is referenced by the onSettingsChanged closure below; it is
     // assigned before any message (hence any mutation) can arrive.
     let session: SessionCore;
@@ -209,6 +213,7 @@ export class TabManager {
       settings: this.settings,
       history: this.history,
       git: Git.forActiveWorkspace() ?? undefined,
+      preview: folderUri ? new PreviewServer(folderUri) : undefined,
       post: (msg) => {
         void webview.postMessage(msg);
       },
@@ -235,6 +240,8 @@ export class TabManager {
       `font-src ${webview.cspSource} data:`,
       `style-src ${webview.cspSource} 'unsafe-inline'`,
       `script-src 'nonce-${nonce}'`,
+      // The preview iframe loads from the local overlay server (and forwarded https URLs).
+      `frame-src http://localhost:* http://127.0.0.1:* https:`,
     ].join('; ');
     return `<!DOCTYPE html>
 <html lang="en">

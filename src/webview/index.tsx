@@ -6,6 +6,7 @@ import type { Conversation } from '../shared/types';
 import { activePath, initStore, post, store, useStore } from './components/store';
 import { Chat } from './components/Chat';
 import { DiffViewer } from './components/DiffViewer';
+import { PreviewPanel } from './components/PreviewPanel';
 import { Settings } from './components/Settings';
 import { HistoryPanel } from './components/HistoryPanel';
 import { Onboarding } from './components/Onboarding';
@@ -30,6 +31,7 @@ function App() {
   const conversation = useStore((s) => s.conversation);
   const streaming = useStore((s) => s.streaming);
   const changeset = useStore((s) => s.changeset);
+  const preview = useStore((s) => s.preview);
   const rebase = useStore((s) => s.rebase);
   const diffReadOnly = useStore((s) => s.diffReadOnly);
   const commitMessage = useStore((s) => s.commitMessage);
@@ -53,6 +55,12 @@ function App() {
           <DiffViewer view={changeset} rebase={rebase} readOnly={diffReadOnly} commitMessage={commitMessage} />
         ) : (
           <div class="fp-empty" style={{ marginTop: 80 }}>No changeset to review.</div>
+        ))}
+      {view === 'preview' &&
+        (preview ? (
+          <PreviewPanel state={preview} />
+        ) : (
+          <div class="fp-empty" style={{ marginTop: 80 }}>Nothing to preview.</div>
         ))}
       {view === 'chat' && (
         <Chat conv={conversation} settings={settings} streaming={streaming} changeCount={changeCount} />
