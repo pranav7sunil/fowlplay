@@ -9,6 +9,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ProviderConfig } from '../src/shared/types';
 import {
+  findUnparsedModelHints,
   isDirectiveOnly,
   matchModels,
   parseModelMentions,
@@ -164,6 +165,86 @@ describe('parseModelMentions — role directives', () => {
     expect(parseModelMentions('it should be the builder that runs')).toEqual([]);
     expect(parseModelMentions('we should build the builder with care')).toEqual([]);
     expect(parseModelMentions('the app should be the best')).toEqual([]);
+  });
+
+  it('modal + bare verb: "<name> should/will build" → role(s) from the verb', () => {
+    expect(parseModelMentions('qwen should build')).toEqual([{ role: 'builder', query: 'qwen' }]);
+    expect(parseModelMentions('gemma will review and audit')).toEqual([
+      { role: 'inspector', query: 'gemma' },
+      { role: 'sentry', query: 'gemma' },
+    ]);
+    // "also" is tolerated between the modal and the verb.
+    expect(parseModelMentions('glm must also plan')).toEqual([{ role: 'scout', query: 'glm' }]);
+  });
+
+  it('the exact field failure: copula + modal-verb in one message', () => {
+    expect(
+      parseModelMentions('gemma should be the orchestrator and planner and qwen should build'),
+    ).toEqual([
+      { role: 'scout', query: 'gemma' },
+      { role: 'builder', query: 'qwen' },
+    ]);
+  });
+
+  it('copula still wins over modal-verb for "should be the <role-person>"', () => {
+    expect(parseModelMentions('gemma should be the builder')).toEqual([{ role: 'builder', query: 'gemma' }]);
+  });
+
+  it('modal-verb guards: prose with pronoun/noun subjects never triggers', () => {
+    expect(parseModelMentions('it should build on the existing design')).toEqual([]);
+    expect(parseModelMentions('this should build quickly')).toEqual([]);
+    expect(parseModelMentions('we must implement caching')).toEqual([]);
+    expect(parseModelMentions('code should build cleanly')).toEqual([]);
+  });
+
+  it('reversed assignment: "(set|assign) [the] <role> to <name>"', () => {
+    expect(parseModelMentions('set the orchestrator to gemma')).toEqual([{ role: 'scout', query: 'gemma' }]);
+    expect(parseModelMentions('assign the builder to qwen')).toEqual([{ role: 'builder', query: 'qwen' }]);
+    expect(parseModelMentions('set planning to gemma')).toEqual([{ role: 'scout', query: 'gemma' }]);
+    // A chained role list before "to" dedupes to one mention.
+    expect(parseModelMentions('set the orchestrator and planner to gemma')).toEqual([
+      { role: 'scout', query: 'gemma' },
+    ]);
+  });
+
+  it('reversed assignment composes with a following clause', () => {
+    expect(parseModelMentions('set the orchestrator and planner to gemma and qwen to build')).toEqual([
+      { role: 'scout', query: 'gemma' },
+      { role: 'builder', query: 'qwen' },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findUnparsedModelHints — near-miss detection
+// ---------------------------------------------------------------------------
+
+describe('findUnparsedModelHints', () => {
+  it('fires for a model token + role word that the grammar did not parse', () => {
+    const text = 'qwen handles the building please';
+    const mentions = parseModelMentions(text);
+    expect(mentions).toEqual([]); // grammar missed it
+    expect(findUnparsedModelHints(text, mentions, PROVIDERS)).toEqual(['qwen']);
+  });
+
+  it('is silent when the directive DID parse (token is inside a claimed span)', () => {
+    const text = 'qwen to build';
+    const mentions = parseModelMentions(text);
+    expect(findUnparsedModelHints(text, mentions, PROVIDERS)).toEqual([]);
+  });
+
+  it('is silent for a fully-parsed modal-verb directive', () => {
+    const text = 'qwen should build';
+    const mentions = parseModelMentions(text);
+    expect(findUnparsedModelHints(text, mentions, PROVIDERS)).toEqual([]);
+  });
+
+  it('is silent for a model named in ordinary prose with no role word', () => {
+    expect(findUnparsedModelHints('qwen wrote this yesterday', [], PROVIDERS)).toEqual([]);
+  });
+
+  it('is silent when no token matches a configured model', () => {
+    expect(findUnparsedModelHints('please review the design', [], PROVIDERS)).toEqual([]);
   });
 });
 

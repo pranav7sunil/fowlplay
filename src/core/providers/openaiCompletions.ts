@@ -20,6 +20,7 @@ import {
   readErrorSnippet,
   readSse,
 } from './adapter';
+import { StreamSanitizer } from './streamSanitizer';
 
 // --- OpenAI wire shapes (only the fields we read) --------------------------
 
@@ -99,6 +100,12 @@ export class OpenAiCompletionsAdapter implements ProviderAdapter {
     let stopReason: 'end' | 'tool_use' = 'end';
     let sawToolCalls = false;
 
+    // Misconfigured local servers (wrong/missing chat template) leak raw channel
+    // markers into `content` as plain text. One sanitizer per request strips them
+    // and routes reasoning-channel text to 'thinking'. `reasoning_content` is a
+    // separate, already-clean channel and bypasses this.
+    const sanitizer = new StreamSanitizer();
+
     try {
       for await (const evt of readSse(response, request.signal)) {
         const data = evt.data.trim();
@@ -126,7 +133,11 @@ export class OpenAiCompletionsAdapter implements ProviderAdapter {
         const delta = choice.delta;
         if (delta) {
           if (typeof delta.content === 'string' && delta.content.length > 0) {
-            yield { type: 'text', delta: delta.content };
+            for (const part of sanitizer.pushText(delta.content)) {
+              yield part.kind === 'thinking'
+                ? { type: 'thinking', delta: part.delta }
+                : { type: 'text', delta: part.delta };
+            }
           }
           if (
             typeof delta.reasoning_content === 'string' &&
@@ -189,6 +200,14 @@ export class OpenAiCompletionsAdapter implements ProviderAdapter {
       yield { type: 'error', message: `stream error: ${errMessage(err)}` };
       yield { type: 'done', stopReason: 'error' };
       return;
+    }
+
+    // Release any tail the sanitizer held back (a marker prefix that turned out
+    // to be a false alarm) as text/thinking before closing out the turn.
+    for (const part of sanitizer.flush()) {
+      yield part.kind === 'thinking'
+        ? { type: 'thinking', delta: part.delta }
+        : { type: 'text', delta: part.delta };
     }
 
     // Close any open tool calls. For an index that received args but never a

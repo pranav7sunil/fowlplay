@@ -76,18 +76,33 @@ const PERSON_TO_ROLE: Record<string, CoopRole> = {
  */
 const CONNECTIVES = ['to', 'with', 'for', 'and', 'or', 'use', 'let', 'switch', 'everything', 'all', 'every', 'please'];
 
+/** Verbs that introduce a reversed assignment ("set the builder to qwen", "assign planning to gemma"). */
+const ASSIGN_VERBS = ['set', 'assign'];
+
 /**
  * Copula/modal glue for predicate phrasing, plus pronouns/articles that must
  * never be mistaken for a model name ("it should be the builder" must not
  * produce a mention with query "it").
  */
 const COPULA_WORDS = ['should', 'shall', 'will', 'can', 'must', 'be', 'is', 'as', 'make', 'the', 'our', 'my', 'a', 'an'];
-const NAME_STOPWORDS = ['it', 'this', 'that', 'these', 'those', 'he', 'she', 'they', 'we', 'i', 'you', 'who', 'which', 'what', 'there', 'model', 'models'];
+const NAME_STOPWORDS = ['it', 'this', 'that', 'these', 'those', 'he', 'she', 'they', 'we', 'i', 'you', 'who', 'which', 'what', 'there', 'model', 'models', 'code', 'everything'];
 
 const KEYWORDS = new Set<string>([
   ...CONNECTIVES,
+  ...ASSIGN_VERBS,
   ...COPULA_WORDS,
   ...NAME_STOPWORDS,
+  ...Object.keys(VERB_TO_ROLE),
+  ...Object.keys(NOUN_TO_ROLE),
+  ...Object.keys(PERSON_TO_ROLE),
+]);
+
+/**
+ * Any word that names a role in one of the grammar tables — used by the
+ * near-miss detector to gate at message level ("did the user use role
+ * vocabulary at all?").
+ */
+const ROLE_WORDS = new Set<string>([
   ...Object.keys(VERB_TO_ROLE),
   ...Object.keys(NOUN_TO_ROLE),
   ...Object.keys(PERSON_TO_ROLE),
@@ -110,6 +125,12 @@ const NOUN_ALT = alternation(Object.keys(NOUN_TO_ROLE));
 const PERSON_ALT = alternation(Object.keys(PERSON_TO_ROLE));
 const KW_ALT = alternation([...KEYWORDS]);
 
+// Combined role vocabulary (role-person nouns + role-nouns) for the reversed
+// "set the <role> to <name>" form. Person entries win where the two tables
+// disagree (they don't today — every shared key maps to the same role).
+const ROLE_TABLE: Record<string, CoopRole> = { ...NOUN_TO_ROLE, ...PERSON_TO_ROLE };
+const ROLE_ALT = alternation(Object.keys(ROLE_TABLE));
+
 // Conjunction chains: "orchestrate and build", "review, audit and security".
 // A chain is a first verb/noun plus zero or more ("and"/comma)-joined ones, so
 // "qwen to orchestrate and build" assigns BOTH roles. The joined token must
@@ -119,8 +140,13 @@ const CHAIN_JOIN = `(?:[ \\t]*,[ \\t]*(?:and[ \\t]+)?|[ \\t]+and[ \\t]+)`;
 const VERB_CHAIN = `(${VERB_ALT})((?:${CHAIN_JOIN}(?:${VERB_ALT})\\b)*)`;
 const NOUN_CHAIN = `(${NOUN_ALT})((?:${CHAIN_JOIN}(?:${NOUN_ALT})\\b)*)`;
 const PERSON_CHAIN = `(${PERSON_ALT})((?:${CHAIN_JOIN}(?:the[ \\t]+)?(?:${PERSON_ALT})\\b)*)`;
+// A chain over the combined role vocabulary, for the reversed "set … to <name>" form.
+const ROLE_CHAIN = `(${ROLE_ALT})((?:${CHAIN_JOIN}(?:the[ \\t]+)?(?:${ROLE_ALT})\\b)*)`;
 // Copula glue: "should be the", "will be our", "is the", "as", "as the" …
 const COPULA = `(?:(?:should|shall|will|can|must)[ \\t]+(?:be[ \\t]+)?|is[ \\t]+|as[ \\t]+)(?:the[ \\t]+|our[ \\t]+|my[ \\t]+|a[ \\t]+|an[ \\t]+)?`;
+// Modal + bare verb glue: "should build", "will review and audit", "must also plan".
+// Note "be" is deliberately NOT a verb, so this can never shadow the copula form.
+const MODAL_VERB_GLUE = `(?:should|shall|will|can|must)[ \\t]+(?:also[ \\t]+)?`;
 
 /** Expand a matched chain (first token + joined tail) into its role list, deduped in order. */
 function chainRoles(table: Record<string, CoopRole>, first: string, tail: string): CoopRole[] {
@@ -166,6 +192,11 @@ const chainMentions = (query: string, roles: CoopRole[]): Mention[] | null =>
   query && roles.length > 0 ? roles.map((role) => ({ role, query })) : null;
 
 const PATTERNS: Pattern[] = [
+  // (set|assign) [the] <role>[ and <role>…] to <name>   ("set the orchestrator and planner to gemma")
+  {
+    re: new RegExp(`\\b(?:set|assign)[ \\t]+(?:the[ \\t]+)?${ROLE_CHAIN}[ \\t]+to[ \\t]+${NAME}`, 'gi'),
+    make: (m) => chainMentions(nameQuery(m[3]), chainRoles(ROLE_TABLE, m[1], m[2])),
+  },
   // use <name> to <verb>[ and <verb>…]
   {
     re: new RegExp(`\\buse[ \\t]+${NAME}[ \\t]+to[ \\t]+${VERB_CHAIN}`, 'gi'),
@@ -183,9 +214,17 @@ const PATTERNS: Pattern[] = [
   },
   // <name> should/will/is/as [be] [the] <role-person>[ and <role-person>…]
   // ("gemma should be the builder", "qwen is the orchestrator", "glm as reviewer")
+  // MUST precede the modal + bare-verb pattern so "should be the builder" resolves
+  // as a copula (builder), not as a bare verb.
   {
     re: new RegExp(`${NAME}[ \\t]+${COPULA}${PERSON_CHAIN}`, 'gi'),
     make: (m) => chainMentions(nameQuery(m[1]), chainRoles(PERSON_TO_ROLE, m[2], m[3])),
+  },
+  // <name> (should|shall|will|can|must) [also] <verb>[ and <verb>…]
+  // ("qwen should build", "gemma will review and audit") — closes the modal-verb gap.
+  {
+    re: new RegExp(`${NAME}[ \\t]+${MODAL_VERB_GLUE}${VERB_CHAIN}`, 'gi'),
+    make: (m) => chainMentions(nameQuery(m[1]), chainRoles(VERB_TO_ROLE, m[2], m[3])),
   },
   // make <name> [the] <role-person>[ and <role-person>…]   ("make gemma the reviewer")
   {
@@ -369,4 +408,55 @@ export function matchModels(query: string, providers: ProviderConfig[]): ModelMa
 /** Convenience: a `ModelMatch` as a `ModelRef`. */
 export function toModelRef(match: ModelMatch): ModelRef {
   return { providerId: match.providerId, modelId: match.modelId };
+}
+
+/**
+ * Detect model directives the grammar ALMOST recognized — a near-miss guard so a
+ * mistyped or unsupported phrasing never fails silently.
+ *
+ * Returns the (verbatim, deduped) tokens in `text` that (a) match a configured
+ * model, (b) fall OUTSIDE every recognized directive span, in a message that
+ * (c) uses role vocabulary at all. The host toasts each hint so the user learns
+ * their steering attempt did not take effect and how to phrase it.
+ *
+ * Conservative by construction: a token inside a parsed span (the directive
+ * worked), a message with no role word ("qwen wrote this yesterday"), or a token
+ * that matches nothing all yield nothing. `mentions` is used to belt-and-suspender
+ * the span check — a token equal to a parsed mention's query is never a hint.
+ */
+export function findUnparsedModelHints(
+  text: string,
+  mentions: Mention[],
+  providers: ProviderConfig[],
+): string[] {
+  const src = text ?? '';
+  if (!src.trim()) return [];
+
+  // Message-level gate: only warn when the user reached for role vocabulary.
+  const hasRoleWord = src
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .some((w) => ROLE_WORDS.has(w));
+  if (!hasRoleWord) return [];
+
+  const spans = scan(src);
+  const claimed = (start: number, end: number): boolean =>
+    spans.some((s) => start < s.end && end > s.start);
+  const mentionQueries = new Set(mentions.map((m) => m.query.toLowerCase()));
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const re = /[A-Za-z0-9][\w.:/-]*/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src)) !== null) {
+    const tok = m[0];
+    if (tok.length < 3) continue;
+    const lower = tok.toLowerCase();
+    if (seen.has(lower) || isKeyword(tok) || mentionQueries.has(lower)) continue;
+    if (claimed(m.index, m.index + tok.length)) continue;
+    if (matchModels(tok, providers).length === 0) continue;
+    seen.add(lower);
+    out.push(tok);
+  }
+  return out;
 }

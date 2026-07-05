@@ -1180,6 +1180,39 @@ describe('ambiguous chat mention', () => {
   });
 });
 
+describe('near-miss model directive warning', () => {
+  it('warns when a message names a model + role word but matches no phrasing', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'qwen handles the building please' });
+
+    expect(
+      posted.some(
+        (m) =>
+          m.type === 'toast' &&
+          m.level === 'warn' &&
+          m.message.includes('qwen') &&
+          m.message.includes("didn't match a known phrasing"),
+      ),
+    ).toBe(true);
+  });
+
+  it('does NOT warn when the directive actually parsed', async () => {
+    const { session, posted } = makeCustomSession({
+      harness: { defaultMode: 'solo', qasRetryBudget: 1 },
+    });
+    await session.handle({ type: 'ready' });
+    await session.handle({ type: 'sendPrompt', text: 'build with m-builder' });
+
+    expect(posted.some((m) => m.type === 'toast' && m.message.includes("didn't match a known phrasing"))).toBe(false);
+    // Sanity: the directive applied.
+    const conv = lastConversation(posted)!;
+    expect(conv.roleModelOverrides?.builder).toEqual({ providerId: 'p1', modelId: 'm-builder' });
+  });
+});
+
 describe('conversation-level model directive persists (JSON round-trip)', () => {
   it('keeps roleModelOverrides through a history save/load', async () => {
     const history = new FakeHistory();
